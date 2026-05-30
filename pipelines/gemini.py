@@ -72,16 +72,15 @@ async def gemini_handler(request):
                 raise Exception(f"Gemini setup error: {resp['error']}")
             print(f"✅ Gemini Live Ready: {json.dumps(resp)[:120]}")
 
-            # ── 3. Kick off greeting (rotating) ─────────────────────────────
-            greetings = APP_CONFIG["scripts"].get(
-                "greetings", [APP_CONFIG["scripts"].get("greeting", "Namaskar!")]
-            )
-            greeting_text = random.choice(greetings)
+            # ── 3. Kick off greeting ─────────────────────────────────────────
+            # Send a silent trigger so Gemini speaks its opening greeting.
+            # The actual greeting scripts are in the system prompt — Gemini
+            # picks one randomly as instructed there.
             await g_ws.send(json.dumps({
                 "clientContent": {
                     "turns": [{
                         "role": "user",
-                        "parts": [{"text": greeting_text}],
+                        "parts": [{"text": "[CALL_STARTED]"}],
                     }],
                     "turnComplete": True,
                 }
