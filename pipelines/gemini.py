@@ -57,7 +57,7 @@ async def gemini_handler(request):
                 }
                 await g_ws.send_json(setup)
 
-                setup_resp = await g_ws.recv()
+                await g_ws.receive()   # consume setup confirmation
                 print("✅ Gemini Live Ready")
 
                 # ── 2. Kick off with greeting ────────────────────────────────
