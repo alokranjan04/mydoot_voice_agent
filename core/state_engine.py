@@ -5,12 +5,13 @@ state_engine.py — Manages the multi-step flow for Mydoot Customer Care Agent.
 
 
 class MydootState:
-    COLLECTING_NAME      = "collecting_name"
-    COLLECTING_PRODUCT   = "collecting_product"
-    COLLECTING_USAGE     = "collecting_usage"
-    COLLECTING_WARRANTY  = "collecting_warranty"
-    COLLECTING_COMPLAINT = "collecting_complaint"
-    COMPLETED            = "completed"
+    COLLECTING_NAME     = "collecting_name"
+    COLLECTING_COMPANY  = "collecting_company"
+    COLLECTING_PRODUCT  = "collecting_product"
+    COLLECTING_USAGE    = "collecting_usage"
+    COLLECTING_WARRANTY = "collecting_warranty"
+    COLLECTING_COMPLAINT= "collecting_complaint"
+    COMPLETED           = "completed"
 
 
 class ConversationStateEngine:
@@ -18,6 +19,7 @@ class ConversationStateEngine:
         self.current_state = MydootState.COLLECTING_NAME
         self.data = {
             "customer_name":   None,
+            "company_name":    None,
             "product_name":    None,
             "usage_duration":  None,
             "warranty_status": None,
@@ -37,17 +39,17 @@ class ConversationStateEngine:
                 f"STILL NEED: {', '.join(missing)}"
             )
         else:
-            status = "ALL DATA COLLECTED — call save_customer_feedback now."
+            status = "ALL DATA COLLECTED — call save_customer_feedback NOW immediately."
         return f"\n\nCURRENT STATE: {self.current_state.upper()}\n{status}"
 
     def set_data(self, key: str, value: str):
-        """Called externally (e.g. from tool args) to record collected data."""
         if key not in self.data:
             return
         self.data[key] = value
-        # Advance to the next missing step
         if not self.data["customer_name"]:
             self.current_state = MydootState.COLLECTING_NAME
+        elif not self.data["company_name"]:
+            self.current_state = MydootState.COLLECTING_COMPANY
         elif not self.data["product_name"]:
             self.current_state = MydootState.COLLECTING_PRODUCT
         elif not self.data["usage_duration"]:
