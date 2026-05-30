@@ -1,9 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Gemini Live Multimodal pipeline for Mydoot Customer Care.
-
-Uses Gemini BidiGenerateContent (v1beta) for native audio-in / audio-out —
-no separate STT or TTS services required.
+Uses Gemini BidiGenerateContent (v1beta) — audio in / audio out, no STT/TTS needed.
 """
 import asyncio, base64, json, traceback
 import audioop
@@ -30,8 +28,11 @@ async def gemini_handler(request):
             f"\n\n{state_engine.get_prompt_injection()}"
         )
 
-    model = APP_CONFIG.get("parameters", {}).get("google", {}).get("model", "models/gemini-2.0-flash-live-001")
-    print(f"🚀 Connecting to Gemini Live ({model})...")
+    model = APP_CONFIG.get("parameters", {}).get("google", {}).get(
+        "model", "models/gemini-2.0-flash-live-001"
+    )
+    print(f"🚀 Gemini Live connecting | model={model} | caller={caller_id}")
+    print(f"   WS URL: {GEMINI_WS_URL[:80]}...")
 
     try:
         async with aiohttp.ClientSession() as session:
@@ -43,43 +44,54 @@ async def gemini_handler(request):
                         "model": model,
                         "generation_config": {
                             "response_modalities": ["AUDIO"],
-                            "speech_config": {
-                                "voice_config": {
-                                    "prebuilt_voice_config": {"voice_name": "Aoede"}
-                                }
-                            },
                         },
                         "system_instruction": {
-                            "parts": [{"text": get_system_prompt()}]
+                            "role": "system",
+                            "parts": [{"text": get_system_prompt()}],
                         },
                         "tools": APP_CONFIG["tools"]["gemini"],
                     }
                 }
                 await g_ws.send_json(setup)
+                print("📤 Setup sent — waiting for Gemini confirmation...")
 
-                await g_ws.receive()   # consume setup confirmation
+                # ── 2. Wait for setup confirmation (10s timeout) ─────────────
+                try:
+                    setup_msg = await asyncio.wait_for(g_ws.receive(), timeout=10.0)
+                except asyncio.TimeoutError:
+                    raise Exception("Gemini setup confirmation timed out after 10s — check model name and API key")
+
+                if setup_msg.type == aiohttp.WSMsgType.TEXT:
+                    resp = json.loads(setup_msg.data)
+                    print(f"📥 Setup response: {json.dumps(resp)[:300]}")
+                    if "error" in resp:
+                        raise Exception(f"Gemini setup error: {resp['error']}")
+                elif setup_msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.ERROR):
+                    raise Exception(f"Gemini closed connection during setup: {setup_msg.data}")
+
                 print("✅ Gemini Live Ready")
 
-                # ── 2. Kick off with greeting ────────────────────────────────
+                # ── 3. Kick off greeting ─────────────────────────────────────
                 await g_ws.send_json({
                     "client_content": {
                         "turns": [{
                             "role": "user",
-                            "parts": [{"text": APP_CONFIG["scripts"]["greeting"]}]
+                            "parts": [{"text": APP_CONFIG["scripts"]["greeting"]}],
                         }],
                         "turn_complete": True,
                     }
                 })
 
-                # ── 3. Receiver: audio + tool calls from Gemini ─────────────
+                # ── 4. Receive loop: audio + tool calls from Gemini ──────────
                 async def g_receiver():
                     try:
                         async for msg in g_ws:
                             if msg.type != aiohttp.WSMsgType.TEXT:
+                                print(f"⚠️ Gemini WS non-text msg: {msg.type}")
                                 break
                             data = json.loads(msg.data)
 
-                            # Audio chunks
+                            # Audio
                             for part in (
                                 data.get("serverContent", {})
                                     .get("modelTurn", {})
@@ -94,13 +106,12 @@ async def gemini_handler(request):
                                         },
                                     }))
 
-                            # Tool calls — Gemini Live sends: toolCall.functionCalls
+                            # Tool calls
                             for fc in data.get("toolCall", {}).get("functionCalls", []):
                                 fn   = fc.get("name", "")
-                                args = fc.get("args", {})   # already a dict, no json.loads needed
+                                args = fc.get("args", {})
                                 cid  = fc.get("id", "")
-
-                                print(f"🔧 Gemini Tool: {fn}({args})")
+                                print(f"🔧 Tool call: {fn}({args})")
 
                                 if fn == "save_customer_feedback":
                                     for k in ["customer_name", "product_name",
@@ -121,12 +132,12 @@ async def gemini_handler(request):
                                         }
                                     })
 
-                    except Exception:
-                        pass
+                    except Exception as ex:
+                        print(f"❌ g_receiver error: {ex}")
 
                 asyncio.create_task(g_receiver())
 
-                # ── 4. Forward inbound audio from Vobiz → Gemini ───────────
+                # ── 5. Forward Vobiz audio → Gemini ─────────────────────────
                 async for msg in ws:
                     if msg.type == aiohttp.WSMsgType.TEXT:
                         data = json.loads(msg.data)
@@ -142,6 +153,7 @@ async def gemini_handler(request):
                                 }
                             })
                     elif msg.type == aiohttp.WSMsgType.ERROR:
+                        print(f"❌ Vobiz WS error: {ws.exception()}")
                         break
 
     except Exception as e:
