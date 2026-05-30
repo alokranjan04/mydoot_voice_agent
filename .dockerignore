@@ -1,0 +1,36 @@
+# ── Secrets — never bake into image ──────────────────────────────────────────
+.env
+.env.*
+google-credentials.json
+*credentials*.json
+*service-account*.json
+
+# ── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# ── Data / logs ───────────────────────────────────────────────────────────────
+recordings/
+benchmarks/
+scratch/
+metrics/call_log.jsonl
+*.log
+
+# ── Dev / test files ──────────────────────────────────────────────────────────
+.github/
+test_*.py
+debug_*.py
+fix_*.py
+check_*.py
+*.bat
+.claude/
+*.md
+PRD.md
+ARCHITECTURE.md
+
+# ── Git ───────────────────────────────────────────────────────────────────────
+.git/
+.gitignore

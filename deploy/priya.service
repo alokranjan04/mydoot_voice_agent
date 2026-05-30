@@ -1,0 +1,40 @@
+# ── Priya systemd service ──────────────────────────────────────────────────────
+# Place at: /etc/systemd/system/priya.service
+# Then:
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable priya
+#   sudo systemctl start priya
+
+[Unit]
+Description=Priya — AI Voice Receptionist (Neha Child Care)
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=priya
+Group=priya
+WorkingDirectory=/opt/priya
+
+# Load all secrets from .env — never hardcode keys in this file
+EnvironmentFile=/opt/priya/.env
+
+# Start the app
+ExecStart=/opt/priya/venv/bin/python app.py
+
+# Auto-restart if it crashes — 5s delay before retry
+Restart=always
+RestartSec=5
+
+# Resource limits
+# Each call uses ~30MB RAM; allow 20 concurrent calls
+MemoryMax=1G
+CPUQuota=80%
+
+# Log to journald (view with: sudo journalctl -u priya -f)
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=priya
+
+[Install]
+WantedBy=multi-user.target

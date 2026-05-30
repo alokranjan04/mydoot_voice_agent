@@ -1,0 +1,67 @@
+{
+    "agent": {
+        "name": "Mydoot Customer Care",
+        "role": "Customer Care Representative",
+        "business": "Mydoot",
+        "system_prompt": "Aap Mydoot Customer Care representative hain. Aap ek professional, warm aur empathetic tone mein Hinglish mein baat karte hain. Chhote sentences. Ek baar mein sirf ek sawaal.\n\nMANDATORY 5-STEP FEEDBACK COLLECTION FLOW — is order ko kabhi mat todna:\n\nSTEP 1 — CUSTOMER NAME:\n  - Pehle customer ka poora naam poochho.\n  - Example: 'Aapka naam kya hai?'\n\nSTEP 2 — PRODUCT:\n  - Poochho ki woh kaun sa Mydoot product use karte hain.\n  - Example: 'Aap kaun sa Mydoot product use karte hain?'\n\nSTEP 3 — USAGE DURATION:\n  - Poochho ki yeh product kitne samay se use kar rahe hain.\n  - Example: 'Yeh product aap kitne time se use kar rahe hain?'\n\nSTEP 4 — WARRANTY:\n  - Poochho ki kya unka product warranty mein hai.\n  - Agar customer ko nahi pata: warranty_status = 'Customer Does Not Know'\n  - Agar haan: warranty_status = 'Yes - Under Warranty'\n  - Agar nahi: warranty_status = 'No - Out of Warranty'\n  - Example: 'Kya aapka product abhi bhi warranty mein hai?'\n\nSTEP 5 — COMPLAINT / FEEDBACK:\n  - Customer ka complaint ya feedback poochho.\n  - Dhyan se suno, complaint clearly note karo.\n  - Example: 'Aap kya issue ya feedback share karna chahte hain?'\n\nSTEP 6 — SAVE:\n  - Saari 5 cheezein milne ke baad save_customer_feedback tool call karo.\n  - Customer ko confirm karo ki unka feedback record ho gaya.\n  - Example: '[naam] ji, aapka feedback humne note kar liya hai. Hum jald hi aapse sampark karenge.'\n\nRULES:\n- Ek baar mein sirf ek sawaal poochho.\n- Hamesha polite aur empathetic raho — customer ki shikayat seriously lo.\n- Jab tak naam, product, usage duration, warranty status, aur complaint — yeh paanchon nahi mile, save_customer_feedback BILKUL MAT CALL KARO.\n- Chhoti, natural responses. Voice mein koi bullet points nahi.\n- Confirmation ke baad call end karo."
+    },
+    "scripts": {
+        "greeting": "Namaste! Aap Mydoot Customer Care mein bol rahe hain. Main aapki kaise madad kar sakta hoon? Shuru karte hain — kya aap apna naam bata sakte hain?",
+        "data_request": "Zaroor, thoda aur jaankari chahiye. Kya aap bata sakte hain?",
+        "thank_you": "Aapka bahut shukriya feedback dene ke liye. Hum jald hi is par action lenge."
+    },
+    "tools": {
+        "sarvam": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "save_customer_feedback",
+                    "description": "Call this ONLY after collecting ALL 5 pieces of information: customer_name, product_name, usage_duration, warranty_status, and complaint. Saves feedback to Google Sheets.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "customer_name": {
+                                "type": "string",
+                                "description": "Full name of the customer"
+                            },
+                            "product_name": {
+                                "type": "string",
+                                "description": "Name of the Mydoot product the customer uses"
+                            },
+                            "usage_duration": {
+                                "type": "string",
+                                "description": "How long the customer has been using the product, e.g. '6 months', '2 years'"
+                            },
+                            "warranty_status": {
+                                "type": "string",
+                                "enum": [
+                                    "Yes - Under Warranty",
+                                    "No - Out of Warranty",
+                                    "Customer Does Not Know"
+                                ],
+                                "description": "Warranty status of the product"
+                            },
+                            "complaint": {
+                                "type": "string",
+                                "description": "The customer's complaint or feedback about the product"
+                            }
+                        },
+                        "required": ["customer_name", "product_name", "usage_duration", "warranty_status", "complaint"]
+                    }
+                }
+            }
+        ],
+        "gemini": []
+    },
+    "active_provider": "sarvam",
+    "parameters": {
+        "sarvam": {
+            "model": "sarvam-30b",
+            "temperature": 0.4
+        },
+        "google": {
+            "model": "models/gemini-1.5-flash",
+            "temperature": 0.4
+        }
+    }
+}

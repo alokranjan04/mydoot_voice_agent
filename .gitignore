@@ -1,0 +1,53 @@
+# ── Secrets & credentials — NEVER commit these ────────────────────────────
+.env
+.env.*
+!.env.example
+!.env.local
+google-credentials.json
+gha-key.json
+testcnx-*.json
+*.json
+!app_config.json
+!app_config_backup.json
+!package.json
+!package-lock.json
+*.pyc
+fix_*.py
+debug_*.py
+test_google_sheets.py
+
+# ── Python ────────────────────────────────────────────────────────────────
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# ── OS / Editor ───────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.log
+
+# ── Project-specific ─────────────────────────────────────────────────────
+tmp/
+.gemini/
+recordings/
+benchmarks/
+scratch/
+metrics/call_log.jsonl
+.claude/
+
+# ── Sensitive utility scripts ────────────────────────────────────────────
+fix_creds.py
+check_models.py
+test_deployment.py
+test_models.py
+test_sarvam_api.py
+test_sarvam_robust.py
+NUKE_AND_BUILD.bat
+START_SARVAM.bat
+_fix_app.py
+sarvam_final.py
+sarvam_main.py
+sarvam_prod.py
+sarvan_final.py

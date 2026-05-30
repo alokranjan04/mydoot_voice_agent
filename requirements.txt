@@ -1,0 +1,16 @@
+# Core dependencies for Astrology Voice Agent
+aiohttp==3.11.11
+websockets==14.1
+requests==2.32.3
+python-dotenv==1.0.1
+psutil==6.1.1
+PyPDF2==3.0.1
+python-multipart==0.0.20
+
+# Optional / Helper dependencies
+google-api-python-client==2.155.0
+google-auth-httplib2==0.2.0
+google-auth-oauthlib==1.2.1
+google-generativeai==0.8.3
+deepgram-sdk==3.11.0
+openai==1.58.1
