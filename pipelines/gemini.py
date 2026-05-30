@@ -29,7 +29,7 @@ async def gemini_handler(request):
         )
 
     model = APP_CONFIG.get("parameters", {}).get("google", {}).get(
-        "model", "models/gemini-2.0-flash-live-001"
+        "model", "models/gemini-1.5-flash"
     )
     print(f"🚀 Gemini Live connecting | model={model} | caller={caller_id}")
     print(f"   WS URL: {GEMINI_WS_URL[:80]}...")
@@ -46,6 +46,7 @@ async def gemini_handler(request):
                             "response_modalities": ["AUDIO"],
                         },
                         "system_instruction": {
+                            "role": "system",
                             "parts": [{"text": get_system_prompt()}],
                         },
                         "tools": APP_CONFIG["tools"]["gemini"],
@@ -108,11 +109,15 @@ async def gemini_handler(request):
                                         },
                                     }))
 
-                            # Tool calls
-                            for fc in data.get("toolCall", {}).get("functionCalls", []):
+                            # Tool calls (gemini-1.5-flash path)
+                            for fc in (
+                                data.get("serverContent", {})
+                                    .get("modelTurn", {})
+                                    .get("toolCalls", [])
+                            ):
                                 fn   = fc.get("name", "")
                                 args = fc.get("args", {})
-                                cid  = fc.get("id", "")
+                                cid  = fc.get("callId", "")
                                 print(f"🔧 Tool call: {fn}({args})")
 
                                 if fn == "save_customer_feedback":

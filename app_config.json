@@ -53,7 +53,7 @@
         ],
         "gemini": [
             {
-                "functionDeclarations": [
+                "function_declarations": [
                     {
                         "name": "save_customer_feedback",
                         "description": "Call this ONLY after collecting ALL 5 pieces of information: customer_name, product_name, usage_duration, warranty_status, and complaint. Saves feedback to Google Sheets.",
@@ -95,7 +95,7 @@
             "temperature": 0.4
         },
         "google": {
-            "model": "models/gemini-2.0-flash-live-001",
+            "model": "models/gemini-1.5-flash",
             "temperature": 0.4
         }
     }
