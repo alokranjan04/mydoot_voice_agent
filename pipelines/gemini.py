@@ -2,7 +2,7 @@
 """
 Gemini Live Multimodal pipeline for Mydoot Customer Care.
 
-Uses Gemini BidiGenerateContent for native audio-in / audio-out —
+Uses Gemini BidiGenerateContent (v1beta) for native audio-in / audio-out —
 no separate STT or TTS services required.
 """
 import asyncio, base64, json, traceback
@@ -11,7 +11,7 @@ from datetime import datetime
 import aiohttp
 from aiohttp import web
 
-from config.settings import APP_CONFIG, GEMINI_API_KEY
+from config.settings import APP_CONFIG, GEMINI_API_KEY, GEMINI_WS_URL
 from core.state_engine import ConversationStateEngine
 from mydoot_functions import FUNCTION_MAP
 
@@ -20,7 +20,7 @@ async def gemini_handler(request):
     ws = web.WebSocketResponse(protocols=["audio.drachtio.org"])
     await ws.prepare(request)
 
-    caller_id   = request.query.get("caller_id", "Unknown")
+    caller_id    = request.query.get("caller_id", "Unknown")
     state_engine = ConversationStateEngine()
 
     def get_system_prompt():
@@ -31,17 +31,11 @@ async def gemini_handler(request):
         )
 
     model = APP_CONFIG.get("parameters", {}).get("google", {}).get("model", "models/gemini-2.0-flash-live-001")
-    url   = (
-        "wss://generativelanguage.googleapis.com/ws/"
-        "google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent"
-        f"?key={GEMINI_API_KEY}"
-    )
-
     print(f"🚀 Connecting to Gemini Live ({model})...")
 
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.ws_connect(url) as g_ws:
+            async with session.ws_connect(GEMINI_WS_URL) as g_ws:
 
                 # ── 1. Setup ────────────────────────────────────────────────
                 setup = {
@@ -58,7 +52,7 @@ async def gemini_handler(request):
                         "system_instruction": {
                             "parts": [{"text": get_system_prompt()}]
                         },
-                        "tools": APP_CONFIG["tools"]["gemini"],   # function_declarations
+                        "tools": APP_CONFIG["tools"]["gemini"],
                     }
                 }
                 await g_ws.send_json(setup)
@@ -67,16 +61,15 @@ async def gemini_handler(request):
                 print("✅ Gemini Live Ready")
 
                 # ── 2. Kick off with greeting ────────────────────────────────
-                greeting_msg = {
+                await g_ws.send_json({
                     "client_content": {
                         "turns": [{
                             "role": "user",
                             "parts": [{"text": APP_CONFIG["scripts"]["greeting"]}]
                         }],
-                        "turn_complete": True
+                        "turn_complete": True,
                     }
-                }
-                await g_ws.send_json(greeting_msg)
+                })
 
                 # ── 3. Receiver: audio + tool calls from Gemini ─────────────
                 async def g_receiver():
@@ -86,7 +79,7 @@ async def gemini_handler(request):
                                 break
                             data = json.loads(msg.data)
 
-                            # ── Audio chunks ────────────────────────────────
+                            # Audio chunks
                             for part in (
                                 data.get("serverContent", {})
                                     .get("modelTurn", {})
@@ -101,10 +94,10 @@ async def gemini_handler(request):
                                         },
                                     }))
 
-                            # ── Tool calls (Gemini Live: toolCall.functionCalls) ─
+                            # Tool calls — Gemini Live sends: toolCall.functionCalls
                             for fc in data.get("toolCall", {}).get("functionCalls", []):
                                 fn   = fc.get("name", "")
-                                args = fc.get("args", {})   # already a dict
+                                args = fc.get("args", {})   # already a dict, no json.loads needed
                                 cid  = fc.get("id", "")
 
                                 print(f"🔧 Gemini Tool: {fn}({args})")
@@ -118,16 +111,15 @@ async def gemini_handler(request):
 
                                 if fn in FUNCTION_MAP:
                                     res = await asyncio.to_thread(FUNCTION_MAP[fn], **args)
-                                    tool_resp = {
-                                        "toolResponse": {
-                                            "functionResponses": [{
+                                    await g_ws.send_json({
+                                        "tool_response": {
+                                            "function_responses": [{
                                                 "id":       cid,
                                                 "name":     fn,
-                                                "response": {"output": res},
+                                                "response": {"result": res},
                                             }]
                                         }
-                                    }
-                                    await g_ws.send_json(tool_resp)
+                                    })
 
                     except Exception:
                         pass
@@ -142,10 +134,10 @@ async def gemini_handler(request):
                             raw_mulaw = base64.b64decode(data["media"]["payload"])
                             pcm       = audioop.ulaw2lin(raw_mulaw, 2)
                             await g_ws.send_json({
-                                "realtimeInput": {
-                                    "mediaChunks": [{
+                                "realtime_input": {
+                                    "media_chunks": [{
                                         "data":      base64.b64encode(pcm).decode("utf-8"),
-                                        "mimeType":  "audio/pcm;rate=16000",
+                                        "mime_type": "audio/pcm",
                                     }]
                                 }
                             })
