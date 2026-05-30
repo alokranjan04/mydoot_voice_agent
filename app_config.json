@@ -95,7 +95,7 @@
             "temperature": 0.4
         },
         "google": {
-            "model": "models/gemini-1.5-flash",
+            "model": "models/gemini-2.5-flash-native-audio-latest",
             "temperature": 0.4
         }
     }

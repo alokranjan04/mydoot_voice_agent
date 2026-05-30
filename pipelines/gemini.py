@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """
 Gemini Live Multimodal pipeline for Mydoot Customer Care.
-Uses Gemini BidiGenerateContent (v1beta) — audio in / audio out, no STT/TTS needed.
+Uses websockets library + BidiGenerateContent (v1beta) — audio in / audio out.
 """
-import asyncio, base64, json, traceback
-import audioop
+import asyncio, audioop, base64, json, traceback
 from datetime import datetime
 import aiohttp
+import websockets
 from aiohttp import web
 
 from config.settings import APP_CONFIG, GEMINI_API_KEY, GEMINI_WS_URL
@@ -29,99 +29,91 @@ async def gemini_handler(request):
         )
 
     model = APP_CONFIG.get("parameters", {}).get("google", {}).get(
-        "model", "models/gemini-1.5-flash"
+        "model", "models/gemini-2.5-flash-native-audio-latest"
     )
     print(f"🚀 Gemini Live connecting | model={model} | caller={caller_id}")
-    print(f"   API key: {'SET len=' + str(len(GEMINI_API_KEY)) if GEMINI_API_KEY else '*** MISSING — will get 1008 ***'}")
-    print(f"   WS URL: {GEMINI_WS_URL[:80]}...")
+    print(f"   API key: {'SET len=' + str(len(GEMINI_API_KEY)) if GEMINI_API_KEY else '*** MISSING ***'}")
 
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.ws_connect(GEMINI_WS_URL) as g_ws:
+        async with websockets.connect(GEMINI_WS_URL, open_timeout=15) as g_ws:
 
-                # ── 1. Setup ────────────────────────────────────────────────
-                setup = {
-                    "setup": {
-                        "model": model,
-                        "generation_config": {
-                            "response_modalities": ["AUDIO"],
-                        },
-                        "system_instruction": {
-                            "role": "system",
-                            "parts": [{"text": get_system_prompt()}],
-                        },
-                        "tools": APP_CONFIG["tools"]["gemini"],
-                    }
+            # ── 1. Setup ────────────────────────────────────────────────────
+            setup = {
+                "setup": {
+                    "model": model,
+                    "generationConfig": {
+                        "responseModalities": ["AUDIO"],
+                    },
+                    "systemInstruction": {
+                        "parts": [{"text": get_system_prompt()}],
+                    },
+                    "tools": APP_CONFIG["tools"]["gemini"],
                 }
-                setup_json = json.dumps(setup)
-                print(f"📤 Setup payload ({len(setup_json)} bytes): {setup_json[:400]}")
-                await g_ws.send_json(setup)
-                print("📤 Setup sent — waiting for Gemini confirmation...")
+            }
+            await g_ws.send(json.dumps(setup))
+            print("📤 Setup sent — waiting for Gemini confirmation...")
 
-                # ── 2. Wait for setup confirmation (10s timeout) ─────────────
+            # ── 2. Wait for setup confirmation ──────────────────────────────
+            try:
+                raw = await asyncio.wait_for(g_ws.recv(), timeout=10.0)
+            except asyncio.TimeoutError:
+                raise Exception("Gemini setup timed out — check model name and API key")
+
+            resp = json.loads(raw)
+            if resp.get("error"):
+                raise Exception(f"Gemini setup error: {resp['error']}")
+            print(f"✅ Gemini Live Ready: {json.dumps(resp)[:120]}")
+
+            # ── 3. Kick off greeting ─────────────────────────────────────────
+            await g_ws.send(json.dumps({
+                "clientContent": {
+                    "turns": [{
+                        "role": "user",
+                        "parts": [{"text": APP_CONFIG["scripts"]["greeting"]}],
+                    }],
+                    "turnComplete": True,
+                }
+            }))
+
+            # ── 4. Receive loop: audio + tool calls from Gemini ─────────────
+            downsample_state = None
+
+            async def g_receiver():
+                nonlocal downsample_state
                 try:
-                    setup_msg = await asyncio.wait_for(g_ws.receive(), timeout=10.0)
-                except asyncio.TimeoutError:
-                    raise Exception("Gemini setup confirmation timed out after 10s — check model name and API key")
+                    async for raw_msg in g_ws:
+                        data = json.loads(raw_msg)
 
-                if setup_msg.type == aiohttp.WSMsgType.TEXT:
-                    resp = json.loads(setup_msg.data)
-                    print(f"📥 Setup response: {json.dumps(resp)[:400]}")
-                    if "error" in resp:
-                        raise Exception(f"Gemini setup error: {resp['error']}")
-                elif setup_msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.ERROR):
-                    reason = getattr(setup_msg, "extra", "") or ""
-                    raise Exception(f"Gemini setup rejected: code={setup_msg.data} reason={reason!r}")
-
-                print("✅ Gemini Live Ready")
-
-                # ── 3. Kick off greeting ─────────────────────────────────────
-                await g_ws.send_json({
-                    "client_content": {
-                        "turns": [{
-                            "role": "user",
-                            "parts": [{"text": APP_CONFIG["scripts"]["greeting"]}],
-                        }],
-                        "turn_complete": True,
-                    }
-                })
-
-                # ── 4. Receive loop: audio + tool calls from Gemini ──────────
-                async def g_receiver():
-                    try:
-                        async for msg in g_ws:
-                            if msg.type in (aiohttp.WSMsgType.CLOSE,
-                                            aiohttp.WSMsgType.ERROR):
-                                print(f"⚠️ Gemini WS closed/error: {msg.type} {msg.data}")
-                                break
-                            if msg.type != aiohttp.WSMsgType.TEXT:
-                                continue
-                            data = json.loads(msg.data)
-
-                            # Audio
-                            for part in (
-                                data.get("serverContent", {})
-                                    .get("modelTurn", {})
-                                    .get("parts", [])
-                            ):
-                                if part.get("inlineData"):
+                        # Audio output — convert Gemini's 24kHz PCM → 8kHz mu-law
+                        for part in (
+                            data.get("serverContent", {})
+                                .get("modelTurn", {})
+                                .get("parts", [])
+                        ):
+                            if part.get("inlineData"):
+                                pcm24 = base64.b64decode(part["inlineData"]["data"])
+                                pcm8, downsample_state = audioop.ratecv(
+                                    pcm24, 2, 1, 24000, 8000, downsample_state
+                                )
+                                pcm8 = audioop.mul(pcm8, 2, 1.4)   # slight volume boost
+                                mulaw = audioop.lin2ulaw(pcm8, 2)
+                                if not ws.closed:
                                     await ws.send_str(json.dumps({
                                         "event": "playAudio",
                                         "media": {
-                                            "payload":    part["inlineData"]["data"],
-                                            "sampleRate": 24000,
+                                            "contentType": "audio/x-mulaw",
+                                            "sampleRate":  8000,
+                                            "payload": base64.b64encode(mulaw).decode("utf-8"),
                                         },
                                     }))
 
-                            # Tool calls (gemini-1.5-flash path)
-                            for fc in (
-                                data.get("serverContent", {})
-                                    .get("modelTurn", {})
-                                    .get("toolCalls", [])
-                            ):
+                        # Tool calls
+                        tool_call = data.get("toolCall")
+                        if tool_call:
+                            for fc in tool_call.get("functionCalls", []):
                                 fn   = fc.get("name", "")
                                 args = fc.get("args", {})
-                                cid  = fc.get("callId", "")
+                                cid  = fc.get("id", "")
                                 print(f"🔧 Tool call: {fn}({args})")
 
                                 if fn == "save_customer_feedback":
@@ -133,44 +125,44 @@ async def gemini_handler(request):
 
                                 if fn in FUNCTION_MAP:
                                     res = await asyncio.to_thread(FUNCTION_MAP[fn], **args)
-                                    await g_ws.send_json({
-                                        "tool_response": {
-                                            "function_responses": [{
+                                    await g_ws.send(json.dumps({
+                                        "toolResponse": {
+                                            "functionResponses": [{
                                                 "id":       cid,
                                                 "name":     fn,
                                                 "response": {"result": res},
                                             }]
                                         }
-                                    })
+                                    }))
 
-                    except Exception as ex:
-                        print(f"❌ g_receiver error: {ex}")
+                except Exception as ex:
+                    print(f"❌ g_receiver error: {ex}")
 
-                asyncio.create_task(g_receiver())
+            asyncio.create_task(g_receiver())
 
-                # ── 5. Forward Vobiz audio → Gemini ─────────────────────────
-                # Vobiz sends mu-law 8 kHz; Gemini Live expects PCM 16 kHz.
-                resample_state = None
-                async for msg in ws:
-                    if msg.type == aiohttp.WSMsgType.TEXT:
-                        data = json.loads(msg.data)
-                        if data.get("event") == "media":
-                            raw_mulaw = base64.b64decode(data["media"]["payload"])
-                            pcm_8k    = audioop.ulaw2lin(raw_mulaw, 2)
-                            pcm_16k, resample_state = audioop.ratecv(
-                                pcm_8k, 2, 1, 8000, 16000, resample_state
-                            )
-                            await g_ws.send_json({
-                                "realtime_input": {
-                                    "media_chunks": [{
-                                        "data":      base64.b64encode(pcm_16k).decode("utf-8"),
-                                        "mime_type": "audio/pcm",
-                                    }]
+            # ── 5. Forward Vobiz audio → Gemini ─────────────────────────────
+            # Vobiz sends mu-law 8kHz; Gemini Live expects PCM 16kHz.
+            upsample_state = None
+            async for msg in ws:
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    data = json.loads(msg.data)
+                    if data.get("event") == "media":
+                        raw_mulaw = base64.b64decode(data["media"]["payload"])
+                        pcm8  = audioop.ulaw2lin(raw_mulaw, 2)
+                        pcm16, upsample_state = audioop.ratecv(
+                            pcm8, 2, 1, 8000, 16000, upsample_state
+                        )
+                        await g_ws.send(json.dumps({
+                            "realtimeInput": {
+                                "audio": {
+                                    "data":     base64.b64encode(pcm16).decode("utf-8"),
+                                    "mimeType": "audio/pcm;rate=16000",
                                 }
-                            })
-                    elif msg.type == aiohttp.WSMsgType.ERROR:
-                        print(f"❌ Vobiz WS error: {ws.exception()}")
-                        break
+                            }
+                        }))
+                elif msg.type == aiohttp.WSMsgType.ERROR:
+                    print(f"❌ Vobiz WS error: {ws.exception()}")
+                    break
 
     except Exception as e:
         print(f"❌ Gemini Live Error: {e}")
