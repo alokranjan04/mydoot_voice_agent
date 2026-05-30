@@ -21,7 +21,7 @@ WORKDIR /app
 COPY --from=builder /install /usr/local
 
 # Copy application source (secrets and local config excluded via .dockerignore)
-COPY app.py pharmacy_functions.py app_config.json ./
+COPY app.py mydoot_functions.py app_config.json ./
 COPY config/     ./config/
 COPY core/       ./core/
 COPY pipelines/  ./pipelines/
@@ -35,6 +35,6 @@ RUN mkdir -p recordings metrics && chown -R 1000:1000 /app
 RUN useradd -m -u 1000 priya
 USER priya
 
-EXPOSE ${PORT}
+EXPOSE 8080
 
 CMD ["python", "app.py"]

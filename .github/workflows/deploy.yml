@@ -1,4 +1,4 @@
-name: Deploy Priya to Compute Engine
+name: Deploy Mydoot Customer Care to Cloud Run
 
 on:
   push:
@@ -6,23 +6,28 @@ on:
   workflow_dispatch:
 
 env:
-  REGION:   us-central1
-  SERVICE_NAME: priya-agent
-  # Artifact Registry path for your project
-  REGISTRY: us-central1-docker.pkg.dev
-  IMAGE_NAME: us-central1-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/priya-repo/priya-agent
+  PROJECT_ID:   testcnx-169610
+  REGION:       us-central1
+  SERVICE_NAME: mydoot-voice-agent
+  REGISTRY:     us-central1-docker.pkg.dev
+  REPO:         mydoot-repo
+  IMAGE:        us-central1-docker.pkg.dev/testcnx-169610/mydoot-repo/mydoot-voice-agent
 
 jobs:
-  build-and-deploy:
+  deploy:
     runs-on: ubuntu-latest
+    environment: mydoot_env          # ← uses the mydoot_env GitHub environment secrets
+
     permissions:
       contents: read
       id-token: write
 
     steps:
-      - name: Checkout Code
+      # ── 1. Checkout ────────────────────────────────────────────────────────
+      - name: Checkout code
         uses: actions/checkout@v4
 
+      # ── 2. Auth to GCP ─────────────────────────────────────────────────────
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
         with:
@@ -31,64 +36,100 @@ jobs:
       - name: Set up Cloud SDK
         uses: google-github-actions/setup-gcloud@v2
 
-      - name: Configure Docker
+      # ── 3. Docker ──────────────────────────────────────────────────────────
+      - name: Configure Docker for Artifact Registry
         run: gcloud auth configure-docker ${{ env.REGISTRY }} --quiet
 
-      - name: Create Artifact Repository (if missing)
+      - name: Create Artifact Registry repo (idempotent)
         run: |
-          gcloud artifacts repositories create priya-repo \
+          gcloud artifacts repositories create ${{ env.REPO }} \
             --repository-format=docker \
             --location=${{ env.REGION }} \
-            --description="Priya Voice Agent Repository" || true
+            --project=${{ env.PROJECT_ID }} \
+            --description="Mydoot Customer Care Voice Agent" || true
 
-      - name: Build and Push Docker Image
+      - name: Build and push Docker image
         run: |
-          docker build -t us-central1-docker.pkg.dev/testcnx-169610/priya-repo/priya-agent:latest .
-          docker push us-central1-docker.pkg.dev/testcnx-169610/priya-repo/priya-agent:latest
+          docker build \
+            -t ${{ env.IMAGE }}:${{ github.sha }} \
+            -t ${{ env.IMAGE }}:latest \
+            .
+          docker push ${{ env.IMAGE }}:${{ github.sha }}
+          docker push ${{ env.IMAGE }}:latest
 
-      - name: Deploy to GCE via SSH
-        uses: appleboy/ssh-action@master
+      # ── 4. Build env-vars file (safe handling for JSON values) ─────────────
+      # Cloud Run's --env-vars-file accepts YAML key: "value" pairs.
+      # We use Python to write the file so JSON blobs (GOOGLE_CREDENTIALS)
+      # are properly escaped regardless of shell special characters.
+      - name: Build Cloud Run env-vars file
         env:
-          SARVAM_API_KEY: ${{ secrets.SARVAM_API_KEY }}
-          DEEPGRAM_API_KEY: ${{ secrets.DEEPGRAM_API_KEY }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          SARVAM_API_KEY:        ${{ secrets.SARVAM_API_KEY }}
+          DEEPGRAM_API_KEY:      ${{ secrets.DEEPGRAM_API_KEY }}
+          GEMINI_API_KEY:        ${{ secrets.GEMINI_API_KEY }}
+          ELEVEN_LABS_API_KEY:   ${{ secrets.ELEVEN_LABS_API_KEY }}
           GOOGLE_SPREADSHEET_ID: ${{ secrets.GOOGLE_SPREADSHEET_ID }}
-          GOOGLE_CALENDAR_ID: ${{ secrets.GOOGLE_CALENDAR_ID }}
-          GMAIL_USER: ${{ secrets.GMAIL_USER }}
-          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
-          DOCTOR_EMAIL: ${{ secrets.DOCTOR_EMAIL }}
-          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
-        with:
-          host: ${{ secrets.GCE_INSTANCE_IP }}
-          username: deploy-agent
-          key: ${{ secrets.SSH_PRIVATE_KEY }}
-          envs: SARVAM_API_KEY,DEEPGRAM_API_KEY,GEMINI_API_KEY,GOOGLE_SPREADSHEET_ID,GOOGLE_CALENDAR_ID,GMAIL_USER,GMAIL_APP_PASSWORD,DOCTOR_EMAIL,GCP_SA_KEY
-          script: |
-            # Authenticate 
-            gcloud auth configure-docker us-central1-docker.pkg.dev --quiet
-            
-            # Cleanup space
-            docker system prune -f
-            
-            # Pull and Update
-            docker pull us-central1-docker.pkg.dev/testcnx-169610/priya-repo/priya-agent:latest
-            docker stop priya-agent || true
-            docker rm priya-agent || true
-            
-            # Start the container using the environment variables passed from GHA
-            docker run -d \
-              --name priya-agent \
-              --restart always \
-              -p 5050:5050 \
-              -e SARVAM_API_KEY="$SARVAM_API_KEY" \
-              -e DEEPGRAM_API_KEY="$DEEPGRAM_API_KEY" \
-              -e GEMINI_API_KEY="$GEMINI_API_KEY" \
-              -e GOOGLE_SPREADSHEET_ID="$GOOGLE_SPREADSHEET_ID" \
-              -e GOOGLE_CALENDAR_ID="$GOOGLE_CALENDAR_ID" \
-              -e GMAIL_USER="$GMAIL_USER" \
-              -e GMAIL_APP_PASSWORD="$GMAIL_APP_PASSWORD" \
-              -e DOCTOR_EMAIL="$DOCTOR_EMAIL" \
-              -e GOOGLE_CREDENTIALS="$GCP_SA_KEY" \
-              us-central1-docker.pkg.dev/testcnx-169610/priya-repo/priya-agent:latest
-            
-            docker image prune -f
+          GMAIL_USER:            ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD:    ${{ secrets.GMAIL_APP_PASSWORD }}
+          DOCTOR_EMAIL:          ${{ secrets.DOCTOR_EMAIL }}
+          PUBLIC_URL:            ${{ secrets.PUBLIC_URL }}
+          # GOOGLE_CREDENTIALS reuses the deployment SA key for Sheets access.
+          # If you use a separate Sheets SA, add a GOOGLE_CREDENTIALS secret.
+          GOOGLE_CREDENTIALS:    ${{ secrets.GCP_SA_KEY }}
+        run: |
+          python3 - <<'PYEOF'
+          import os, json
+
+          keys = [
+              "SARVAM_API_KEY",
+              "DEEPGRAM_API_KEY",
+              "GEMINI_API_KEY",
+              "ELEVEN_LABS_API_KEY",
+              "GOOGLE_SPREADSHEET_ID",
+              "GMAIL_USER",
+              "GMAIL_APP_PASSWORD",
+              "DOCTOR_EMAIL",
+              "PUBLIC_URL",
+              "GOOGLE_CREDENTIALS",
+          ]
+
+          lines = []
+          for k in keys:
+              val = os.environ.get(k, "")
+              if val:                        # skip empty / unset secrets
+                  lines.append(f"{k}: {json.dumps(val)}")
+
+          with open("/tmp/env.yaml", "w") as f:
+              f.write("\n".join(lines) + "\n")
+
+          print(f"Wrote {len(lines)} env vars to /tmp/env.yaml")
+          PYEOF
+
+      # ── 5. Deploy to Cloud Run ─────────────────────────────────────────────
+      - name: Deploy to Cloud Run
+        run: |
+          gcloud run deploy ${{ env.SERVICE_NAME }} \
+            --image=${{ env.IMAGE }}:${{ github.sha }} \
+            --region=${{ env.REGION }} \
+            --project=${{ env.PROJECT_ID }} \
+            --platform=managed \
+            --allow-unauthenticated \
+            --port=8080 \
+            --timeout=3600 \
+            --concurrency=80 \
+            --min-instances=1 \
+            --max-instances=10 \
+            --memory=512Mi \
+            --cpu=1 \
+            --env-vars-file=/tmp/env.yaml
+
+      # ── 6. Print the live URL ──────────────────────────────────────────────
+      - name: Print service URL
+        run: |
+          URL=$(gcloud run services describe ${{ env.SERVICE_NAME }} \
+            --region=${{ env.REGION }} \
+            --project=${{ env.PROJECT_ID }} \
+            --format='value(status.url)')
+          echo "### Deployed: $URL" >> $GITHUB_STEP_SUMMARY
+          echo "Vobiz Answer URL: POST $URL/answer"
+          echo "Dashboard:        $URL/"
+          echo "Voice Lab:        $URL/voice-lab"
