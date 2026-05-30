@@ -51,16 +51,51 @@
                 }
             }
         ],
-        "gemini": []
+        "gemini": [
+            {
+                "function_declarations": [
+                    {
+                        "name": "save_customer_feedback",
+                        "description": "Call this ONLY after collecting ALL 5 pieces of information: customer_name, product_name, usage_duration, warranty_status, and complaint. Saves feedback to Google Sheets.",
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "customer_name": {
+                                    "type": "STRING",
+                                    "description": "Full name of the customer"
+                                },
+                                "product_name": {
+                                    "type": "STRING",
+                                    "description": "Name of the Mydoot product the customer uses"
+                                },
+                                "usage_duration": {
+                                    "type": "STRING",
+                                    "description": "How long the customer has been using the product, e.g. '6 months', '2 years'"
+                                },
+                                "warranty_status": {
+                                    "type": "STRING",
+                                    "description": "One of: 'Yes - Under Warranty', 'No - Out of Warranty', 'Customer Does Not Know'"
+                                },
+                                "complaint": {
+                                    "type": "STRING",
+                                    "description": "The customer's complaint or feedback about the product"
+                                }
+                            },
+                            "required": ["customer_name", "product_name", "usage_duration", "warranty_status", "complaint"]
+                        }
+                    }
+                ]
+            }
+        ]
     },
-    "active_provider": "sarvam",
+    "active_provider": "google",
     "parameters": {
         "sarvam": {
             "model": "sarvam-30b",
             "temperature": 0.4
         },
         "google": {
-            "model": "models/gemini-1.5-flash",
+            "model": "models/gemini-2.0-flash-live-001",
             "temperature": 0.4
         }
     }
