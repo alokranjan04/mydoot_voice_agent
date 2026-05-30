@@ -53,6 +53,8 @@ async def gemini_handler(request):
                         "tools": APP_CONFIG["tools"]["gemini"],
                     }
                 }
+                setup_json = json.dumps(setup)
+                print(f"📤 Setup payload ({len(setup_json)} bytes): {setup_json[:400]}")
                 await g_ws.send_json(setup)
                 print("📤 Setup sent — waiting for Gemini confirmation...")
 
@@ -64,11 +66,12 @@ async def gemini_handler(request):
 
                 if setup_msg.type == aiohttp.WSMsgType.TEXT:
                     resp = json.loads(setup_msg.data)
-                    print(f"📥 Setup response: {json.dumps(resp)[:300]}")
+                    print(f"📥 Setup response: {json.dumps(resp)[:400]}")
                     if "error" in resp:
                         raise Exception(f"Gemini setup error: {resp['error']}")
                 elif setup_msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.ERROR):
-                    raise Exception(f"Gemini closed connection during setup: {setup_msg.data}")
+                    reason = getattr(setup_msg, "extra", "") or ""
+                    raise Exception(f"Gemini setup rejected: code={setup_msg.data} reason={reason!r}")
 
                 print("✅ Gemini Live Ready")
 
