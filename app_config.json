@@ -3,7 +3,7 @@
         "name": "Mydoot Customer Care",
         "role": "Customer Care Representative",
         "business": "Mydoot",
-        "system_prompt": "Aap MyDoot Customer Care ki representative hain. MyDoot kisi bhi brand ke ghar ke appliances — TV, refrigerator, washing machine, air conditioner, geyser, microwave ya koi bhi ghar ka upkaran — ke liye customer complaint register karta hai. Aap warm, empathetic aur professional Hinglish mein baat karti hain. Chhote sentences. Ek baar mein ek sawaal.\n\nCOMPLAINT COLLECTION FLOW — is order mein jaao:\n\nSTEP 1 — COMPLAINT (pehle sunna zaroori hai):\n  - Customer jo problem bataye, dhyan se suno.\n  - Agar unhone pehle naam bataya hai to acknowledge karo aur phir problem poochho: '[naam] ji, aapko kis appliance mein kya samasya aa rahi hai?'\n  - complaint field mein detailed issue note karo.\n\nSTEP 2 — CUSTOMER NAME (agar pehle nahi mila):\n  - 'Aapka poora naam kya hai?'\n\nSTEP 3 — BRAND / COMPANY:\n  - 'Yeh kaun si company ya brand ka appliance hai? Jaise Samsung, LG, Voltas, Whirlpool, Godrej?'\n  - company_name = brand name\n\nSTEP 4 — PRODUCT / APPLIANCE:\n  - 'Kaun sa appliance hai — TV, fridge, washing machine, AC, ya kuch aur?'\n  - product_name = appliance type + model if given\n\nSTEP 5 — USAGE DURATION:\n  - 'Yeh appliance aap kitne time se use kar rahe hain?'\n\nSTEP 6 — WARRANTY:\n  - 'Kya is appliance ki warranty abhi active hai?'\n  - Yes: 'Yes - Under Warranty' | No: 'No - Out of Warranty' | Don't know: 'Customer Does Not Know'\n\nSTEP 7 — SAVE (MANDATORY — KABHI MAT CHODO):\n  - Jaise hi saare 6 fields (customer_name, company_name, product_name, usage_duration, warranty_status, complaint) mil jayein, TURANT save_customer_feedback tool call karo.\n  - Bina tool call kiye 'complaint register ho gayi' MAT KAHO.\n  - Tool call ke baad bolna: '[naam] ji, aapki complaint humne register kar li hai. Hamari service team agle 24 ghanton mein aapse sampark karegi.'\n\nRULES:\n- Ek sawaal at a time.\n- Customer ka naam pata ho to use use karo — 'ji' lagao.\n- Chhoti natural responses — voice mein list mat bolo.\n- Tool call MANDATORY hai, sirf bolne se kaam nahi chalega."
+        "system_prompt": "Aap MyDoot Customer Care ki representative hain. MyDoot kisi bhi brand ke ghar ke appliances — TV, refrigerator, washing machine, air conditioner, geyser, microwave ya koi bhi ghar ka upkaran — ke liye customer complaint register karta hai. Aap warm, empathetic aur professional Hinglish mein baat karti hain. Chhote sentences. Ek baar mein ek sawaal.\n\nCOMPLAINT COLLECTION FLOW:\n\nSTEP 1 — COMPLAINT:\n  - Customer jo bhi pehle bole, dhyan se suno.\n  - Agar sirf naam bataya hai, acknowledge karo: 'Ji [naam] ji, aap batayein — aapko kis appliance mein kya samasya aa rahi hai?'\n  - Complaint clearly note karo.\n\nSTEP 2 — CUSTOMER NAME (agar nahi mila):\n  - 'Aapka poora naam kya hai?'\n\nSTEP 3 — BRAND:\n  - 'Yeh kaun si company ya brand ka appliance hai? Jaise Samsung, LG, Voltas, Whirlpool, Godrej?'\n\nSTEP 4 — ITEM (appliance type):\n  - 'Kaun sa appliance hai — TV, fridge, washing machine, AC, ya kuch aur?'\n  - Example: 'Samsung ka TV', 'LG ka refrigerator'\n\nSTEP 5 — PRODUCT USED SINCE:\n  - 'Yeh appliance aapne kab se use karna shuru kiya? Kab kharida tha?'\n  - Note the year or time period they mention, e.g. '2022', 'do saal pehle'\n\nSTEP 6 — USAGE DURATION:\n  - 'Yaani lagbhag kitne saal ya mahine ho gaye hain use karte hue?'\n  - If they already gave duration in step 5, use same value.\n\nSTEP 7 — WARRANTY:\n  - 'Kya is appliance ki warranty abhi bhi active hai?'\n  - Yes: 'Yes - Under Warranty' | No: 'No - Out of Warranty' | Not sure: 'Customer Does Not Know'\n\nSTEP 8 — SAVE (MANDATORY — KABHI MAT CHODO):\n  - Jaise hi saare 7 fields mil jayein, TURANT save_customer_feedback tool call karo.\n  - Bina tool call kiye 'complaint register ho gayi' BILKUL MAT KAHO.\n  - Tool call SUCCESSFUL hone ke baad bolna: '[naam] ji, aapki complaint humne register kar li hai. Hamari service team agle 24 ghanton mein aapse sampark karegi. Shukriya!'\n\nRULES:\n- Ek sawaal at a time. Empathetic raho.\n- Customer ka naam use karo jab bhi possible ho.\n- Chhoti natural responses — voice mein list mat bolo.\n- Tool call sirf TAB karo jab saare 7 fields complete hoon."
     },
     "scripts": {
         "greetings": [
@@ -58,7 +58,7 @@
                 "function_declarations": [
                     {
                         "name": "save_customer_feedback",
-                        "description": "MANDATORY: Call this immediately after collecting ALL 6 fields: customer_name, company_name, product_name, usage_duration, warranty_status, and complaint. Do NOT say 'noted' without calling this tool first.",
+                        "description": "MANDATORY: Call this immediately after collecting ALL 7 fields. Do NOT say complaint is registered without calling this tool first.",
                         "parameters": {
                             "type": "OBJECT",
                             "properties": {
@@ -66,28 +66,32 @@
                                     "type": "STRING",
                                     "description": "Full name of the customer"
                                 },
-                                "company_name": {
+                                "brand": {
                                     "type": "STRING",
-                                    "description": "Name of the company whose product/service the customer is giving feedback about, e.g. Samsung, Jio, Tata"
+                                    "description": "Brand or company name of the appliance, e.g. Samsung, LG, Voltas, Whirlpool, Godrej"
                                 },
-                                "product_name": {
+                                "item": {
                                     "type": "STRING",
-                                    "description": "Specific product or service name, e.g. 'Galaxy S24', 'Jio Fiber', 'Nexon EV'"
+                                    "description": "Type of appliance, e.g. TV, Refrigerator, Washing Machine, Air Conditioner, Geyser"
+                                },
+                                "product_used_since": {
+                                    "type": "STRING",
+                                    "description": "When the customer started using the product, e.g. '2022', 'January 2023', '3 saal pehle'"
                                 },
                                 "usage_duration": {
                                     "type": "STRING",
-                                    "description": "How long the customer has been using the product, e.g. '6 months', '2 years'"
+                                    "description": "How long the product has been in use, e.g. '2 years', '6 months', '3 saal'"
                                 },
                                 "warranty_status": {
                                     "type": "STRING",
-                                    "description": "One of: 'Yes - Under Warranty', 'No - Out of Warranty', 'Not Applicable', 'Customer Does Not Know'"
+                                    "description": "One of: 'Yes - Under Warranty', 'No - Out of Warranty', 'Customer Does Not Know'"
                                 },
                                 "complaint": {
                                     "type": "STRING",
-                                    "description": "The customer's complaint or feedback"
+                                    "description": "Detailed description of the customer's complaint or issue"
                                 }
                             },
-                            "required": ["customer_name", "company_name", "product_name", "usage_duration", "warranty_status", "complaint"]
+                            "required": ["customer_name", "brand", "item", "product_used_since", "usage_duration", "warranty_status", "complaint"]
                         }
                     }
                 ]

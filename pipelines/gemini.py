@@ -36,7 +36,12 @@ async def gemini_handler(request):
     print(f"   API key: {'SET len=' + str(len(GEMINI_API_KEY)) if GEMINI_API_KEY else '*** MISSING ***'}")
 
     try:
-        async with websockets.connect(GEMINI_WS_URL, open_timeout=15) as g_ws:
+        async with websockets.connect(
+            GEMINI_WS_URL,
+            open_timeout=15,
+            ping_interval=20,
+            ping_timeout=20,
+        ) as g_ws:
 
             # ── 1. Setup ────────────────────────────────────────────────────
             setup = {
@@ -195,12 +200,11 @@ async def gemini_handler(request):
         print(f"❌ Gemini Live Error: {e}")
         traceback.print_exc()
     finally:
-        # Send email transcript
-        if transcript_log:
-            try:
-                await asyncio.to_thread(send_call_summary_email, caller_id, transcript_log)
-            except Exception as mail_err:
-                print(f"[EMAIL WARN]: {mail_err}")
+        # Always send transcript email (even if empty — confirms call happened)
+        try:
+            await asyncio.to_thread(send_call_summary_email, caller_id, transcript_log)
+        except Exception as mail_err:
+            print(f"[EMAIL WARN]: {mail_err}")
         if not ws.closed:
             await ws.close()
 

@@ -5,9 +5,9 @@ mydoot_functions.py — Mydoot Customer Care tool functions.
 Collects customer feedback via voice and saves to Google Sheets.
 
 Expected Google Sheet columns (Sheet1):
-  A: Customer Name | B: Company Name | C: Product/Service
-  D: Usage Duration | E: Warranty Status | F: Complaint
-  G: Timestamp | H: Caller ID
+  A: Customer Name | B: Brand    | C: Item
+  D: Product Used Since | E: Usage Duration | F: Warranty Status
+  G: Complaint | H: Timestamp | I: Caller ID
 """
 import os
 import json
@@ -87,16 +87,17 @@ def _ensure_header_row(service, spreadsheet_id):
     """Write the header row if the sheet is empty."""
     try:
         result = service.spreadsheets().values().get(
-            spreadsheetId=spreadsheet_id, range="Sheet1!A1:H1"
+            spreadsheetId=spreadsheet_id, range="Sheet1!A1:I1"
         ).execute()
         existing = result.get("values", [])
         if not existing:
-            headers = [["Customer Name", "Company Name", "Product/Service",
-                        "Usage Duration", "Warranty Status", "Complaint",
+            headers = [["Customer Name", "Brand", "Item",
+                        "Product Used Since", "Usage Duration",
+                        "Warranty Status", "Complaint",
                         "Timestamp", "Caller ID"]]
             service.spreadsheets().values().update(
                 spreadsheetId=spreadsheet_id,
-                range="Sheet1!A1:H1",
+                range="Sheet1!A1:I1",
                 valueInputOption="RAW",
                 body={"values": headers}
             ).execute()
@@ -105,18 +106,19 @@ def _ensure_header_row(service, spreadsheet_id):
         print(f"[SHEETS HEADER WARNING]: {e}")
 
 
-def save_customer_feedback(customer_name, company_name, product_name,
-                           usage_duration, warranty_status, complaint,
+def save_customer_feedback(customer_name, brand, item,
+                           product_used_since, usage_duration,
+                           warranty_status, complaint,
                            caller_id=""):
     """
     Save customer feedback to Google Sheets.
 
-    Sheet columns (A–H):
-      A: Customer Name | B: Company Name  | C: Product/Service
-      D: Usage Duration| E: Warranty Status| F: Complaint
-      G: Timestamp     | H: Caller ID
+    Sheet columns (A–I):
+      A: Customer Name | B: Brand  | C: Item
+      D: Product Used Since | E: Usage Duration | F: Warranty Status
+      G: Complaint | H: Timestamp | I: Caller ID
     """
-    print(f"[FEEDBACK]: Saving — Customer={customer_name}, Company={company_name}, Product={product_name}")
+    print(f"[FEEDBACK]: Saving — Customer={customer_name}, Brand={brand}, Item={item}")
     try:
         service, spreadsheet_id = _get_sheets_service()
         if not service:
@@ -130,8 +132,9 @@ def save_customer_feedback(customer_name, company_name, product_name,
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         values = [[
             customer_name,
-            company_name,
-            product_name,
+            brand,
+            item,
+            product_used_since,
             usage_duration,
             warranty_status,
             complaint,
@@ -152,8 +155,9 @@ def save_customer_feedback(customer_name, company_name, product_name,
         return {
             "success": True,
             "message": (
-                f"Aapka feedback successfully save ho gaya hai, {customer_name} ji. "
-                "Shukriya Mydoot se contact karne ke liye!"
+                f"{customer_name} ji, aapki complaint humne register kar li hai. "
+                "Hamari service team agle 24 ghanton mein aapse sampark karegi. "
+                "Shukriya MyDoot Customer Care ko call karne ke liye!"
             ),
         }
     except Exception as e:
@@ -164,18 +168,31 @@ def save_customer_feedback(customer_name, company_name, product_name,
 def send_call_summary_email(caller_id: str, transcript_lines: list):
     """Send full call transcript to the configured admin email after each call."""
     gmail_user     = os.getenv("GMAIL_USER", "").strip()
-    gmail_password = os.getenv("GMAIL_APP_PASSWORD", "").strip()
+    gmail_password = os.getenv("GMAIL_APP_PASSWORD", "").strip().replace(" ", "")
     if not gmail_user or not gmail_password:
         print("[EMAIL]: GMAIL_USER or GMAIL_APP_PASSWORD not set — skipping email.")
         return
 
-    subject = f"Mydoot Call Transcript — {caller_id} — {datetime.now().strftime('%Y-%m-%d %H:%M')}"
-    body    = "\n".join(transcript_lines) if transcript_lines else "(no transcript captured)"
+    ts      = datetime.now().strftime("%Y-%m-%d %H:%M IST")
+    subject = f"MyDoot Call Transcript — Caller: {caller_id} — {ts}"
+    body_lines = [
+        f"MyDoot Customer Care — Call Summary",
+        f"Caller ID : {caller_id}",
+        f"Time      : {ts}",
+        f"",
+        "─── TRANSCRIPT ───",
+        "",
+    ]
+    if transcript_lines:
+        body_lines.extend(transcript_lines)
+    else:
+        body_lines.append("(No transcript captured — transcription may not be supported for this call)")
+    body = "\n".join(body_lines)
 
     try:
         msg = MIMEMultipart()
         msg["From"]    = gmail_user
-        msg["To"]      = gmail_user          # send to self (admin inbox)
+        msg["To"]      = gmail_user
         msg["Subject"] = subject
         msg.attach(MIMEText(body, "plain", "utf-8"))
 
