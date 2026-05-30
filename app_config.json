@@ -53,7 +53,7 @@
         ],
         "gemini": [
             {
-                "function_declarations": [
+                "functionDeclarations": [
                     {
                         "name": "save_customer_feedback",
                         "description": "Call this ONLY after collecting ALL 5 pieces of information: customer_name, product_name, usage_duration, warranty_status, and complaint. Saves feedback to Google Sheets.",

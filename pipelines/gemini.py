@@ -46,7 +46,6 @@ async def gemini_handler(request):
                             "response_modalities": ["AUDIO"],
                         },
                         "system_instruction": {
-                            "role": "system",
                             "parts": [{"text": get_system_prompt()}],
                         },
                         "tools": APP_CONFIG["tools"]["gemini"],
