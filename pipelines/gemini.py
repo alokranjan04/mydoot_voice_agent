@@ -85,9 +85,12 @@ async def gemini_handler(request):
                 async def g_receiver():
                     try:
                         async for msg in g_ws:
-                            if msg.type != aiohttp.WSMsgType.TEXT:
-                                print(f"⚠️ Gemini WS non-text msg: {msg.type}")
+                            if msg.type in (aiohttp.WSMsgType.CLOSE,
+                                            aiohttp.WSMsgType.ERROR):
+                                print(f"⚠️ Gemini WS closed/error: {msg.type} {msg.data}")
                                 break
+                            if msg.type != aiohttp.WSMsgType.TEXT:
+                                continue
                             data = json.loads(msg.data)
 
                             # Audio
@@ -137,16 +140,21 @@ async def gemini_handler(request):
                 asyncio.create_task(g_receiver())
 
                 # ── 5. Forward Vobiz audio → Gemini ─────────────────────────
+                # Vobiz sends mu-law 8 kHz; Gemini Live expects PCM 16 kHz.
+                resample_state = None
                 async for msg in ws:
                     if msg.type == aiohttp.WSMsgType.TEXT:
                         data = json.loads(msg.data)
                         if data.get("event") == "media":
                             raw_mulaw = base64.b64decode(data["media"]["payload"])
-                            pcm       = audioop.ulaw2lin(raw_mulaw, 2)
+                            pcm_8k    = audioop.ulaw2lin(raw_mulaw, 2)
+                            pcm_16k, resample_state = audioop.ratecv(
+                                pcm_8k, 2, 1, 8000, 16000, resample_state
+                            )
                             await g_ws.send_json({
                                 "realtime_input": {
                                     "media_chunks": [{
-                                        "data":      base64.b64encode(pcm).decode("utf-8"),
+                                        "data":      base64.b64encode(pcm_16k).decode("utf-8"),
                                         "mime_type": "audio/pcm",
                                     }]
                                 }
