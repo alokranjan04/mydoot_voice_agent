@@ -32,6 +32,7 @@ async def gemini_handler(request):
         "model", "models/gemini-1.5-flash"
     )
     print(f"🚀 Gemini Live connecting | model={model} | caller={caller_id}")
+    print(f"   API key: {'SET len=' + str(len(GEMINI_API_KEY)) if GEMINI_API_KEY else '*** MISSING — will get 1008 ***'}")
     print(f"   WS URL: {GEMINI_WS_URL[:80]}...")
 
     try:
