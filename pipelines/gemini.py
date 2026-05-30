@@ -3,7 +3,7 @@
 Gemini Live Multimodal pipeline for Mydoot Customer Care.
 Uses websockets library + BidiGenerateContent (v1beta) — audio in / audio out.
 """
-import asyncio, audioop, base64, json, traceback
+import asyncio, audioop, base64, json, random, time, traceback
 from datetime import datetime
 import aiohttp
 import websockets
@@ -67,22 +67,27 @@ async def gemini_handler(request):
                 raise Exception(f"Gemini setup error: {resp['error']}")
             print(f"✅ Gemini Live Ready: {json.dumps(resp)[:120]}")
 
-            # ── 3. Kick off greeting ─────────────────────────────────────────
+            # ── 3. Kick off greeting (rotating) ─────────────────────────────
+            greetings = APP_CONFIG["scripts"].get(
+                "greetings", [APP_CONFIG["scripts"].get("greeting", "Namaskar!")]
+            )
+            greeting_text = random.choice(greetings)
             await g_ws.send(json.dumps({
                 "clientContent": {
                     "turns": [{
                         "role": "user",
-                        "parts": [{"text": APP_CONFIG["scripts"]["greeting"]}],
+                        "parts": [{"text": greeting_text}],
                     }],
                     "turnComplete": True,
                 }
             }))
 
             # ── 4. Receive loop: audio + tool calls from Gemini ─────────────
-            downsample_state = None
+            downsample_state  = None
+            last_ai_audio_ts  = 0.0   # track when Gemini last sent audio
 
             async def g_receiver():
-                nonlocal downsample_state
+                nonlocal downsample_state, last_ai_audio_ts
                 try:
                     async for raw_msg in g_ws:
                         data = json.loads(raw_msg)
@@ -110,6 +115,7 @@ async def gemini_handler(request):
                                 )
                                 pcm8 = audioop.mul(pcm8, 2, 1.4)
                                 mulaw = audioop.lin2ulaw(pcm8, 2)
+                                last_ai_audio_ts = time.time()  # mark AI speaking
                                 if not ws.closed:
                                     await ws.send_str(json.dumps({
                                         "event": "playAudio",
@@ -158,11 +164,16 @@ async def gemini_handler(request):
 
             # ── 5. Forward Vobiz audio → Gemini ─────────────────────────────
             # Vobiz sends mu-law 8kHz; Gemini Live expects PCM 16kHz.
+            # ECHO GUARD: don't send user audio while Gemini is speaking —
+            # echoing AI audio back confuses VAD and causes infinite silence.
             upsample_state = None
             async for msg in ws:
                 if msg.type == aiohttp.WSMsgType.TEXT:
                     data = json.loads(msg.data)
                     if data.get("event") == "media":
+                        # Skip if Gemini spoke within the last 1.2 seconds
+                        if time.time() - last_ai_audio_ts < 1.2:
+                            continue
                         raw_mulaw = base64.b64decode(data["media"]["payload"])
                         pcm8  = audioop.ulaw2lin(raw_mulaw, 2)
                         pcm16, upsample_state = audioop.ratecv(
