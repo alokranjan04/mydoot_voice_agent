@@ -176,7 +176,7 @@ async def gemini_handler(request):
                         if out_t and out_t.get("text"):
                             # Agent started speaking — flush pending customer line
                             if customer_buf.strip():
-                                line = f"Customer: {_clean_transcript(customer_buf.strip())}"
+                                line = f"[{_ts()}] Customer: {_clean_transcript(customer_buf.strip())}"
                                 transcript_log.append(line)
                                 log(f"🗣  {line}")
                                 customer_buf = ""
@@ -212,7 +212,7 @@ async def gemini_handler(request):
                             ai_dur = gemini_turn_end_ts - last_ai_audio_ts if last_ai_audio_ts else 0
                             # Flush agent buffer as one clean line
                             if agent_buf.strip():
-                                line = f"Agent: {agent_buf.strip()}"
+                                line = f"[{_ts()}] Agent: {agent_buf.strip()}"
                                 transcript_log.append(line)
                                 log(f"🤖  {line}")
                                 agent_buf = ""
@@ -288,14 +288,22 @@ async def gemini_handler(request):
                             log(f"❌ Gemini error message: {data['error']}")
 
                 except Exception as ex:
-                    log(f"❌ g_receiver error: {ex}")
+                    log(f"❌ g_receiver error: {type(ex).__name__}: {ex}")
                     traceback.print_exc()
+                else:
+                    # Loop ended without exception = Gemini closed connection normally
+                    try:
+                        close_code = g_ws.protocol.close_code
+                        close_reason = g_ws.protocol.close_reason
+                        log(f"⚠️  Gemini closed connection — code={close_code} reason={close_reason!r}")
+                    except Exception:
+                        log("⚠️  Gemini closed connection (no close code available)")
                 finally:
                     # Flush any partial buffers that didn't get a turnComplete
                     if agent_buf.strip():
-                        transcript_log.append(f"Agent: {agent_buf.strip()}")
+                        transcript_log.append(f"[{_ts()}] Agent: {agent_buf.strip()}")
                     if customer_buf.strip():
-                        transcript_log.append(f"Customer: {_clean_transcript(customer_buf.strip())}")
+                        transcript_log.append(f"[{_ts()}] Customer: {_clean_transcript(customer_buf.strip())}")
                     log("🔁 g_receiver exiting — releasing echo guard")
                     gemini_turn_end_ts = time.time() - 1.0
 
@@ -352,16 +360,10 @@ async def gemini_handler(request):
                                 f"(turnComplete missing for {now - last_ai_audio_ts:.1f}s)")
                             gemini_turn_end_ts = now - 1.0
 
-                        # Echo guard: 1.0s buffer after turnComplete
-                        guard_active = now - gemini_turn_end_ts < 1.0
+                        # Echo guard: 0.5s buffer after turnComplete
+                        guard_active = now - gemini_turn_end_ts < 0.5
                         if guard_active:
                             blocked_count += 1
-                            # Log guard state once per second (not every packet)
-                            if now - guard_log_ts > 1.0:
-                                guard_log_ts = now
-                                log(f"🔇 Echo guard active — "
-                                    f"{1.0 - (now - gemini_turn_end_ts):.2f}s remaining "
-                                    f"| blocked={blocked_count} pkts")
                             continue
 
                         raw_mulaw = base64.b64decode(data["media"]["payload"])
