@@ -3,7 +3,7 @@
 Gemini Live Multimodal pipeline for Mydoot Customer Care.
 Uses websockets library + BidiGenerateContent (v1beta) — audio in / audio out.
 """
-import asyncio, audioop, base64, json, random, time, traceback
+import asyncio, audioop, base64, json, time, traceback
 from datetime import datetime
 import aiohttp
 import websockets
@@ -32,6 +32,37 @@ async def _close_after(vobiz_ws, gemini_ws, delay: float, log_fn):
             await vobiz_ws.close()
     except Exception:
         pass
+
+
+def _clean_transcript(text: str) -> str:
+    """
+    Keep only Latin, Devanagari, digits, and common punctuation.
+    Replaces runs of unsupported characters (Urdu, Tamil, Japanese, etc.)
+    with [unclear] so the transcript stays in English/Hindi/Hinglish only.
+    """
+    result = []
+    run = []
+    for ch in text:
+        cp = ord(ch)
+        allowed = (
+            cp <= 0x024F            # Latin + Latin Extended
+            or 0x0900 <= cp <= 0x097F  # Devanagari (Hindi)
+            or ch in " \t\n.,!?-–—()[]\":;'/"
+        )
+        if allowed:
+            if run:
+                result.append("[unclear]")
+                run = []
+            result.append(ch)
+        else:
+            run.append(ch)
+    if run:
+        result.append("[unclear]")
+    cleaned = "".join(result).strip()
+    # Collapse multiple [unclear] tags
+    import re
+    cleaned = re.sub(r"(\[unclear\]\s*)+", "[unclear] ", cleaned).strip()
+    return cleaned
 
 
 async def gemini_handler(request):
@@ -145,7 +176,7 @@ async def gemini_handler(request):
                         if out_t and out_t.get("text"):
                             # Agent started speaking — flush pending customer line
                             if customer_buf.strip():
-                                line = f"Customer: {customer_buf.strip()}"
+                                line = f"Customer: {_clean_transcript(customer_buf.strip())}"
                                 transcript_log.append(line)
                                 log(f"🗣  {line}")
                                 customer_buf = ""
@@ -189,6 +220,11 @@ async def gemini_handler(request):
                                 greeting_done = True
                                 log(f"🔔 turnComplete — GREETING DONE, customer audio now live "
                                     f"(last audio {ai_dur:.2f}s ago)")
+                            elif save_done_ts > 0:
+                                # First turnComplete after save = confirmation finished
+                                # Close call immediately so Gemini can't repeat it
+                                log("✅ Confirmation turnComplete — closing call now")
+                                asyncio.create_task(_close_after(ws, g_ws, 0.5, log))
                             else:
                                 log(f"🔔 turnComplete — echo guard releases in 1.0s "
                                     f"(last audio {ai_dur:.2f}s ago)")
@@ -257,11 +293,9 @@ async def gemini_handler(request):
                 finally:
                     # Flush any partial buffers that didn't get a turnComplete
                     if agent_buf.strip():
-                        line = f"Agent: {agent_buf.strip()}"
-                        transcript_log.append(line)
+                        transcript_log.append(f"Agent: {agent_buf.strip()}")
                     if customer_buf.strip():
-                        line = f"Customer: {customer_buf.strip()}"
-                        transcript_log.append(line)
+                        transcript_log.append(f"Customer: {_clean_transcript(customer_buf.strip())}")
                     log("🔁 g_receiver exiting — releasing echo guard")
                     gemini_turn_end_ts = time.time() - 1.0
 
