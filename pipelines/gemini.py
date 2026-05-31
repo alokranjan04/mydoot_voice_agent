@@ -29,7 +29,7 @@ SPEECH_TAIL_SECS           = float(os.getenv("SPEECH_TAIL_SECS", "0.4"))
 # After the speech tail expires, forward zero-amplitude audio for this long.
 # This gives Gemini's VAD an explicit silence signal so it responds in ~1-2s
 # instead of waiting 20-30s for background noise to go silent on its own.
-SILENCE_SEND_SECS          = float(os.getenv("SILENCE_SEND_SECS", "2.0"))
+SILENCE_SEND_SECS          = float(os.getenv("SILENCE_SEND_SECS", "5.0"))
 # Accumulate this many 20ms frames before sending one Gemini message.
 # 4 × 20ms = 80ms chunks → ~12 sends/s instead of 50.
 AUDIO_BATCH_FRAMES         = 4
@@ -362,14 +362,19 @@ async def gemini_handler(request):
                                 log(f"🔒 Post-save guard — {15.0 - (now - save_done_ts):.0f}s remaining")
                             continue
 
-                        # Block ALL audio until greeting turnComplete fires.
-                        # This prevents background noise from interrupting the greeting.
-                        # Safety: if greeting turnComplete never arrives within 20s,
-                        # force-release so the call doesn't hang forever.
+                        # Block ALL audio until greeting finishes.
+                        # Early release: 1.0s after the last audio chunk — because
+                        # gemini-2.5-flash-native-audio-latest fires turnComplete 7+s
+                        # after the last audio, causing the customer's first response
+                        # to be completely missed while waiting for turnComplete.
                         if not greeting_done:
-                            if now - call_start_ts > 20.0:
-                                log("⚠️  Greeting turnComplete missing after 20s — force-releasing")
+                            if last_ai_audio_ts > 0 and now - last_ai_audio_ts > 1.0:
                                 greeting_done = True
+                                log(f"🔔 Greeting early release — last audio "
+                                    f"{now - last_ai_audio_ts:.1f}s ago, accepting customer audio")
+                            elif now - call_start_ts > 20.0:
+                                greeting_done = True
+                                log("⚠️  Greeting guard 20s timeout — force-releasing")
                             else:
                                 blocked_count += 1
                                 if now - guard_log_ts > 3.0:
