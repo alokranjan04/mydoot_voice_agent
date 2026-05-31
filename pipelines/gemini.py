@@ -17,15 +17,18 @@ from mydoot_functions import FUNCTION_MAP, send_call_summary_email
 # Packets below this RMS are treated as background noise (fan, line hiss, etc.)
 # and not forwarded to Gemini. Increase if fan noise still leaks through;
 # decrease if soft speech is being filtered out.
-NOISE_GATE_RMS     = int(os.getenv("NOISE_GATE_RMS", "300"))
+NOISE_GATE_RMS             = int(os.getenv("NOISE_GATE_RMS", "60"))
+NOISE_GATE_FALLBACK_RMS     = int(os.getenv("NOISE_GATE_FALLBACK_RMS", "20"))
+NOISE_GATE_FALLBACK_AFTER_S = float(os.getenv("NOISE_GATE_FALLBACK_AFTER_S", "3.0"))
+NOISE_GATE_FALLBACK_ENABLED = os.getenv("NOISE_GATE_FALLBACK", "1").lower() in ("1", "true", "yes")
 # Keep forwarding audio for this many seconds after the last speech packet,
 # so the tail of each utterance reaches Gemini intact.
-SPEECH_TAIL_SECS   = float(os.getenv("SPEECH_TAIL_SECS", "0.9"))
+SPEECH_TAIL_SECS           = float(os.getenv("SPEECH_TAIL_SECS", "0.9"))
 # Accumulate this many 20ms frames before sending one Gemini message.
 # 4 × 20ms = 80ms chunks → ~12 sends/s instead of 50.
-AUDIO_BATCH_FRAMES = 4
+AUDIO_BATCH_FRAMES         = 4
 # Enable per-packet audio RMS debug logging for noise-gate tuning.
-NOISE_GATE_DEBUG   = os.getenv("NOISE_GATE_DEBUG", "0").lower() in ("1", "true", "yes")
+NOISE_GATE_DEBUG           = os.getenv("NOISE_GATE_DEBUG", "0").lower() in ("1", "true", "yes")
 
 
 def _ts():
@@ -395,13 +398,21 @@ async def gemini_handler(request):
                         # packet (so the end of each utterance reaches Gemini).
                         rms = audioop.rms(pcm16, 2)
                         speech_since_last = now - last_speech_ts
-                        is_speech = rms > NOISE_GATE_RMS
+                        active_noise_gate = NOISE_GATE_RMS
+                        if (NOISE_GATE_FALLBACK_ENABLED and greeting_done and fwd_count == 0
+                                and now - call_start_ts > NOISE_GATE_FALLBACK_AFTER_S
+                                and noise_blocked_count >= 10):
+                            active_noise_gate = NOISE_GATE_FALLBACK_RMS
+                            if now - guard_log_ts > 5.0:
+                                guard_log_ts = now
+                                log(f"⚠️  Noise gate fallback active — lowering threshold to {active_noise_gate}")
+                        is_speech = rms > active_noise_gate
                         speech_tail_ok = speech_since_last < SPEECH_TAIL_SECS
                         if is_speech:
                             last_speech_ts = now
                         if NOISE_GATE_DEBUG:
                             log(
-                                f"🔍 Noise debug | rms={rms} | threshold={NOISE_GATE_RMS} | "
+                                f"🔍 Noise debug | rms={rms} | threshold={active_noise_gate} | "
                                 f"is_speech={is_speech} | tail_ok={speech_tail_ok} | "
                                 f"since_last_speech={speech_since_last:.3f}s"
                             )
