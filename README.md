@@ -1,7 +1,7 @@
 # Mydoot Customer Care — AI Voice Agent
 
 > **Every customer complaint deserves a real response, instantly.**
-> Mydoot Customer Care is a production-grade AI voice agent that answers inbound calls 24/7, collects structured appliance complaint data in natural Hinglish, and logs every interaction directly to Google Sheets — no human agent required.
+> Mydoot Customer Care is a production-grade AI voice agent that answers inbound calls 24/7, collects structured appliance complaint data in bilingual (English or Hinglish) conversation, and logs every interaction directly to Google Sheets — no human agent required.
 
 ---
 
@@ -9,9 +9,9 @@
 
 A customer calls **+917971542939**. The AI agent:
 
-1. Answers immediately with a warm, empathetic Hinglish greeting
-2. Understands the complaint in the customer's own words
-3. Collects 7 structured fields conversationally
+1. Answers immediately with a bilingual greeting (English + Hindi), then asks language preference
+2. Conducts the entire call in English if chosen, or Hinglish if Hindi / unclear
+3. Collects 7 structured fields conversationally in a fixed order
 4. Saves the complete record to Google Sheets
 5. Emails the full call transcript to the admin after every call
 
@@ -45,14 +45,46 @@ Customer Phone Call
  Gemini Live (gemini-2.5-flash-native-audio-latest)
  • Native STT + LLM + TTS in one model
  • Voice: Aoede (warm, clear female)
- • Language: Hinglish
+ • Language: English or Hinglish (per customer choice)
         │
         │  When all 7 fields collected:
         ▼
  save_customer_feedback() tool call
         │
         ├── Google Sheets API ──► Append row to mydoot_Customer_Care sheet
-        └── Gmail SMTP ──────────► Send transcript email to admin
+        └── Gmail SMTP ──────────► Send transcript email to admin (after call)
+```
+
+---
+
+## Call Flow
+
+```
+[CALL_STARTED] → Agent speaks bilingual greeting (1 of 3, random)
+      ↓
+Agent asks: English or Hindi?
+      ↓
+Customer responds
+  ├── "English" / clear English → entire call in English
+  └── Hindi / unclear / anything else → entire call in Hinglish
+      ↓
+Agent asks: "Which appliance/device has a problem and what's wrong?"
+      ↓
+Agent collects remaining fields in order:
+  1. complaint + device (combined first question)
+  2. brand (if not already mentioned)
+  3. item / device type (if not already mentioned)
+  4. usage duration → fills both product_used_since + usage_duration
+  5. warranty status
+  6. customer name (LAST)
+      ↓
+All 7 fields collected → save_customer_feedback() tool call
+      ↓
+Agent speaks confirmation ONCE, then goes silent
+      ↓
+Call auto-closes 8 seconds after successful save
+      ↓
+Transcript emailed to admin (always, even on dropped calls)
 ```
 
 ---
@@ -63,13 +95,13 @@ The agent collects **7 fields** for every complaint:
 
 | # | Field | Example |
 |---|-------|---------|
-| 1 | Customer Name | Kumud Ranjan |
+| 1 | Complaint | "laptop chal nahi raha hai" |
 | 2 | Brand | HP, Samsung, Apple, LG |
 | 3 | Item (device) | Laptop, TV, Refrigerator, MacBook |
 | 4 | Product Used Since | 2022, 3 saal pehle |
 | 5 | Usage Duration | 3 saal, 6 mahine |
 | 6 | Warranty Status | Yes - Under Warranty / No - Out of Warranty / Customer Does Not Know |
-| 7 | Complaint | Free-text description |
+| 7 | Customer Name | Kumud Ranjan |
 
 ### Google Sheet Columns (A–I)
 
@@ -106,10 +138,10 @@ mydoot-voice-agent/
 │   └── settings.py         # API keys, URLs loaded from env
 │
 ├── core/
-│   └── state_engine.py     # 7-field conversation state machine
+│   └── state_engine.py     # 7-field conversation state tracker (used at tool call time)
 │
 ├── pipelines/
-│   └── gemini.py           # Gemini Live WebSocket pipeline (active)
+│   └── gemini.py           # Gemini Live WebSocket pipeline
 │
 ├── routes/
 │   └── webhook.py          # POST /answer — Vobiz inbound call handler
@@ -153,8 +185,6 @@ Server starts on `http://localhost:5050`
 | `GMAIL_USER` | Yes | Gmail address for transcript emails |
 | `GMAIL_APP_PASSWORD` | Yes | Gmail App Password (16-char, spaces OK) |
 | `PUBLIC_URL` | Yes | Public HTTPS URL (for Vobiz webhook) |
-| `SARVAM_API_KEY` | No | Reserved for Sarvam pipeline |
-| `DEEPGRAM_API_KEY` | No | Reserved for Deepgram pipeline |
 | `PORT` | No | Server port (default: 5050) |
 
 ---
@@ -179,6 +209,7 @@ Every push to `main` auto-deploys to Google Cloud Run via GitHub Actions.
 | Setting | Value |
 |---------|-------|
 | Region | us-central1 |
+| Project | testcnx-169610 |
 | Memory | 512Mi |
 | CPU | 1 |
 | Min instances | 1 (always warm) |
@@ -196,31 +227,6 @@ Every push to `main` auto-deploys to Google Cloud Run via GitHub Actions.
    POST https://<your-cloud-run-url>/answer
    ```
 3. The agent handles all inbound calls automatically
-
----
-
-## Conversation Flow
-
-```
-[CALL_STARTED] → Agent speaks greeting (1 of 3, random)
-      ↓
-Customer speaks (complaint, name, or anything)
-      ↓
-Agent collects (in natural conversation order):
-  1. Complaint description
-  2. Customer name
-  3. Brand name
-  4. Device/appliance type
-  5. How long they've been using it (fills both product_used_since + usage_duration)
-  6. Warranty status
-      ↓
-All 7 fields collected → save_customer_feedback() tool call
-      ↓
-"[Name] ji, aapki complaint humne register kar li hai. Hamari service team
-agle 24 ghanton mein aapse sampark karegi. Shukriya!"
-      ↓
-Call ends → Transcript emailed to admin
-```
 
 ---
 

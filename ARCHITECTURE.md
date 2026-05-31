@@ -8,7 +8,7 @@
 
 ## 1. System Overview
 
-Mydoot Customer Care is an AI voice agent that handles inbound phone calls on the Vobiz SIP platform. It uses Google Gemini Live for end-to-end audio understanding and synthesis (no separate STT/TTS steps), collects structured complaint data conversationally in Hinglish, and persists results to Google Sheets.
+Mydoot Customer Care is an AI voice agent that handles inbound phone calls on the Vobiz SIP platform. It uses Google Gemini Live for end-to-end audio understanding and synthesis (no separate STT/TTS steps), collects structured complaint data conversationally in English or Hinglish based on the customer's language preference, and persists results to Google Sheets.
 
 ---
 
@@ -39,7 +39,8 @@ Mydoot Customer Care is an AI voice agent that handles inbound phone calls on th
 ┌─────────────────────────────────────────────────────────────────────┐
 │ 4. gemini_handler opens second WebSocket to Gemini Live API         │
 │    wss://generativelanguage.googleapis.com/.../BidiGenerateContent  │
-│    Sends setup: model, speechConfig, systemInstruction, tools       │
+│    Sends setup: model, systemInstruction, tools                     │
+│    (No speechConfig, no VAD config — native audio model only)       │
 └─────────────────────────┬───────────────────────────────────────────┘
                           │
            ┌──────────────┴──────────────┐
@@ -55,10 +56,18 @@ Mydoot Customer Care is an AI voice agent that handles inbound phone calls on th
 │ → PCM 16kHz          │    │ → mu-law 8kHz           │
 │ → Gemini realtimeIn  │    │ → Vobiz playAudio       │
 │                      │    │                         │
-│ ECHO GUARD:          │    │ Tracks turnComplete:    │
-│ Block while          │    │ gemini_speaking=True    │
-│ gemini_speaking=True │    │ until turnComplete msg  │
-│ + 1.5s after end     │    │ then gemini_speaking=F  │
+│ BLOCKED until        │    │ Tracks turnComplete:    │
+│ greeting_done=True   │    │ flushes transcript buf  │
+│ (first turnComplete) │    │ sets gemini_turn_end_ts │
+│                      │    │                         │
+│ Echo guard:          │    │                         │
+│ 1.0s after each      │    │                         │
+│ turnComplete         │    │                         │
+│                      │    │                         │
+│ Post-save guard:     │    │                         │
+│ 15s after successful │    │                         │
+│ save_customer_feed-  │    │                         │
+│ back call            │    │                         │
 └──────────────────────┘    └────────────────────────┘
                           │
                           ▼
@@ -67,13 +76,15 @@ Mydoot Customer Care is an AI voice agent that handles inbound phone calls on th
 │    Triggered when Gemini has all 7 fields                           │
 │    Handler: mydoot_functions.py                                     │
 │    - Appends row to Google Sheets                                   │
-│    - Returns success message to Gemini                              │
-│    - Gemini speaks confirmation to customer                         │
+│    - Returns success to Gemini                                      │
+│    - Gemini speaks confirmation once, then goes silent              │
+│    - Call auto-closes 8s after success (_close_after task)          │
+│    - save_executed flag prevents duplicate execution per session    │
 └─────────────────────────┬───────────────────────────────────────────┘
                           │
                           ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│ 6. Call ends (customer hangs up or agent says goodbye)              │
+│ 6. Call ends (auto-close or customer hangs up)                      │
 │    finally block → send_call_summary_email()                        │
 │    Gmail SMTP SSL → transcript email to admin                       │
 └─────────────────────────────────────────────────────────────────────┘
@@ -116,41 +127,39 @@ Gemini serverContent.modelTurn.parts[].inlineData
   Vobiz playAudio { contentType: "audio/x-mulaw", sampleRate: 8000, payload }
 ```
 
-### Echo Guard
+---
 
-Prevents Gemini's own audio from being echoed back as customer input (which would confuse VAD and cause stuck calls or infinite loops):
+## 4. Echo Guard and Audio Blocking Logic
+
+Three distinct audio blocking layers prevent feedback loops and protect the confirmation message:
+
+### Layer 1 — Greeting Guard (startup)
+All customer audio is blocked until the first `turnComplete` event fires (`greeting_done` flag). This ensures background noise on the line cannot interrupt the greeting before it finishes. Safety release: if `turnComplete` never arrives within 20 seconds, the guard is force-released.
+
+### Layer 2 — Echo Guard (per turn)
+After every `turnComplete`, a 1.0-second buffer blocks customer audio. This prevents the tail end of Gemini's own audio being echoed back as customer speech. A safety timeout releases the guard if `turnComplete` is missing for more than 8 seconds after audio was last sent.
+
+### Layer 3 — Post-Save Guard (end of call)
+After `save_customer_feedback` succeeds, ALL customer audio is blocked for 15 seconds. This ensures the confirmation message plays completely without interruption before the call closes.
 
 ```python
-# In g_receiver (asyncio task):
-if part has audio:
-    gemini_speaking = True
-
-if serverContent.turnComplete:
-    gemini_speaking = False
-    gemini_turn_end_ts = time.time()
-
-# In Vobiz audio forwarding loop:
-if gemini_speaking:
-    continue  # Drop customer audio while agent is speaking
-if time.time() - gemini_turn_end_ts < 1.5:
-    continue  # 1.5s buffer after turn ends
+# Precedence order (highest to lowest):
+# 1. Post-save guard: save_done_ts set → block for 15s
+# 2. Greeting guard: greeting_done=False → block
+# 3. Echo guard: now - gemini_turn_end_ts < 1.0 → block
+# 4. Forward packet to Gemini
 ```
 
 ---
 
-## 4. Gemini Live Configuration
+## 5. Gemini Live Configuration
 
 ```json
 {
   "setup": {
     "model": "models/gemini-2.5-flash-native-audio-latest",
     "generationConfig": {
-      "responseModalities": ["AUDIO"],
-      "speechConfig": {
-        "voiceConfig": {
-          "prebuiltVoiceConfig": { "voiceName": "Aoede" }
-        }
-      }
+      "responseModalities": ["AUDIO"]
     },
     "inputAudioTranscription":  {},
     "outputAudioTranscription": {},
@@ -163,56 +172,47 @@ if time.time() - gemini_turn_end_ts < 1.5:
 | Setting | Value | Reason |
 |---------|-------|--------|
 | Model | gemini-2.5-flash-native-audio-latest | Native audio — no separate STT/TTS |
-| Voice | Aoede | Warm, clear female voice |
 | Modalities | AUDIO only | No text output needed |
+| speechConfig | Not set | Causes deferred 1008 errors on this model |
+| VAD config | Not set | Causes 1008 policy violations on native audio model |
 | Transcription | Both directions | For post-call transcript email |
 | ping_interval | 20s | Prevents mid-call WebSocket timeout |
 | ping_timeout | 20s | Drops dead connections quickly |
 
 ---
 
-## 5. Data Collection State Machine
+## 6. Conversation Flow and Data Collection
 
-`core/state_engine.py` tracks which of the 7 fields have been collected and injects a status summary into every Gemini system prompt turn.
+### Language Selection (Step 1)
+On `[CALL_STARTED]`, the agent delivers a bilingual greeting (one of 3 random options, each spoken in both English and Hindi) and asks the customer their language preference:
+- Customer says "English" or responds in clear English → entire call in English
+- Customer says "Hindi", responds in Hindi, or response is unclear/mixed → entire call in Hinglish
+- Default is Hinglish when in doubt
 
-### States
+### Field Collection Order (Step 2)
+After language selection, fields are collected in this fixed order:
 
-```
-COLLECTING_COMPLAINT → COLLECTING_NAME → COLLECTING_BRAND →
-COLLECTING_ITEM → COLLECTING_PRODUCT_SINCE → COLLECTING_USAGE →
-COLLECTING_WARRANTY → COMPLETED
-```
+| Step | Field(s) | Notes |
+|------|----------|-------|
+| 1 | complaint + device | First question after language: "Which appliance has a problem and what's wrong?" |
+| 2 | brand | Skipped if mentioned anywhere in prior speech |
+| 3 | item | Skipped if mentioned anywhere in prior speech |
+| 4 | product_used_since + usage_duration | Single question: "How long have you been using it?" — fills both fields |
+| 5 | warranty_status | Enum value selected from three options |
+| 6 | customer_name | Always collected LAST |
 
-### Prompt Injection (appended to every system prompt)
+### Extract, Don't Re-Ask
+The agent extracts information from any point in the conversation. If a customer mentions brand, device, or name at any point, those fields are never asked again. Examples:
+- "my LG TV is not working" → brand=LG, item=TV, no further questions on these
+- "MacBook" → brand=Apple, item=MacBook Laptop
+- "I'm Rohit" → customer_name=Rohit
 
-```
-CURRENT STATE: COLLECTING_WARRANTY
-COLLECTED: complaint, customer_name, brand, item, product_used_since, usage_duration
-STILL NEED: warranty_status
-```
-
-When all 7 collected:
-```
-ALL 7 FIELDS COLLECTED — call save_customer_feedback NOW.
-```
-
-### Field Mapping
-
-| State Engine Key | Tool Parameter | Sheet Column |
-|-----------------|----------------|--------------|
-| customer_name | customer_name | A: Customer Name |
-| brand | brand | B: Brand |
-| item | item | C: Item |
-| product_used_since | product_used_since | D: Product Used Since |
-| usage_duration | usage_duration | E: Usage Duration |
-| warranty_status | warranty_status | F: Warranty Status |
-| complaint | complaint | G: Complaint |
-| _(auto)_ | caller_id | I: Caller ID |
-| _(auto)_ | _(timestamp)_ | H: Timestamp |
+### Agent Gender
+The agent is female. Feminine Hindi verb forms are used for self-reference (`kar sakti hoon`, `karungi`). Gender-neutral forms are used when addressing the customer (`kar rahe hain`).
 
 ---
 
-## 6. Tool Call: save_customer_feedback
+## 7. Tool Call: save_customer_feedback
 
 Defined in `app_config.json` under `tools.gemini`, executed in `mydoot_functions.py`.
 
@@ -239,6 +239,10 @@ Defined in `app_config.json` under `tools.gemini`, executed in `mydoot_functions
 }
 ```
 
+### Execution Guards
+- `save_executed` flag: if Gemini calls the tool a second time in the same session, the pipeline returns a synthetic `success: true` response without re-executing. This prevents duplicate Sheet rows.
+- `caller_id` is added to the arguments by the pipeline before execution (not passed by Gemini).
+
 ### Google Sheets Write
 
 ```python
@@ -246,15 +250,67 @@ service.spreadsheets().values().append(
     spreadsheetId=SPREADSHEET_ID,
     range="Sheet1!A2",
     valueInputOption="RAW",
-    insertDataOption="INSERT_ROWS",   # always appends new row
+    insertDataOption="INSERT_ROWS",   # always appends new row, never overwrites
     body={"values": [[name, brand, item, since, duration, warranty,
                       complaint, timestamp, caller_id]]}
 )
 ```
 
+### Auto-Close
+On successful save: `asyncio.create_task(_close_after(vobiz_ws, gemini_ws, 8.0))` closes both WebSockets 8 seconds later, allowing the confirmation message to finish.
+
 ---
 
-## 7. Credentials Architecture
+## 8. Transcript Logging
+
+Transcripts are buffered per turn and flushed as single lines on turn boundaries:
+
+- Agent speech chunks accumulate in `agent_buf` during a turn
+- Customer speech chunks accumulate in `customer_buf`
+- On `turnComplete`: agent buffer is flushed as one `"Agent: ..."` line
+- When agent starts speaking: any pending customer buffer is flushed first as `"Customer: ..."` line
+- Partial buffers are flushed in the `finally` block of `g_receiver`
+
+All log lines are prefixed with `HH:MM:SS.mmm` timestamps and the caller ID. The full transcript is printed at call end before the email is sent.
+
+---
+
+## 9. State Engine
+
+`core/state_engine.py` tracks which of the 7 fields have been collected. It is used only at tool call time — `set_data()` is called for each argument received in the `save_customer_feedback` tool call. The state engine does **not** inject prompts into the conversation during the call (prompt injection was removed as it caused the agent to re-ask already-answered fields).
+
+### Field Mapping
+
+| State Engine Key | Tool Parameter | Sheet Column |
+|-----------------|----------------|--------------|
+| customer_name | customer_name | A: Customer Name |
+| brand | brand | B: Brand |
+| item | item | C: Item |
+| product_used_since | product_used_since | D: Product Used Since |
+| usage_duration | usage_duration | E: Usage Duration |
+| warranty_status | warranty_status | F: Warranty Status |
+| complaint | complaint | G: Complaint |
+| _(auto)_ | _(timestamp)_ | H: Timestamp |
+| _(auto)_ | caller_id | I: Caller ID |
+
+---
+
+## 10. Post-Call Email
+
+```python
+# pipelines/gemini.py — finally block (always runs, even on error)
+await asyncio.to_thread(send_call_summary_email, caller_id, transcript_log)
+```
+
+`transcript_log` contains `"Agent: ..."` and `"Customer: ..."` lines accumulated during the call via Gemini's transcription events:
+- `inputAudioTranscription.text` → customer speech
+- `outputAudioTranscription.text` → agent speech
+
+Sent via Gmail SMTP SSL (port 465). Spaces are stripped from the App Password automatically. Sent to `GMAIL_USER` (admin email).
+
+---
+
+## 11. Credentials Architecture
 
 ```
 GitHub Secret: GCP_SA_KEY (full service account JSON)
@@ -275,24 +331,11 @@ GitHub Secret: GCP_SA_KEY (full service account JSON)
 Service account: `mydoot-voice@testcnx-169610.iam.gserviceaccount.com`
 Required permission: Editor on sheet `1uW39kklQKc4rhf5REATgKqgwbvSNAhlDVKXyAzOMKCk`
 
----
-
-## 8. Post-Call Email
-
-```python
-# pipelines/gemini.py — finally block (always runs, even on error)
-await asyncio.to_thread(send_call_summary_email, caller_id, transcript_log)
-```
-
-`transcript_log` is built during the call from Gemini's transcription events:
-- `inputAudioTranscription.text` → `"Customer: ..."` lines
-- `outputAudioTranscription.text` → `"Agent: ..."` lines
-
-Sends via Gmail SMTP SSL (port 465). Spaces stripped from App Password automatically.
+The Sheets service is cached after first initialization (`_CACHED_SERVICES`) and reused for all calls on the same instance.
 
 ---
 
-## 9. Infrastructure
+## 12. Infrastructure
 
 ### Docker Image (Multi-stage)
 
@@ -302,7 +345,7 @@ FROM python:3.11-slim AS builder
 
 FROM python:3.11-slim
 # Copies only: app.py, mydoot_functions.py, app_config.json,
-#              config/, core/, pipelines/, routes/, metrics/
+#              config/, core/, pipelines/, routes/
 # Excludes: .env, credentials, recordings, venv, test files
 USER priya (non-root, uid 1000)
 EXPOSE 8080
@@ -335,16 +378,16 @@ git push main → GitHub Actions (deploy.yml)
 
 ---
 
-## 10. Key Files Reference
+## 13. Key Files Reference
 
 | File | Purpose |
 |------|---------|
 | `app.py` | Entry point — registers routes, reconstructs google-credentials.json at startup |
-| `app_config.json` | System prompt, greeting scripts, tool schema, model/voice config |
+| `app_config.json` | System prompt, greeting scripts, tool schema, model config |
 | `mydoot_functions.py` | `save_customer_feedback()`, `send_call_summary_email()`, Sheets client |
-| `pipelines/gemini.py` | Gemini Live WebSocket pipeline — audio I/O, echo guard, tool dispatch |
+| `pipelines/gemini.py` | Gemini Live WebSocket pipeline — audio I/O, echo guard, tool dispatch, transcript |
 | `routes/webhook.py` | Vobiz inbound call handler — returns Stream XML with wss:// URL |
-| `core/state_engine.py` | 7-field state machine — tracks collected fields, generates prompt injection |
+| `core/state_engine.py` | 7-field state tracker — used only at tool call time |
 | `config/settings.py` | API keys and WebSocket URLs from environment variables |
 | `Dockerfile` | Multi-stage build — builder + minimal runtime image |
 | `.github/workflows/deploy.yml` | GitHub Actions → Cloud Run CI/CD pipeline |
