@@ -60,11 +60,8 @@ async def gemini_handler(request):
                     "realtimeInputConfig": {
                         "automaticActivityDetection": {
                             "disabled": False,
-                            # LOW start sensitivity: ignore fan/background noise,
-                            # only trigger on clear human speech
-                            "startOfSpeechSensitivity": "START_SENSITIVITY_LOW",
                             # LOW end sensitivity: wait longer before cutting off
-                            # the customer (avoids clipping mid-sentence)
+                            # the customer mid-sentence
                             "endOfSpeechSensitivity": "END_SENSITIVITY_LOW",
                             # 800ms silence required before declaring end-of-turn
                             "silenceDurationMs": 800,
@@ -109,12 +106,13 @@ async def gemini_handler(request):
             downsample_state   = None
             last_ai_audio_ts   = 0.0   # timestamp of last audio packet from Gemini
             gemini_turn_end_ts = 0.0   # timestamp when Gemini signalled turnComplete
+            greeting_done      = False  # True after first turnComplete (greeting finished)
             greeting_started   = False
             guard_log_ts       = 0.0   # throttle echo-guard log spam
 
             async def g_receiver():
                 nonlocal downsample_state, last_ai_audio_ts, gemini_turn_end_ts
-                nonlocal greeting_started
+                nonlocal greeting_started, greeting_done
                 try:
                     async for raw_msg in g_ws:
                         data = json.loads(raw_msg)
@@ -161,8 +159,13 @@ async def gemini_handler(request):
                         if server_content.get("turnComplete"):
                             gemini_turn_end_ts = time.time()
                             ai_dur = gemini_turn_end_ts - last_ai_audio_ts if last_ai_audio_ts else 0
-                            log(f"🔔 turnComplete — echo guard releases in 1.0s "
-                                f"(last audio {ai_dur:.2f}s ago)")
+                            if not greeting_done:
+                                greeting_done = True
+                                log(f"🔔 turnComplete — GREETING DONE, customer audio now live "
+                                    f"(last audio {ai_dur:.2f}s ago)")
+                            else:
+                                log(f"🔔 turnComplete — echo guard releases in 1.0s "
+                                    f"(last audio {ai_dur:.2f}s ago)")
 
                         # ── Interrupted: agent cut off mid-speech ────────────
                         if server_content.get("interrupted"):
@@ -231,6 +234,22 @@ async def gemini_handler(request):
                     data = json.loads(msg.data)
                     if data.get("event") == "media":
                         now = time.time()
+
+                        # Block ALL audio until greeting turnComplete fires.
+                        # This prevents background noise from interrupting the greeting.
+                        # Safety: if greeting turnComplete never arrives within 20s,
+                        # force-release so the call doesn't hang forever.
+                        if not greeting_done:
+                            if now - call_start_ts > 20.0:
+                                log("⚠️  Greeting turnComplete missing after 20s — force-releasing")
+                                greeting_done = True
+                            else:
+                                blocked_count += 1
+                                if now - guard_log_ts > 3.0:
+                                    guard_log_ts = now
+                                    log(f"🔇 Greeting in progress — blocking customer audio "
+                                        f"| blocked={blocked_count} pkts so far")
+                                continue
 
                         # Safety: if Gemini sent audio but turnComplete never
                         # arrived, unblock after 8s
