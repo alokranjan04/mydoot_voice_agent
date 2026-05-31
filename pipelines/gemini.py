@@ -49,13 +49,6 @@ async def gemini_handler(request):
                     "model": model,
                     "generationConfig": {
                         "responseModalities": ["AUDIO"],
-                        "speechConfig": {
-                            "voiceConfig": {
-                                "prebuiltVoiceConfig": {
-                                    "voiceName": "Aoede"
-                                }
-                            }
-                        },
                     },
                     "inputAudioTranscription":  {},
                     "outputAudioTranscription": {},
