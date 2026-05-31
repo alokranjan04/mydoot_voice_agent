@@ -18,9 +18,11 @@ from mydoot_functions import FUNCTION_MAP, send_call_summary_email
 # and not forwarded to Gemini. Increase if fan noise still leaks through;
 # decrease if soft speech is being filtered out.
 NOISE_GATE_RMS             = int(os.getenv("NOISE_GATE_RMS", "60"))
-NOISE_GATE_FALLBACK_RMS     = int(os.getenv("NOISE_GATE_FALLBACK_RMS", "5"))
-NOISE_GATE_FALLBACK_AFTER_S = float(os.getenv("NOISE_GATE_FALLBACK_AFTER_S", "3.0"))
-NOISE_GATE_FALLBACK_ENABLED = os.getenv("NOISE_GATE_FALLBACK", "1").lower() in ("1", "true", "yes")
+NOISE_GATE_FALLBACK_RMS             = int(os.getenv("NOISE_GATE_FALLBACK_RMS", "5"))
+NOISE_GATE_FALLBACK_AFTER_S         = float(os.getenv("NOISE_GATE_FALLBACK_AFTER_S", "2.0"))
+NOISE_GATE_FALLBACK_FULL_DISABLE_S  = float(os.getenv("NOISE_GATE_FALLBACK_FULL_DISABLE_S", "7.0"))
+NOISE_GATE_FALLBACK_FULL_COUNT      = int(os.getenv("NOISE_GATE_FALLBACK_FULL_COUNT", "40"))
+NOISE_GATE_FALLBACK_ENABLED         = os.getenv("NOISE_GATE_FALLBACK", "1").lower() in ("1", "true", "yes")
 # Keep forwarding audio for this many seconds after the last speech packet,
 # so the tail of each utterance reaches Gemini intact.
 SPEECH_TAIL_SECS           = float(os.getenv("SPEECH_TAIL_SECS", "0.9"))
@@ -401,28 +403,29 @@ async def gemini_handler(request):
                         active_noise_gate = NOISE_GATE_RMS
                         if (NOISE_GATE_FALLBACK_ENABLED and greeting_done and fwd_count == 0
                                 and now - call_start_ts > NOISE_GATE_FALLBACK_AFTER_S
-                                and noise_blocked_count >= 10):
+                                and noise_blocked_count >= 5):
                             active_noise_gate = NOISE_GATE_FALLBACK_RMS
-                            if now - guard_log_ts > 5.0:
+                            if now - guard_log_ts > 3.0:
                                 guard_log_ts = now
                                 log(f"⚠️  Noise gate fallback active — lowering threshold to {active_noise_gate}")
                         if (NOISE_GATE_FALLBACK_ENABLED and greeting_done and fwd_count == 0
-                                and now - call_start_ts > 12.0
-                                and noise_blocked_count >= 50):
+                                and now - call_start_ts > NOISE_GATE_FALLBACK_FULL_DISABLE_S
+                                and noise_blocked_count >= NOISE_GATE_FALLBACK_FULL_COUNT):
                             if active_noise_gate != 0:
                                 active_noise_gate = 0
-                                if now - guard_log_ts > 5.0:
+                                if now - guard_log_ts > 3.0:
                                     guard_log_ts = now
                                     log("⚠️  Soft audio fallback engaged — noise gate fully disabled")
                         is_speech = rms > active_noise_gate
                         speech_tail_ok = speech_since_last < SPEECH_TAIL_SECS
                         if is_speech:
                             last_speech_ts = now
-                        if NOISE_GATE_DEBUG:
+                        if NOISE_GATE_DEBUG or active_noise_gate != NOISE_GATE_RMS:
                             log(
                                 f"🔍 Noise debug | rms={rms} | threshold={active_noise_gate} | "
                                 f"is_speech={is_speech} | tail_ok={speech_tail_ok} | "
-                                f"since_last_speech={speech_since_last:.3f}s"
+                                f"since_last_speech={speech_since_last:.3f}s | "
+                                f"blocked={noise_blocked_count}"
                             )
                         if not is_speech and not speech_tail_ok:
                             # Flush any partially-accumulated batch so Gemini
