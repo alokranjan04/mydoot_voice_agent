@@ -1,4 +1,4 @@
-# Core dependencies for Astrology Voice Agent
+# Core dependencies for Mydoot Customer Care Voice Agent
 aiohttp==3.11.11
 websockets==14.1
 requests==2.32.3

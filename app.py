@@ -58,7 +58,7 @@ async def main():
     await web.TCPSite(runner, "0.0.0.0", PORT).start()
 
     provider = APP_CONFIG.get("active_provider", "sarvam")
-    print(f"🚀 ACHARYA JI ONLINE — PORT {PORT}")
+    print(f"🚀 MYDOOT CUSTOMER CARE ONLINE — PORT {PORT}")
     print(f"   Active pipeline : {provider.upper()}")
     print(f"   Dashboard       : http://localhost:{PORT}/")
     print(f"   Metrics         : http://localhost:{PORT}/metrics")

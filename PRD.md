@@ -1,165 +1,198 @@
 # PRD: Mydoot Customer Care — AI Voice Agent
 
-**Version:** 1.0
+**Version:** 2.0
 **Owner:** Alok Ranjan
 **Phone Number:** +917971542939
+**Last Updated:** May 2026
 
 ---
 
-## 1. Vision
+## 1. Problem Statement
 
-Build an always-available AI voice agent for Mydoot that answers every inbound customer call, collects a complete and structured complaint or feedback record in natural Hinglish, and writes the data to Google Sheets in real time — eliminating missed complaints and incomplete tickets.
+Home appliance customers have complaints — their TV won't turn on, the AC is not cooling, the washing machine leaks. When they call for help:
 
----
+- Lines are often busy or unmanned outside business hours
+- Agents take details inconsistently (some miss the brand, some skip warranty status)
+- Data rarely makes it into a structured format for follow-up
+- Customers wait on hold, get frustrated, hang up
 
-## 2. Problem Statement
-
-| Problem | Impact |
-|---|---|
-| Customer care lines are unavailable after business hours | Complaints go unrecorded; customers feel ignored |
-| Human agents skip required fields under call pressure | Incomplete records lead to unresolved issues |
-| No structured log of complaints by product, warranty status, or usage | Support teams cannot identify repeat issues or warranty abuse |
-| Long hold times erode customer trust | Customers abandon calls and escalate on social media |
+**Result:** Complaints are lost, service teams have incomplete data, and customers feel unheard.
 
 ---
 
-## 3. Target Users
+## 2. Solution
 
-| User | Description |
-|---|---|
-| **End Customer** | Mydoot product buyer calling to report an issue or give feedback |
-| **Support Manager** | Reviews Google Sheet logs, assigns resolution tasks |
-| **Product Team** | Analyses complaint patterns by product and usage duration |
-| **Operations** | Monitors agent uptime, call volume, and data completeness |
+An always-available AI voice agent that:
+1. Answers every call instantly, 24/7
+2. Speaks natural, empathetic Hinglish
+3. Collects all 7 required fields in a single conversation
+4. Saves a complete structured record to Google Sheets
+5. Emails the full transcript to the admin after every call
 
----
-
-## 4. Core Features
-
-### 4.1 Structured 5-Step Feedback Collection
-
-The agent must collect exactly these five data points in every call, in order:
-
-1. **Customer Name** — Full name as spoken
-2. **Product Used** — Which Mydoot product the customer is using
-3. **Usage Duration** — How long the customer has been using it (months / years)
-4. **Warranty Status** — One of: `Yes - Under Warranty`, `No - Out of Warranty`, `Customer Does Not Know`
-5. **Complaint / Feedback** — Verbatim description of the issue or suggestion
-
-The agent must not call the save function until all five fields are confirmed. If a field is ambiguous, the agent must clarify before proceeding.
-
-### 4.2 Google Sheets Logging
-
-Every completed call must append one row to a pre-configured Google Sheet with columns:
-
-```
-Customer Name | Product Used | Usage Duration | Warranty Status | Complaint | Timestamp | Caller ID
-```
-
-Rows must appear within 3 seconds of the customer confirming their complaint.
-
-### 4.3 Natural Hinglish Conversation
-
-- The agent speaks fluent Hinglish (mixed Hindi + English) — the natural register of Indian customer service.
-- One question at a time. No bullet points or lists read aloud.
-- Empathetic tone: acknowledges the complaint before moving to the next question.
-- Handles interruptions gracefully — if the customer barge-in, the agent stops and listens.
-
-### 4.4 Dual Pipeline Support
-
-| Mode | Use Case |
-|---|---|
-| **Sarvam Hybrid** (default) | Best-quality Hinglish understanding; ElevenLabs or Sarvam Bulbul TTS |
-| **Gemini Live** (alternative) | Ultra-low latency; better for fast-paced or impatient callers |
-
-Switching between pipelines requires only a config change — no code deployment.
-
-### 4.5 24/7 Availability
-
-The agent must handle concurrent inbound calls without degradation. There is no business-hours restriction.
+No hold time. No missed fields. No data entry lag.
 
 ---
 
-## 5. Technical Requirements
+## 3. Users
+
+| User | Role |
+|------|------|
+| End Customer | Calls to register a complaint about any home appliance |
+| Support Manager | Reviews Google Sheet, assigns service tickets |
+| Admin (Alok Ranjan) | Receives transcript emails, monitors system |
+
+---
+
+## 4. Functional Requirements
+
+### FR-1: Inbound Call Handling
+- Agent answers all calls on +917971542939 within 2 rings
+- No call should go unanswered due to concurrency limits (up to 10 simultaneous)
+- Call must work 24/7/365
+
+### FR-2: Greeting
+- Agent speaks a warm, empathetic Hinglish greeting on call connect
+- 3 greeting scripts rotate randomly across calls (avoids robotic repetition)
+- Greeting explains what Mydoot does and invites the customer to share their problem
+
+### FR-3: 7-Field Data Collection
+Agent must collect all 7 fields before saving:
+
+| # | Field | Validation |
+|---|-------|-----------|
+| 1 | Customer Name | Free text, as spoken |
+| 2 | Brand | Any brand (Samsung, Apple, LG, HP, Bajaj, etc.) |
+| 3 | Item | Any appliance or device — TV, laptop, AC, mixer, MacBook, etc. |
+| 4 | Product Used Since | Year or relative period (e.g., "2022", "3 saal pehle") |
+| 5 | Usage Duration | Duration (e.g., "3 saal", "6 mahine") |
+| 6 | Warranty Status | Enum: "Yes - Under Warranty" / "No - Out of Warranty" / "Customer Does Not Know" |
+| 7 | Complaint | Free text description of the problem |
+
+Fields 4 and 5 are collected with a single question; the agent derives both from the customer's answer.
+
+### FR-4: Conversational Flow
+- Collects complaint first (customer's primary concern)
+- Collects name second (personalization)
+- Remaining fields in natural order
+- One question at a time
+- Never asks a question the customer already answered
+- Accepts any device type — no restricted list
+- Smart brand detection: "MacBook" → brand=Apple, item=MacBook Laptop
+
+### FR-5: Data Persistence
+- On completing all 7 fields: call `save_customer_feedback` tool immediately
+- Do NOT say "complaint registered" before the tool call succeeds
+- Write one row per call to Google Sheets (Sheet1, appended, never overwrite)
+- Sheet columns: Customer Name | Brand | Item | Product Used Since | Usage Duration | Warranty Status | Complaint | Timestamp | Caller ID
+
+### FR-6: Post-Call Transcript Email
+- After every call (completed or dropped), send email to admin
+- Email contains: Caller ID, timestamp, full Agent+Customer transcript
+- Send even if transcript is empty (confirms call happened)
+
+### FR-7: Voice Quality
+- Soft, warm, clear female voice (Aoede via Gemini Live)
+- Slow, deliberate pace with natural pauses
+- Empathetic tone throughout
+- Language: Hinglish (Hindi + English mix)
+
+---
+
+## 5. Non-Functional Requirements
 
 | Requirement | Target |
-|---|---|
-| First response latency (TTFT) | < 1.5 seconds after customer stops speaking |
-| Language accuracy | > 90% correct field extraction on first attempt |
-| Google Sheets write success rate | > 99% (retry on transient failure) |
-| Warranty field accuracy | Must correctly map ambiguous answers to one of the 3 enum values |
-| Concurrent calls supported | Minimum 10 simultaneous (aiohttp async architecture) |
-| Call recording | 100% of calls recorded as stereo WAV |
-| Uptime | 99.5% monthly |
+|-------------|--------|
+| Call answer latency | < 3 seconds from ring to greeting |
+| Agent response latency (TTFT) | < 2 seconds per turn |
+| Google Sheets write success | > 99% |
+| Concurrent calls supported | 10 |
+| Uptime | 99.5% (Cloud Run managed) |
+| Call max duration | 60 minutes |
+| Audio quality | Clear mu-law 8kHz, no distortion |
 
 ---
 
 ## 6. Data Model
 
-### Google Sheets Row
+### Google Sheet: mydoot_Customer_Care
 
-| Field | Type | Populated By |
-|---|---|---|
-| Customer Name | String | LLM extraction from speech |
-| Product Used | String | LLM extraction from speech |
-| Usage Duration | String (free text) | LLM extraction (e.g. "6 months") |
-| Warranty Status | Enum (3 values) | LLM classification |
-| Complaint | String | LLM extraction from speech |
-| Timestamp | DateTime (YYYY-MM-DD HH:MM:SS) | System-generated at save time |
-| Caller ID | String | Vobiz `From` header (phone number) |
+| Column | Field | Type | Example |
+|--------|-------|------|---------|
+| A | Customer Name | String | Kumud Ranjan |
+| B | Brand | String | HP |
+| C | Item | String | laptop |
+| D | Product Used Since | String | 3 saal pehle |
+| E | Usage Duration | String | 3 saal |
+| F | Warranty Status | Enum | No - Out of Warranty |
+| G | Complaint | String | laptop chal nahi raha hai |
+| H | Timestamp | DateTime | 2026-05-31 00:15:22 |
+| I | Caller ID | String | 917042915552 |
 
-### Warranty Status Enum
-
-| Value | When Used |
-|---|---|
-| `Yes - Under Warranty` | Customer confirms the product is under warranty |
-| `No - Out of Warranty` | Customer confirms warranty has expired or product is old |
-| `Customer Does Not Know` | Customer is unsure or cannot answer |
+Warranty Status enum values:
+- `Yes - Under Warranty`
+- `No - Out of Warranty`
+- `Customer Does Not Know`
 
 ---
 
-## 7. Out of Scope (v1.0)
+## 7. Technical Constraints
 
-- Ticket creation in CRM or helpdesk systems (post-MVP)
-- Automated escalation or callback scheduling
-- SMS / WhatsApp follow-up after the call
-- Multi-language support beyond Hindi / Hinglish
-- Sentiment analysis on complaints
-- Payment or refund handling via voice
+- **Language model**: Google Gemini 2.5 Flash Native Audio (BidiGenerateContent API)
+- **Telephony**: Vobiz SIP (+917971542939)
+- **Audio codec**: mu-law 8kHz (Vobiz ↔ server), PCM 16kHz (server → Gemini), PCM 24kHz (Gemini → server)
+- **Infrastructure**: Google Cloud Run (us-central1, project testcnx-169610)
+- **Data storage**: Google Sheets only (no database)
+- **Notification**: Gmail SMTP (App Password auth)
 
 ---
 
 ## 8. Success Metrics
 
-| Metric | Definition | Target |
-|---|---|---|
-| **Completion Rate** | % of calls where all 5 fields are collected and saved | > 85% |
-| **Data Completeness** | % of saved rows with no empty required fields | 100% |
-| **Average Handle Time** | Average call duration for a completed feedback session | 2–4 minutes |
-| **CSAT Proxy** | Customer does not hang up mid-collection | < 10% drop rate |
-| **Sheet Write Success** | Rows saved vs. calls completed | > 99% |
+| Metric | Target |
+|--------|--------|
+| Complaint registration completion rate | > 85% of calls where customer speaks |
+| Data completeness | 100% of saved rows have all 7 fields |
+| Average handle time | 2–4 minutes |
+| Call drop rate (before completion) | < 15% |
+| Sheet write latency | < 5 seconds after all fields collected |
+| Transcript email delivery | 100% of completed calls |
 
 ---
 
-## 9. Assumptions & Constraints
+## 9. Out of Scope (v2.0)
 
-- Customers are calling from Indian mobile numbers via Vobiz SIP trunk (+917971542939).
-- Google Sheets credentials (service account) are available and the target sheet is shared with the service account as Editor.
-- The server is publicly reachable so Vobiz can POST to `/answer` and open WebSocket streams.
-- Python 3.10–3.12 is used (required for `audioop` Mu-law encoding).
-- `GOOGLE_SPREADSHEET_ID` and at least one valid API key (`SARVAM_API_KEY` + `DEEPGRAM_API_KEY`) are configured.
+- CRM or ticketing system integration (Freshdesk, Zoho, etc.)
+- SMS/WhatsApp confirmation to customer after registration
+- Outbound call-back scheduling
+- Sentiment analysis or complaint severity scoring
+- Multi-language support beyond Hinglish
+- Real-time dashboard for complaint volume/trends
+- IVR menu (press 1 for AC, press 2 for TV)
 
 ---
 
 ## 10. Future Roadmap
 
 | Priority | Feature |
-|---|---|
-| High | WhatsApp confirmation message to customer after call |
-| High | CRM / helpdesk ticket auto-creation (Zoho, Freshdesk) |
-| Medium | Complaint category classification (defect, delivery, warranty, general) |
-| Medium | Weekly complaint summary email to support manager |
-| Medium | Escalation detection — if customer mentions legal/consumer forum, flag the row |
-| Low | Regional language support (Tamil, Telugu, Bengali) |
-| Low | Voice sentiment score appended to the Sheet row |
-| Low | Dashboard showing complaint trends by product over time |
+|----------|---------|
+| High | WhatsApp confirmation message to customer after registration |
+| High | Complaint category auto-classification (hardware failure, installation, noise, etc.) |
+| Medium | CRM integration (Freshdesk / Zoho) — auto-create ticket from Sheet row |
+| Medium | Regional language support (Tamil, Telugu, Marathi, Bengali) |
+| Medium | Weekly summary email to manager (total complaints, brands, devices) |
+| Low | Real-time call monitoring dashboard |
+| Low | Repeat caller detection (same phone number within 7 days) |
+| Low | Estimated resolution time based on brand + complaint type |
+
+---
+
+## 11. Configuration
+
+All agent behavior is controlled via `app_config.json` — no code changes needed for:
+- System prompt updates
+- Greeting script changes
+- Model or voice selection
+- Tool schema modifications
+- Temperature / generation parameters
+
+To change the active voice pipeline: update `active_provider` in `app_config.json` (`"google"` for Gemini Live).
