@@ -94,13 +94,12 @@ async def gemini_handler(request):
             }))
 
             # ── 4. Receive loop: audio + tool calls from Gemini ─────────────
-            downsample_state  = None
-            last_ai_audio_ts  = 0.0   # timestamp of last audio packet from Gemini
-            gemini_speaking   = False  # True from first audio chunk until turnComplete
-            gemini_turn_end_ts = 0.0  # timestamp when Gemini's turn completed
+            downsample_state   = None
+            last_ai_audio_ts   = 0.0   # timestamp of last audio packet from Gemini
+            gemini_turn_end_ts = 0.0   # timestamp when Gemini signalled turnComplete
 
             async def g_receiver():
-                nonlocal downsample_state, last_ai_audio_ts, gemini_speaking, gemini_turn_end_ts
+                nonlocal downsample_state, last_ai_audio_ts, gemini_turn_end_ts
                 try:
                     async for raw_msg in g_ws:
                         data = json.loads(raw_msg)
@@ -125,7 +124,6 @@ async def gemini_handler(request):
                                     pcm24, 2, 1, 24000, 8000, downsample_state
                                 )
                                 mulaw = audioop.lin2ulaw(pcm8, 2)
-                                gemini_speaking  = True
                                 last_ai_audio_ts = time.time()
                                 if not ws.closed:
                                     await ws.send_str(json.dumps({
@@ -139,8 +137,8 @@ async def gemini_handler(request):
 
                         # Gemini signals it finished speaking this turn
                         if server_content.get("turnComplete"):
-                            gemini_speaking    = False
                             gemini_turn_end_ts = time.time()
+                            print("🔔 turnComplete received")
 
                         # Tool calls
                         tool_call = data.get("toolCall")
@@ -175,23 +173,31 @@ async def gemini_handler(request):
                 except Exception as ex:
                     print(f"❌ g_receiver error: {ex}")
                     traceback.print_exc()
+                finally:
+                    # Release echo guard so the main loop never stays blocked
+                    gemini_turn_end_ts = time.time() - 1.0
 
             asyncio.create_task(g_receiver())
 
             # ── 5. Forward Vobiz audio → Gemini ─────────────────────────────
             # Vobiz sends mu-law 8kHz; Gemini Live expects PCM 16kHz.
-            # ECHO GUARD: block customer audio while Gemini is in its turn,
-            # plus 1.5s buffer after turnComplete to avoid echo/repeat loops.
+            # ECHO GUARD: only block for a short window after Gemini finishes
+            # speaking (clears reverb/echo). Do NOT block during speech —
+            # that prevents barge-in and drops the customer's first words.
+            # Safety: if no turnComplete for 8s after last AI audio, auto-release.
             upsample_state = None
             async for msg in ws:
                 if msg.type == aiohttp.WSMsgType.TEXT:
                     data = json.loads(msg.data)
                     if data.get("event") == "media":
-                        # Block while Gemini is actively speaking its turn
-                        if gemini_speaking:
-                            continue
-                        # Buffer 1.5s after turn ends (clears reverb/echo)
-                        if time.time() - gemini_turn_end_ts < 1.5:
+                        now = time.time()
+                        # Safety release: if Gemini sent audio but turnComplete
+                        # never arrived (e.g. g_receiver died), unblock after 8s
+                        if (last_ai_audio_ts > gemini_turn_end_ts and
+                                now - last_ai_audio_ts > 8.0):
+                            gemini_turn_end_ts = now - 1.0  # skip buffer
+                        # Short post-turn buffer: 1.0s after turnComplete
+                        if time.time() - gemini_turn_end_ts < 1.0:
                             continue
                         raw_mulaw = base64.b64decode(data["media"]["payload"])
                         pcm8  = audioop.ulaw2lin(raw_mulaw, 2)
