@@ -99,45 +99,41 @@ async def gemini_handler(request):
             greeting_started   = False
             save_done_ts       = 0.0   # timestamp when save_customer_feedback succeeded
             guard_log_ts       = 0.0   # throttle echo-guard log spam
+            agent_buf          = ""    # accumulate agent speech chunks per turn
+            customer_buf       = ""    # accumulate customer speech chunks per utterance
 
             async def g_receiver():
                 nonlocal downsample_state, last_ai_audio_ts, gemini_turn_end_ts
                 nonlocal greeting_started, greeting_done, save_done_ts
+                nonlocal agent_buf, customer_buf
                 try:
                     async for raw_msg in g_ws:
                         data = json.loads(raw_msg)
 
-                        # ── Debug: log top-level keys of every message ───────
-                        top_keys = list(data.keys())
                         sc = data.get("serverContent", {})
-                        sc_keys = list(sc.keys()) if sc else []
-                        if top_keys not in [["serverContent"], ["setupComplete"]]:
-                            log(f"📩 Gemini msg keys={top_keys} sc_keys={sc_keys}")
-                        elif sc_keys and sc_keys != ["modelTurn"]:
-                            log(f"📩 serverContent keys={sc_keys}")
 
-                        # ── Transcript: customer speech ──────────────────────
-                        # Try both top-level and nested locations
+                        # ── Transcript: buffer chunks, flush on turn boundary ─
                         in_t = (data.get("inputAudioTranscription")
                                 or data.get("inputTranscription")
                                 or sc.get("inputAudioTranscription")
                                 or sc.get("inputTranscription")
                                 or {})
                         if in_t and in_t.get("text"):
-                            line = f"Customer: {in_t['text']}"
-                            transcript_log.append(line)
-                            log(f"🗣  {line}")
+                            customer_buf += in_t["text"]
 
-                        # ── Transcript: agent speech ─────────────────────────
                         out_t = (data.get("outputAudioTranscription")
                                  or data.get("outputTranscription")
                                  or sc.get("outputAudioTranscription")
                                  or sc.get("outputTranscription")
                                  or {})
                         if out_t and out_t.get("text"):
-                            line = f"Agent: {out_t['text']}"
-                            transcript_log.append(line)
-                            log(f"🤖  {line}")
+                            # Agent started speaking — flush pending customer line
+                            if customer_buf.strip():
+                                line = f"Customer: {customer_buf.strip()}"
+                                transcript_log.append(line)
+                                log(f"🗣  {line}")
+                                customer_buf = ""
+                            agent_buf += out_t["text"]
 
                         server_content = data.get("serverContent", {})
 
@@ -167,6 +163,12 @@ async def gemini_handler(request):
                         if server_content.get("turnComplete"):
                             gemini_turn_end_ts = time.time()
                             ai_dur = gemini_turn_end_ts - last_ai_audio_ts if last_ai_audio_ts else 0
+                            # Flush agent buffer as one clean line
+                            if agent_buf.strip():
+                                line = f"Agent: {agent_buf.strip()}"
+                                transcript_log.append(line)
+                                log(f"🤖  {line}")
+                                agent_buf = ""
                             if not greeting_done:
                                 greeting_done = True
                                 log(f"🔔 turnComplete — GREETING DONE, customer audio now live "
@@ -223,6 +225,13 @@ async def gemini_handler(request):
                     log(f"❌ g_receiver error: {ex}")
                     traceback.print_exc()
                 finally:
+                    # Flush any partial buffers that didn't get a turnComplete
+                    if agent_buf.strip():
+                        line = f"Agent: {agent_buf.strip()}"
+                        transcript_log.append(line)
+                    if customer_buf.strip():
+                        line = f"Customer: {customer_buf.strip()}"
+                        transcript_log.append(line)
                     log("🔁 g_receiver exiting — releasing echo guard")
                     gemini_turn_end_ts = time.time() - 1.0
 
