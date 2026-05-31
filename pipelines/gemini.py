@@ -193,9 +193,6 @@ async def gemini_handler(request):
                         # Buffer 1.5s after turn ends (clears reverb/echo)
                         if time.time() - gemini_turn_end_ts < 1.5:
                             continue
-                        # Stop forwarding if Gemini connection already closed
-                        if g_ws.closed:
-                            break
                         raw_mulaw = base64.b64decode(data["media"]["payload"])
                         pcm8  = audioop.ulaw2lin(raw_mulaw, 2)
                         pcm16, upsample_state = audioop.ratecv(
