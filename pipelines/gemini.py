@@ -14,6 +14,11 @@ from core.state_engine import ConversationStateEngine
 from mydoot_functions import FUNCTION_MAP, send_call_summary_email
 
 
+def _ts():
+    """Short HH:MM:SS.mmm timestamp for log lines."""
+    return datetime.now().strftime("%H:%M:%S.%f")[:-3]
+
+
 async def gemini_handler(request):
     ws = web.WebSocketResponse(protocols=["audio.drachtio.org"])
     await ws.prepare(request)
@@ -21,6 +26,9 @@ async def gemini_handler(request):
     caller_id      = request.query.get("caller_id", "Unknown")
     state_engine   = ConversationStateEngine()
     transcript_log = []     # ["Agent: ...", "Customer: ..."]
+
+    def log(msg):
+        print(f"[{_ts()}] caller={caller_id} | {msg}", flush=True)
 
     def get_system_prompt():
         return (
@@ -31,8 +39,8 @@ async def gemini_handler(request):
     model = APP_CONFIG.get("parameters", {}).get("google", {}).get(
         "model", "models/gemini-2.5-flash-native-audio-latest"
     )
-    print(f"🚀 Gemini Live connecting | model={model} | caller={caller_id}")
-    print(f"   API key: {'SET len=' + str(len(GEMINI_API_KEY)) if GEMINI_API_KEY else '*** MISSING ***'}")
+    log(f"🚀 Gemini Live connecting | model={model}")
+    log(f"   API key: {'SET len=' + str(len(GEMINI_API_KEY)) if GEMINI_API_KEY else '*** MISSING ***'}")
 
     try:
         async with websockets.connect(
@@ -72,7 +80,7 @@ async def gemini_handler(request):
                 }
             }
             await g_ws.send(json.dumps(setup))
-            print("📤 Setup sent — waiting for Gemini confirmation...")
+            log("📤 Setup sent — waiting for Gemini confirmation...")
 
             # ── 2. Wait for setup confirmation ──────────────────────────────
             try:
@@ -83,12 +91,9 @@ async def gemini_handler(request):
             resp = json.loads(raw)
             if resp.get("error"):
                 raise Exception(f"Gemini setup error: {resp['error']}")
-            print(f"✅ Gemini Live Ready: {json.dumps(resp)[:120]}")
+            log(f"✅ Gemini Live Ready: {json.dumps(resp)[:120]}")
 
             # ── 3. Kick off greeting ─────────────────────────────────────────
-            # Send a silent trigger so Gemini speaks its opening greeting.
-            # The actual greeting scripts are in the system prompt — Gemini
-            # picks one randomly as instructed there.
             await g_ws.send(json.dumps({
                 "clientContent": {
                     "turns": [{
@@ -98,33 +103,44 @@ async def gemini_handler(request):
                     "turnComplete": True,
                 }
             }))
+            log("📨 [CALL_STARTED] trigger sent — awaiting greeting audio")
 
             # ── 4. Receive loop: audio + tool calls from Gemini ─────────────
             downsample_state   = None
             last_ai_audio_ts   = 0.0   # timestamp of last audio packet from Gemini
             gemini_turn_end_ts = 0.0   # timestamp when Gemini signalled turnComplete
+            greeting_started   = False
+            guard_log_ts       = 0.0   # throttle echo-guard log spam
 
             async def g_receiver():
                 nonlocal downsample_state, last_ai_audio_ts, gemini_turn_end_ts
+                nonlocal greeting_started
                 try:
                     async for raw_msg in g_ws:
                         data = json.loads(raw_msg)
 
-                        # Capture customer speech transcript
+                        # ── Transcript: customer speech ──────────────────────
                         in_t = data.get("inputAudioTranscription", {})
                         if in_t and in_t.get("text"):
-                            transcript_log.append(f"Customer: {in_t['text']}")
+                            line = f"Customer: {in_t['text']}"
+                            transcript_log.append(line)
+                            log(f"🗣  {line}")
 
-                        # Capture agent speech transcript
+                        # ── Transcript: agent speech ─────────────────────────
                         out_t = data.get("outputAudioTranscription", {})
                         if out_t and out_t.get("text"):
-                            transcript_log.append(f"Agent: {out_t['text']}")
+                            line = f"Agent: {out_t['text']}"
+                            transcript_log.append(line)
+                            log(f"🤖  {line}")
 
                         server_content = data.get("serverContent", {})
 
-                        # Audio output — convert Gemini's 24kHz PCM → 8kHz mu-law
+                        # ── Audio output → Vobiz ────────────────────────────
                         for part in server_content.get("modelTurn", {}).get("parts", []):
                             if part.get("inlineData"):
+                                if not greeting_started:
+                                    greeting_started = True
+                                    log("🔊 Greeting audio started streaming to caller")
                                 pcm24 = base64.b64decode(part["inlineData"]["data"])
                                 pcm8, downsample_state = audioop.ratecv(
                                     pcm24, 2, 1, 24000, 8000, downsample_state
@@ -141,19 +157,25 @@ async def gemini_handler(request):
                                         },
                                     }))
 
-                        # Gemini signals it finished speaking this turn
+                        # ── turnComplete: agent finished speaking ────────────
                         if server_content.get("turnComplete"):
                             gemini_turn_end_ts = time.time()
-                            print("🔔 turnComplete received")
+                            ai_dur = gemini_turn_end_ts - last_ai_audio_ts if last_ai_audio_ts else 0
+                            log(f"🔔 turnComplete — echo guard releases in 1.0s "
+                                f"(last audio {ai_dur:.2f}s ago)")
 
-                        # Tool calls
+                        # ── Interrupted: agent cut off mid-speech ────────────
+                        if server_content.get("interrupted"):
+                            log("⚡ serverContent.interrupted — agent speech was interrupted by customer")
+
+                        # ── Tool calls ───────────────────────────────────────
                         tool_call = data.get("toolCall")
                         if tool_call:
                             for fc in tool_call.get("functionCalls", []):
                                 fn   = fc.get("name", "")
                                 args = fc.get("args", {})
                                 cid  = fc.get("id", "")
-                                print(f"🔧 Tool call: {fn}({args})")
+                                log(f"🔧 Tool call: {fn} | args={json.dumps(args)}")
 
                                 if fn == "save_customer_feedback":
                                     for k in ["customer_name", "brand", "item",
@@ -165,7 +187,7 @@ async def gemini_handler(request):
 
                                 if fn in FUNCTION_MAP:
                                     res = await asyncio.to_thread(FUNCTION_MAP[fn], **args)
-                                    print(f"🔧 Tool result: {res}")
+                                    log(f"🔧 Tool result: {res}")
                                     await g_ws.send(json.dumps({
                                         "toolResponse": {
                                             "functionResponses": [{
@@ -175,44 +197,61 @@ async def gemini_handler(request):
                                             }]
                                         }
                                     }))
+                                else:
+                                    log(f"⚠️  Unknown tool: {fn}")
+
+                        # ── Log unexpected error fields ──────────────────────
+                        if data.get("error"):
+                            log(f"❌ Gemini error message: {data['error']}")
 
                 except Exception as ex:
-                    print(f"❌ g_receiver error: {ex}")
+                    log(f"❌ g_receiver error: {ex}")
                     traceback.print_exc()
                 finally:
-                    # Release echo guard so the main loop never stays blocked
+                    log("🔁 g_receiver exiting — releasing echo guard")
                     gemini_turn_end_ts = time.time() - 1.0
 
             asyncio.create_task(g_receiver())
 
             # ── 5. Forward Vobiz audio → Gemini ─────────────────────────────
-            # Vobiz sends mu-law 8kHz; Gemini Live expects PCM 16kHz.
-            # ECHO GUARD: only block for a short window after Gemini finishes
-            # speaking (clears reverb/echo). Do NOT block during speech —
-            # that prevents barge-in and drops the customer's first words.
-            # Safety: if no turnComplete for 8s after last AI audio, auto-release.
-            upsample_state = None
-            call_start_ts  = time.time()
-            MAX_CALL_SECS  = 600  # 10 min hard limit — prevents infinite hang
+            upsample_state  = None
+            call_start_ts   = time.time()
+            MAX_CALL_SECS   = 600   # 10 min hard limit
+            fwd_count       = 0     # packets forwarded to Gemini
+            blocked_count   = 0     # packets dropped by echo guard
+            last_stat_ts    = time.time()
 
             async for msg in ws:
-                # Hard timeout: kill call if it hangs beyond 10 minutes
+                # Hard timeout
                 if time.time() - call_start_ts > MAX_CALL_SECS:
-                    print(f"⏱ Call timeout ({MAX_CALL_SECS}s) — closing.")
+                    log(f"⏱ Call timeout ({MAX_CALL_SECS}s) — closing.")
                     break
 
                 if msg.type == aiohttp.WSMsgType.TEXT:
                     data = json.loads(msg.data)
                     if data.get("event") == "media":
                         now = time.time()
+
                         # Safety: if Gemini sent audio but turnComplete never
-                        # arrived (g_receiver died/crashed), unblock after 8s
+                        # arrived, unblock after 8s
                         if (last_ai_audio_ts > gemini_turn_end_ts and
                                 now - last_ai_audio_ts > 8.0):
+                            log(f"⚠️  Echo guard safety timeout — forcing release "
+                                f"(turnComplete missing for {now - last_ai_audio_ts:.1f}s)")
                             gemini_turn_end_ts = now - 1.0
-                        # Short post-turn buffer: 1.0s after turnComplete
-                        if now - gemini_turn_end_ts < 1.0:
+
+                        # Echo guard: 1.0s buffer after turnComplete
+                        guard_active = now - gemini_turn_end_ts < 1.0
+                        if guard_active:
+                            blocked_count += 1
+                            # Log guard state once per second (not every packet)
+                            if now - guard_log_ts > 1.0:
+                                guard_log_ts = now
+                                log(f"🔇 Echo guard active — "
+                                    f"{1.0 - (now - gemini_turn_end_ts):.2f}s remaining "
+                                    f"| blocked={blocked_count} pkts")
                             continue
+
                         raw_mulaw = base64.b64decode(data["media"]["payload"])
                         pcm8  = audioop.ulaw2lin(raw_mulaw, 2)
                         pcm16, upsample_state = audioop.ratecv(
@@ -227,21 +266,35 @@ async def gemini_handler(request):
                                     }
                                 }
                             }))
+                            fwd_count += 1
                         except Exception:
-                            break  # Gemini closed — end gracefully
+                            log("❌ Gemini WS closed mid-send — ending call")
+                            break
+
+                        # Periodic stats log every 10s
+                        if now - last_stat_ts > 10.0:
+                            last_stat_ts = now
+                            elapsed = now - call_start_ts
+                            log(f"📊 Stats @{elapsed:.0f}s — "
+                                f"fwd={fwd_count} pkts | blocked={blocked_count} pkts | "
+                                f"transcript={len(transcript_log)} lines")
+
                 elif msg.type == aiohttp.WSMsgType.ERROR:
-                    print(f"❌ Vobiz WS error: {ws.exception()}")
+                    log(f"❌ Vobiz WS error: {ws.exception()}")
                     break
 
     except Exception as e:
-        print(f"❌ Gemini Live Error: {e}")
+        print(f"[{_ts()}] ❌ Gemini Live Error: {e}", flush=True)
         traceback.print_exc()
     finally:
-        # Always send transcript email (even if empty — confirms call happened)
+        elapsed = time.time() - (call_start_ts if 'call_start_ts' in dir() else time.time())
+        log(f"📞 Call ended | duration={elapsed:.1f}s | transcript={len(transcript_log)} lines")
+        log("📋 TRANSCRIPT:\n" + ("\n".join(transcript_log) if transcript_log else "  (empty)"))
         try:
             await asyncio.to_thread(send_call_summary_email, caller_id, transcript_log)
+            log("📧 Transcript email sent")
         except Exception as mail_err:
-            print(f"[EMAIL WARN]: {mail_err}")
+            log(f"⚠️  Email failed: {mail_err}")
         if not ws.closed:
             await ws.close()
 
