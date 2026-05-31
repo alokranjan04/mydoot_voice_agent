@@ -17,7 +17,7 @@ from mydoot_functions import FUNCTION_MAP, send_call_summary_email
 # Packets below this RMS are treated as background noise (fan, line hiss, etc.)
 # and not forwarded to Gemini. Increase if fan noise still leaks through;
 # decrease if soft speech is being filtered out.
-NOISE_GATE_RMS             = int(os.getenv("NOISE_GATE_RMS", "60"))
+NOISE_GATE_RMS             = int(os.getenv("NOISE_GATE_RMS", "200"))
 NOISE_GATE_FALLBACK_RMS             = int(os.getenv("NOISE_GATE_FALLBACK_RMS", "5"))
 NOISE_GATE_FALLBACK_AFTER_S         = float(os.getenv("NOISE_GATE_FALLBACK_AFTER_S", "2.0"))
 NOISE_GATE_FALLBACK_FULL_DISABLE_S  = float(os.getenv("NOISE_GATE_FALLBACK_FULL_DISABLE_S", "7.0"))
@@ -26,6 +26,10 @@ NOISE_GATE_FALLBACK_ENABLED         = os.getenv("NOISE_GATE_FALLBACK", "1").lowe
 # Keep forwarding audio for this many seconds after the last speech packet,
 # so the tail of each utterance reaches Gemini intact.
 SPEECH_TAIL_SECS           = float(os.getenv("SPEECH_TAIL_SECS", "0.9"))
+# After the speech tail expires, forward zero-amplitude audio for this long.
+# This gives Gemini's VAD an explicit silence signal so it responds in ~1-2s
+# instead of waiting 20-30s for background noise to go silent on its own.
+SILENCE_SEND_SECS          = float(os.getenv("SILENCE_SEND_SECS", "2.0"))
 # Accumulate this many 20ms frames before sending one Gemini message.
 # 4 × 20ms = 80ms chunks → ~12 sends/s instead of 50.
 AUDIO_BATCH_FRAMES         = 4
@@ -428,28 +432,20 @@ async def gemini_handler(request):
                                 f"blocked={noise_blocked_count}"
                             )
                         if not is_speech and not speech_tail_ok:
-                            # Flush any partially-accumulated batch so Gemini
-                            # receives the complete tail of the last utterance.
-                            if audio_batch:
-                                combined = b"".join(audio_batch)
-                                audio_batch.clear()
-                                try:
-                                    await g_ws.send(json.dumps({
-                                        "realtimeInput": {"audio": {
-                                            "data":     base64.b64encode(combined).decode("utf-8"),
-                                            "mimeType": "audio/pcm;rate=16000",
-                                        }}
-                                    }))
-                                    fwd_count += 1
-                                except Exception:
-                                    log("❌ Gemini WS closed mid-send — ending call")
-                                    break
                             noise_blocked_count += 1
-                            if now - guard_log_ts > 5.0:
-                                guard_log_ts = now
-                                log(f"🔇 Noise gate — rms={rms} < {NOISE_GATE_RMS} | "
-                                    f"{noise_blocked_count} pkts filtered so far")
-                            continue
+                            since_speech = now - last_speech_ts
+                            if since_speech < SPEECH_TAIL_SECS + SILENCE_SEND_SECS:
+                                # Replace background noise with zero-amplitude audio.
+                                # Gemini's VAD sees clean silence → detects end-of-speech
+                                # → responds in ~1-2s instead of waiting 20-30s.
+                                pcm16 = bytes(len(pcm16))
+                            else:
+                                # Beyond silence window — drop entirely to save bandwidth.
+                                if now - guard_log_ts > 5.0:
+                                    guard_log_ts = now
+                                    log(f"🔇 Noise gate — rms={rms} < {active_noise_gate} | "
+                                        f"{noise_blocked_count} pkts filtered so far")
+                                continue
 
                         # ── Batch 4 frames (80ms) before sending to Gemini ───
                         audio_batch.append(pcm16)
