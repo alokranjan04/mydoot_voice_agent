@@ -106,15 +106,33 @@ async def gemini_handler(request):
                     async for raw_msg in g_ws:
                         data = json.loads(raw_msg)
 
+                        # ── Debug: log top-level keys of every message ───────
+                        top_keys = list(data.keys())
+                        sc = data.get("serverContent", {})
+                        sc_keys = list(sc.keys()) if sc else []
+                        if top_keys not in [["serverContent"], ["setupComplete"]]:
+                            log(f"📩 Gemini msg keys={top_keys} sc_keys={sc_keys}")
+                        elif sc_keys and sc_keys != ["modelTurn"]:
+                            log(f"📩 serverContent keys={sc_keys}")
+
                         # ── Transcript: customer speech ──────────────────────
-                        in_t = data.get("inputAudioTranscription", {})
+                        # Try both top-level and nested locations
+                        in_t = (data.get("inputAudioTranscription")
+                                or data.get("inputTranscription")
+                                or sc.get("inputAudioTranscription")
+                                or sc.get("inputTranscription")
+                                or {})
                         if in_t and in_t.get("text"):
                             line = f"Customer: {in_t['text']}"
                             transcript_log.append(line)
                             log(f"🗣  {line}")
 
                         # ── Transcript: agent speech ─────────────────────────
-                        out_t = data.get("outputAudioTranscription", {})
+                        out_t = (data.get("outputAudioTranscription")
+                                 or data.get("outputTranscription")
+                                 or sc.get("outputAudioTranscription")
+                                 or sc.get("outputTranscription")
+                                 or {})
                         if out_t and out_t.get("text"):
                             line = f"Agent: {out_t['text']}"
                             transcript_log.append(line)
