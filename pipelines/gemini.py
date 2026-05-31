@@ -179,18 +179,26 @@ async def gemini_handler(request):
             # that prevents barge-in and drops the customer's first words.
             # Safety: if no turnComplete for 8s after last AI audio, auto-release.
             upsample_state = None
+            call_start_ts  = time.time()
+            MAX_CALL_SECS  = 600  # 10 min hard limit — prevents infinite hang
+
             async for msg in ws:
+                # Hard timeout: kill call if it hangs beyond 10 minutes
+                if time.time() - call_start_ts > MAX_CALL_SECS:
+                    print(f"⏱ Call timeout ({MAX_CALL_SECS}s) — closing.")
+                    break
+
                 if msg.type == aiohttp.WSMsgType.TEXT:
                     data = json.loads(msg.data)
                     if data.get("event") == "media":
                         now = time.time()
-                        # Safety release: if Gemini sent audio but turnComplete
-                        # never arrived (e.g. g_receiver died), unblock after 8s
+                        # Safety: if Gemini sent audio but turnComplete never
+                        # arrived (g_receiver died/crashed), unblock after 8s
                         if (last_ai_audio_ts > gemini_turn_end_ts and
                                 now - last_ai_audio_ts > 8.0):
-                            gemini_turn_end_ts = now - 1.0  # skip buffer
+                            gemini_turn_end_ts = now - 1.0
                         # Short post-turn buffer: 1.0s after turnComplete
-                        if time.time() - gemini_turn_end_ts < 1.0:
+                        if now - gemini_turn_end_ts < 1.0:
                             continue
                         raw_mulaw = base64.b64decode(data["media"]["payload"])
                         pcm8  = audioop.ulaw2lin(raw_mulaw, 2)
