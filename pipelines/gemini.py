@@ -3,7 +3,7 @@
 Gemini Live Multimodal pipeline for Mydoot Customer Care.
 Uses websockets library + BidiGenerateContent (v1beta) — audio in / audio out.
 """
-import asyncio, audioop, base64, json, time, traceback
+import asyncio, audioop, base64, json, os, time, traceback
 from datetime import datetime
 import aiohttp
 import websockets
@@ -17,13 +17,15 @@ from mydoot_functions import FUNCTION_MAP, send_call_summary_email
 # Packets below this RMS are treated as background noise (fan, line hiss, etc.)
 # and not forwarded to Gemini. Increase if fan noise still leaks through;
 # decrease if soft speech is being filtered out.
-NOISE_GATE_RMS     = 400
+NOISE_GATE_RMS     = int(os.getenv("NOISE_GATE_RMS", "300"))
 # Keep forwarding audio for this many seconds after the last speech packet,
 # so the tail of each utterance reaches Gemini intact.
-SPEECH_TAIL_SECS   = 0.8
+SPEECH_TAIL_SECS   = float(os.getenv("SPEECH_TAIL_SECS", "0.9"))
 # Accumulate this many 20ms frames before sending one Gemini message.
 # 4 × 20ms = 80ms chunks → ~12 sends/s instead of 50.
 AUDIO_BATCH_FRAMES = 4
+# Enable per-packet audio RMS debug logging for noise-gate tuning.
+NOISE_GATE_DEBUG   = os.getenv("NOISE_GATE_DEBUG", "0").lower() in ("1", "true", "yes")
 
 
 def _ts():
@@ -392,10 +394,17 @@ async def gemini_handler(request):
                         # or falls within SPEECH_TAIL_SECS after the last speech
                         # packet (so the end of each utterance reaches Gemini).
                         rms = audioop.rms(pcm16, 2)
+                        speech_since_last = now - last_speech_ts
                         is_speech = rms > NOISE_GATE_RMS
-                        speech_tail_ok = (now - last_speech_ts) < SPEECH_TAIL_SECS
+                        speech_tail_ok = speech_since_last < SPEECH_TAIL_SECS
                         if is_speech:
                             last_speech_ts = now
+                        if NOISE_GATE_DEBUG:
+                            log(
+                                f"🔍 Noise debug | rms={rms} | threshold={NOISE_GATE_RMS} | "
+                                f"is_speech={is_speech} | tail_ok={speech_tail_ok} | "
+                                f"since_last_speech={speech_since_last:.3f}s"
+                            )
                         if not is_speech and not speech_tail_ok:
                             # Flush any partially-accumulated batch so Gemini
                             # receives the complete tail of the last utterance.

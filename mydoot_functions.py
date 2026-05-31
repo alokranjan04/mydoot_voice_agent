@@ -23,6 +23,15 @@ SPREADSHEET_ID = os.getenv("GOOGLE_SPREADSHEET_ID", "")
 _CACHED_SERVICES = {}
 
 
+def _validate_google_creds(data):
+    if not isinstance(data, dict):
+        return ["type", "project_id", "private_key", "client_email", "token_uri"]
+
+    required = ["type", "project_id", "private_key", "client_email", "token_uri"]
+    missing = [key for key in required if not data.get(key)]
+    return missing
+
+
 def get_google_creds():
     """Load and normalize Google service account credentials."""
     data = None
@@ -52,6 +61,13 @@ def get_google_creds():
     if not data:
         return None
 
+    missing_keys = _validate_google_creds(data)
+    if missing_keys:
+        print("[AUTH ERROR]: Google service account credentials are invalid or incomplete.")
+        print("[AUTH ERROR]: Missing required fields: " + ", ".join(missing_keys))
+        print("[AUTH ERROR]: Ensure your service account JSON is a full Google key file and that the target sheet is shared with the service account email.")
+        return None
+
     pk = data.get("private_key", "")
     if pk:
         pk = pk.strip().strip("'").strip('"')
@@ -67,12 +83,66 @@ def get_google_creds():
     return data
 
 
+def get_google_creds_health():
+    creds_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "google-credentials.json")
+    file_exists = os.path.exists(creds_file)
+    creds_json = os.getenv("GOOGLE_CREDENTIALS", "").strip()
+    env_present = bool(creds_json)
+    load_error = None
+    source = None
+    data = None
+
+    if file_exists:
+        try:
+            with open(creds_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                source = "google-credentials.json"
+        except Exception as e:
+            load_error = f"google-credentials.json parse error: {e}"
+
+    if data is None and env_present:
+        try:
+            if (creds_json.startswith("'") and creds_json.endswith("'")) or \
+               (creds_json.startswith('"') and creds_json.endswith('"')):
+                creds_json = creds_json[1:-1]
+            data = json.loads(creds_json)
+            source = "ENVIRONMENT"
+        except Exception as e:
+            load_error = f"GOOGLE_CREDENTIALS parse error: {e}"
+
+    missing_keys = []
+    valid = False
+    if data is not None:
+        missing_keys = _validate_google_creds(data)
+        valid = not missing_keys and load_error is None
+
+    return {
+        "file_exists": file_exists,
+        "env_present": env_present,
+        "valid": valid,
+        "missing_keys": missing_keys,
+        "load_error": load_error,
+        "source": source,
+    }
+
+
+def get_gmail_health():
+    gmail_user = os.getenv("GMAIL_USER", "").strip()
+    gmail_password = os.getenv("GMAIL_APP_PASSWORD", "").strip()
+    return {
+        "user_set": bool(gmail_user),
+        "app_password_set": bool(gmail_password),
+        "valid": bool(gmail_user and gmail_password),
+    }
+
+
 def _get_sheets_service():
     if "sheets" in _CACHED_SERVICES:
         return _CACHED_SERVICES["sheets"], SPREADSHEET_ID
 
     creds_data = get_google_creds()
     if not creds_data:
+        print("[FEEDBACK ERROR]: Unable to initialize Google Sheets service because credentials are missing or invalid.")
         return None, None
 
     creds = service_account.Credentials.from_service_account_info(

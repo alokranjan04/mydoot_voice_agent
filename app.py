@@ -21,9 +21,23 @@ from routes.dashboard import home_page, set_provider, set_parameters
 from routes.voice_lab import voice_lab_page
 from routes.metrics   import metrics_page, metrics_data
 from routes.uploads   import upload_file, list_files, delete_file
+from mydoot_functions import get_google_creds_health, get_gmail_health, SPREADSHEET_ID
 
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+
+
+async def health_check(request):
+    google_health = get_google_creds_health()
+    gmail_health = get_gmail_health()
+    return web.json_response({
+        "status": "ok",
+        "provider": APP_CONFIG.get("active_provider", "sarvam"),
+        "google_sheets": google_health,
+        "spreadsheet_id": SPREADSHEET_ID,
+        "gmail": gmail_health,
+        "public_url": os.getenv("PUBLIC_URL", ""),
+    })
 
 
 async def main():
@@ -48,6 +62,7 @@ async def main():
     app.router.add_get( "/gemini-stream",     gemini_handler)
     app.router.add_get( "/metrics",           metrics_page)
     app.router.add_get( "/metrics/data",      metrics_data)
+    app.router.add_get( "/health",           health_check)
     app.router.add_post("/api/upload",        upload_file)
     app.router.add_get( "/api/files",         list_files)
     app.router.add_post("/api/delete-file",   delete_file)
