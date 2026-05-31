@@ -19,6 +19,21 @@ def _ts():
     return datetime.now().strftime("%H:%M:%S.%f")[:-3]
 
 
+async def _close_after(vobiz_ws, gemini_ws, delay: float, log_fn):
+    """Close both WebSockets after `delay` seconds — ends the call gracefully."""
+    await asyncio.sleep(delay)
+    log_fn(f"📴 Closing call after {delay}s post-confirmation delay")
+    try:
+        await gemini_ws.close()
+    except Exception:
+        pass
+    try:
+        if not vobiz_ws.closed:
+            await vobiz_ws.close()
+    except Exception:
+        pass
+
+
 async def gemini_handler(request):
     ws = web.WebSocketResponse(protocols=["audio.drachtio.org"])
     await ws.prepare(request)
@@ -98,13 +113,14 @@ async def gemini_handler(request):
             greeting_done      = False  # True after first turnComplete (greeting finished)
             greeting_started   = False
             save_done_ts       = 0.0   # timestamp when save_customer_feedback succeeded
+            save_executed      = False  # prevent duplicate save calls per session
             guard_log_ts       = 0.0   # throttle echo-guard log spam
             agent_buf          = ""    # accumulate agent speech chunks per turn
             customer_buf       = ""    # accumulate customer speech chunks per utterance
 
             async def g_receiver():
                 nonlocal downsample_state, last_ai_audio_ts, gemini_turn_end_ts
-                nonlocal greeting_started, greeting_done, save_done_ts
+                nonlocal greeting_started, greeting_done, save_done_ts, save_executed
                 nonlocal agent_buf, customer_buf
                 try:
                     async for raw_msg in g_ws:
@@ -198,13 +214,27 @@ async def gemini_handler(request):
                                             state_engine.set_data(k, args[k])
                                     args.setdefault("caller_id", caller_id)
 
-                                if fn in FUNCTION_MAP:
+                                if fn == "save_customer_feedback" and save_executed:
+                                    log("⚠️  Duplicate save_customer_feedback call — skipping. "
+                                        "Returning success so Gemini doesn't retry.")
+                                    await g_ws.send(json.dumps({
+                                        "toolResponse": {
+                                            "functionResponses": [{
+                                                "id":       cid,
+                                                "name":     fn,
+                                                "response": {"result": {"success": True}},
+                                            }]
+                                        }
+                                    }))
+                                elif fn in FUNCTION_MAP:
                                     res = await asyncio.to_thread(FUNCTION_MAP[fn], **args)
                                     log(f"🔧 Tool result: {res}")
                                     if fn == "save_customer_feedback" and res.get("success"):
+                                        save_executed = True
                                         save_done_ts = time.time()
-                                        log("🔒 Post-save guard active — blocking audio for 15s "
-                                            "to let confirmation play uninterrupted")
+                                        log("🔒 Post-save guard active — blocking audio for 15s")
+                                        # Schedule call close after 8s (confirmation takes ~5s)
+                                        asyncio.create_task(_close_after(ws, g_ws, 8.0, log))
                                     await g_ws.send(json.dumps({
                                         "toolResponse": {
                                             "functionResponses": [{
