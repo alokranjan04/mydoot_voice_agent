@@ -49,6 +49,20 @@ async def gemini_handler(request):
                     "generationConfig": {
                         "responseModalities": ["AUDIO"],
                     },
+                    "realtimeInputConfig": {
+                        "automaticActivityDetection": {
+                            "disabled": False,
+                            # LOW start sensitivity: ignore fan/background noise,
+                            # only trigger on clear human speech
+                            "startOfSpeechSensitivity": "START_SENSITIVITY_LOW",
+                            # LOW end sensitivity: wait longer before cutting off
+                            # the customer (avoids clipping mid-sentence)
+                            "endOfSpeechSensitivity": "END_SENSITIVITY_LOW",
+                            # 800ms silence required before declaring end-of-turn
+                            "silenceDurationMs": 800,
+                            "prefixPaddingMs": 20,
+                        }
+                    },
                     "inputAudioTranscription":  {},
                     "outputAudioTranscription": {},
                     "systemInstruction": {
