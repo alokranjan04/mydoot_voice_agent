@@ -336,12 +336,18 @@ async def gemini_handler(request):
             upsample_state       = None
             call_start_ts        = time.time()
             MAX_CALL_SECS        = 600   # 10 min hard limit
-            fwd_count            = 0     # Gemini sends (each = AUDIO_BATCH_FRAMES packets)
+            fwd_count            = 0     # total Gemini sends (each = AUDIO_BATCH_FRAMES packets)
             blocked_count        = 0     # packets dropped by echo/greeting/save guards
-            noise_blocked_count  = 0     # packets filtered by noise gate
+            noise_blocked_count  = 0     # packets filtered by noise gate (total)
             last_speech_ts       = 0.0   # timestamp of last above-threshold audio packet
             audio_batch          = []    # accumulate frames before sending
             last_stat_ts         = time.time()
+            # Per-turn counters — reset each time the agent finishes speaking.
+            # Used so the noise gate fallback re-evaluates every turn, not just
+            # at the start of the call (fwd_count > 0 forever after first exchange).
+            turn_fwd_count       = 0     # speech packets forwarded since last turnComplete
+            turn_noise_blocked   = 0     # noise gate blocks since last turnComplete
+            last_seen_turn_end   = 0.0   # tracks last gemini_turn_end_ts we reset against
 
             async for msg in ws:
                 # Hard timeout
@@ -390,6 +396,19 @@ async def gemini_handler(request):
                             blocked_count += 1
                             continue
 
+                        # ── Reset per-turn counters when agent's turn ends ────
+                        if gemini_turn_end_ts != last_seen_turn_end:
+                            last_seen_turn_end = gemini_turn_end_ts
+                            turn_fwd_count   = 0
+                            turn_noise_blocked = 0
+
+                        # ── Inactivity timeout: close call if customer silent 20s ─
+                        if (save_done_ts == 0 and gemini_turn_end_ts > 0
+                                and turn_fwd_count == 0
+                                and now - gemini_turn_end_ts > 20.0):
+                            log("⏱ Inactivity — no customer speech for 20s after agent turn, closing")
+                            break
+
                         raw_mulaw = base64.b64decode(data["media"]["payload"])
                         pcm8  = audioop.ulaw2lin(raw_mulaw, 2)
                         pcm16, upsample_state = audioop.ratecv(
@@ -397,27 +416,32 @@ async def gemini_handler(request):
                         )
 
                         # ── Noise gate: filter fan/background noise ──────────
-                        # Only forward audio that exceeds the speech RMS threshold,
-                        # or falls within SPEECH_TAIL_SECS after the last speech
-                        # packet (so the end of each utterance reaches Gemini).
+                        # Fallback uses per-turn counters (turn_fwd_count, turn_noise_blocked)
+                        # so the threshold re-evaluates after every agent response, not just
+                        # at the start of the call (fwd_count stays > 0 after first exchange).
                         rms = audioop.rms(pcm16, 2)
                         speech_since_last = now - last_speech_ts
                         active_noise_gate = NOISE_GATE_RMS
-                        if (NOISE_GATE_FALLBACK_ENABLED and greeting_done and fwd_count == 0
-                                and now - call_start_ts > NOISE_GATE_FALLBACK_AFTER_S
-                                and noise_blocked_count >= 50):
+                        if (NOISE_GATE_FALLBACK_ENABLED and greeting_done
+                                and turn_fwd_count == 0
+                                and gemini_turn_end_ts > 0
+                                and now - gemini_turn_end_ts > NOISE_GATE_FALLBACK_AFTER_S
+                                and turn_noise_blocked >= 50):
                             active_noise_gate = NOISE_GATE_FALLBACK_RMS
                             if now - guard_log_ts > 3.0:
                                 guard_log_ts = now
-                                log(f"⚠️  Noise gate fallback active — lowering threshold to {active_noise_gate}")
-                        if (NOISE_GATE_FALLBACK_ENABLED and greeting_done and fwd_count == 0
-                                and now - call_start_ts > NOISE_GATE_FALLBACK_FULL_DISABLE_S
-                                and noise_blocked_count >= NOISE_GATE_FALLBACK_FULL_COUNT):
+                                log(f"⚠️  Noise gate fallback — threshold → {active_noise_gate} "
+                                    f"(turn_blocked={turn_noise_blocked})")
+                        if (NOISE_GATE_FALLBACK_ENABLED and greeting_done
+                                and turn_fwd_count == 0
+                                and gemini_turn_end_ts > 0
+                                and now - gemini_turn_end_ts > NOISE_GATE_FALLBACK_FULL_DISABLE_S
+                                and turn_noise_blocked >= NOISE_GATE_FALLBACK_FULL_COUNT):
                             if active_noise_gate != 0:
                                 active_noise_gate = 0
                                 if now - guard_log_ts > 3.0:
                                     guard_log_ts = now
-                                    log("⚠️  Soft audio fallback engaged — noise gate fully disabled")
+                                    log("⚠️  Soft audio fallback — noise gate fully disabled")
                         is_speech = rms > active_noise_gate
                         speech_tail_ok = speech_since_last < SPEECH_TAIL_SECS
                         if is_speech:
@@ -427,12 +451,21 @@ async def gemini_handler(request):
                                 f"🔍 Noise debug | rms={rms} | threshold={active_noise_gate} | "
                                 f"is_speech={is_speech} | tail_ok={speech_tail_ok} | "
                                 f"since_last_speech={speech_since_last:.3f}s | "
-                                f"blocked={noise_blocked_count}"
+                                f"turn_blocked={turn_noise_blocked}"
                             )
                         if not is_speech and not speech_tail_ok:
                             noise_blocked_count += 1
-                            since_speech = now - last_speech_ts
-                            if since_speech < SPEECH_TAIL_SECS + SILENCE_SEND_SECS:
+                            turn_noise_blocked  += 1
+                            # Silence injection reference: the later of last real speech
+                            # OR the agent's last turnComplete + echo guard. This ensures
+                            # Gemini always receives a fresh silence window after each
+                            # agent turn, even when last_speech_ts is from a previous turn.
+                            _silence_ref = max(
+                                last_speech_ts,
+                                gemini_turn_end_ts + 0.3 if gemini_turn_end_ts > 0 else 0.0,
+                            )
+                            since_ref = now - _silence_ref
+                            if since_ref < SPEECH_TAIL_SECS + SILENCE_SEND_SECS:
                                 # Replace background noise with zero-amplitude audio.
                                 # Gemini's VAD sees clean silence → detects end-of-speech
                                 # → responds in ~1-2s instead of waiting 20-30s.
@@ -461,7 +494,8 @@ async def gemini_handler(request):
                                     }
                                 }
                             }))
-                            fwd_count += 1
+                            fwd_count     += 1
+                            turn_fwd_count += 1
                         except Exception:
                             log("❌ Gemini WS closed mid-send — ending call")
                             break
