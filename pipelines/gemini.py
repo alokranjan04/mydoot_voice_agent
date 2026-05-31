@@ -193,19 +193,25 @@ async def gemini_handler(request):
                         # Buffer 1.5s after turn ends (clears reverb/echo)
                         if time.time() - gemini_turn_end_ts < 1.5:
                             continue
+                        # Stop forwarding if Gemini connection already closed
+                        if g_ws.closed:
+                            break
                         raw_mulaw = base64.b64decode(data["media"]["payload"])
                         pcm8  = audioop.ulaw2lin(raw_mulaw, 2)
                         pcm16, upsample_state = audioop.ratecv(
                             pcm8, 2, 1, 8000, 16000, upsample_state
                         )
-                        await g_ws.send(json.dumps({
-                            "realtimeInput": {
-                                "audio": {
-                                    "data":     base64.b64encode(pcm16).decode("utf-8"),
-                                    "mimeType": "audio/pcm;rate=16000",
+                        try:
+                            await g_ws.send(json.dumps({
+                                "realtimeInput": {
+                                    "audio": {
+                                        "data":     base64.b64encode(pcm16).decode("utf-8"),
+                                        "mimeType": "audio/pcm;rate=16000",
+                                    }
                                 }
-                            }
-                        }))
+                            }))
+                        except Exception:
+                            break  # Gemini closed — end gracefully
                 elif msg.type == aiohttp.WSMsgType.ERROR:
                     print(f"❌ Vobiz WS error: {ws.exception()}")
                     break
