@@ -362,25 +362,18 @@ async def gemini_handler(request):
                                 log(f"🔒 Post-save guard — {15.0 - (now - save_done_ts):.0f}s remaining")
                             continue
 
-                        # Block ALL audio until greeting finishes.
-                        # Early release: 1.0s after the last audio chunk — because
-                        # gemini-2.5-flash-native-audio-latest fires turnComplete 7+s
-                        # after the last audio, causing the customer's first response
-                        # to be completely missed while waiting for turnComplete.
+                        # 2-second startup guard — blocks only the initial connection
+                        # burst. After 2s, the noise gate (threshold 200) handles
+                        # background noise and the native audio model handles
+                        # interruptions naturally. Customers can say "Hindi" or
+                        # "English" at any point during or after the greeting.
                         if not greeting_done:
-                            if last_ai_audio_ts > 0 and now - last_ai_audio_ts > 1.0:
+                            if now - call_start_ts > 2.0:
                                 greeting_done = True
-                                log(f"🔔 Greeting early release — last audio "
-                                    f"{now - last_ai_audio_ts:.1f}s ago, accepting customer audio")
-                            elif now - call_start_ts > 20.0:
-                                greeting_done = True
-                                log("⚠️  Greeting guard 20s timeout — force-releasing")
+                                log(f"🔔 Greeting guard released at "
+                                    f"{now - call_start_ts:.1f}s — customer audio live")
                             else:
                                 blocked_count += 1
-                                if now - guard_log_ts > 3.0:
-                                    guard_log_ts = now
-                                    log(f"🔇 Greeting in progress — blocking customer audio "
-                                        f"| blocked={blocked_count} pkts so far")
                                 continue
 
                         # Safety: if Gemini sent audio but turnComplete never
