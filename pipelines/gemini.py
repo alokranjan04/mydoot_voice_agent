@@ -140,8 +140,8 @@ async def gemini_handler(request):
                                 print(f"🔧 Tool call: {fn}({args})")
 
                                 if fn == "save_customer_feedback":
-                                    for k in ["customer_name", "company_name",
-                                              "product_name", "usage_duration",
+                                    for k in ["customer_name", "brand", "item",
+                                              "product_used_since", "usage_duration",
                                               "warranty_status", "complaint"]:
                                         if args.get(k):
                                             state_engine.set_data(k, args[k])

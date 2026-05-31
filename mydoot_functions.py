@@ -119,9 +119,11 @@ def save_customer_feedback(customer_name, brand, item,
       G: Complaint | H: Timestamp | I: Caller ID
     """
     print(f"[FEEDBACK]: Saving — Customer={customer_name}, Brand={brand}, Item={item}")
+    print(f"[FEEDBACK]: SpreadsheetID={SPREADSHEET_ID!r} | GOOGLE_CREDENTIALS set={bool(os.getenv('GOOGLE_CREDENTIALS'))}")
     try:
         service, spreadsheet_id = _get_sheets_service()
         if not service:
+            print("[FEEDBACK ERROR]: No Sheets service — check GOOGLE_CREDENTIALS env var")
             return {
                 "success": False,
                 "message": "Google Sheets credentials not found.",
