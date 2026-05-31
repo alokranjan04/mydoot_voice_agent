@@ -97,11 +97,12 @@ async def gemini_handler(request):
             gemini_turn_end_ts = 0.0   # timestamp when Gemini signalled turnComplete
             greeting_done      = False  # True after first turnComplete (greeting finished)
             greeting_started   = False
+            save_done_ts       = 0.0   # timestamp when save_customer_feedback succeeded
             guard_log_ts       = 0.0   # throttle echo-guard log spam
 
             async def g_receiver():
                 nonlocal downsample_state, last_ai_audio_ts, gemini_turn_end_ts
-                nonlocal greeting_started, greeting_done
+                nonlocal greeting_started, greeting_done, save_done_ts
                 try:
                     async for raw_msg in g_ws:
                         data = json.loads(raw_msg)
@@ -198,6 +199,10 @@ async def gemini_handler(request):
                                 if fn in FUNCTION_MAP:
                                     res = await asyncio.to_thread(FUNCTION_MAP[fn], **args)
                                     log(f"🔧 Tool result: {res}")
+                                    if fn == "save_customer_feedback" and res.get("success"):
+                                        save_done_ts = time.time()
+                                        log("🔒 Post-save guard active — blocking audio for 15s "
+                                            "to let confirmation play uninterrupted")
                                     await g_ws.send(json.dumps({
                                         "toolResponse": {
                                             "functionResponses": [{
@@ -241,6 +246,14 @@ async def gemini_handler(request):
                     data = json.loads(msg.data)
                     if data.get("event") == "media":
                         now = time.time()
+
+                        # Block audio for 15s after save so confirmation plays uninterrupted.
+                        if save_done_ts and now - save_done_ts < 15.0:
+                            blocked_count += 1
+                            if now - guard_log_ts > 3.0:
+                                guard_log_ts = now
+                                log(f"🔒 Post-save guard — {15.0 - (now - save_done_ts):.0f}s remaining")
+                            continue
 
                         # Block ALL audio until greeting turnComplete fires.
                         # This prevents background noise from interrupting the greeting.
