@@ -13,6 +13,18 @@ from config.settings import APP_CONFIG, GEMINI_API_KEY, GEMINI_WS_URL
 from core.state_engine import ConversationStateEngine
 from mydoot_functions import FUNCTION_MAP, send_call_summary_email
 
+# ── Audio pipeline tuning ────────────────────────────────────────────────────
+# Packets below this RMS are treated as background noise (fan, line hiss, etc.)
+# and not forwarded to Gemini. Increase if fan noise still leaks through;
+# decrease if soft speech is being filtered out.
+NOISE_GATE_RMS     = 400
+# Keep forwarding audio for this many seconds after the last speech packet,
+# so the tail of each utterance reaches Gemini intact.
+SPEECH_TAIL_SECS   = 0.8
+# Accumulate this many 20ms frames before sending one Gemini message.
+# 4 × 20ms = 80ms chunks → ~12 sends/s instead of 50.
+AUDIO_BATCH_FRAMES = 4
+
 
 def _ts():
     """Short HH:MM:SS.mmm timestamp for log lines."""
@@ -310,12 +322,15 @@ async def gemini_handler(request):
             asyncio.create_task(g_receiver())
 
             # ── 5. Forward Vobiz audio → Gemini ─────────────────────────────
-            upsample_state  = None
-            call_start_ts   = time.time()
-            MAX_CALL_SECS   = 600   # 10 min hard limit
-            fwd_count       = 0     # packets forwarded to Gemini
-            blocked_count   = 0     # packets dropped by echo guard
-            last_stat_ts    = time.time()
+            upsample_state       = None
+            call_start_ts        = time.time()
+            MAX_CALL_SECS        = 600   # 10 min hard limit
+            fwd_count            = 0     # Gemini sends (each = AUDIO_BATCH_FRAMES packets)
+            blocked_count        = 0     # packets dropped by echo/greeting/save guards
+            noise_blocked_count  = 0     # packets filtered by noise gate
+            last_speech_ts       = 0.0   # timestamp of last above-threshold audio packet
+            audio_batch          = []    # accumulate frames before sending
+            last_stat_ts         = time.time()
 
             async for msg in ws:
                 # Hard timeout
@@ -371,11 +386,52 @@ async def gemini_handler(request):
                         pcm16, upsample_state = audioop.ratecv(
                             pcm8, 2, 1, 8000, 16000, upsample_state
                         )
+
+                        # ── Noise gate: filter fan/background noise ──────────
+                        # Only forward audio that exceeds the speech RMS threshold,
+                        # or falls within SPEECH_TAIL_SECS after the last speech
+                        # packet (so the end of each utterance reaches Gemini).
+                        rms = audioop.rms(pcm16, 2)
+                        is_speech = rms > NOISE_GATE_RMS
+                        speech_tail_ok = (now - last_speech_ts) < SPEECH_TAIL_SECS
+                        if is_speech:
+                            last_speech_ts = now
+                        if not is_speech and not speech_tail_ok:
+                            # Flush any partially-accumulated batch so Gemini
+                            # receives the complete tail of the last utterance.
+                            if audio_batch:
+                                combined = b"".join(audio_batch)
+                                audio_batch.clear()
+                                try:
+                                    await g_ws.send(json.dumps({
+                                        "realtimeInput": {"audio": {
+                                            "data":     base64.b64encode(combined).decode("utf-8"),
+                                            "mimeType": "audio/pcm;rate=16000",
+                                        }}
+                                    }))
+                                    fwd_count += 1
+                                except Exception:
+                                    log("❌ Gemini WS closed mid-send — ending call")
+                                    break
+                            noise_blocked_count += 1
+                            if now - guard_log_ts > 5.0:
+                                guard_log_ts = now
+                                log(f"🔇 Noise gate — rms={rms} < {NOISE_GATE_RMS} | "
+                                    f"{noise_blocked_count} pkts filtered so far")
+                            continue
+
+                        # ── Batch 4 frames (80ms) before sending to Gemini ───
+                        audio_batch.append(pcm16)
+                        if len(audio_batch) < AUDIO_BATCH_FRAMES:
+                            continue
+
+                        combined = b"".join(audio_batch)
+                        audio_batch.clear()
                         try:
                             await g_ws.send(json.dumps({
                                 "realtimeInput": {
                                     "audio": {
-                                        "data":     base64.b64encode(pcm16).decode("utf-8"),
+                                        "data":     base64.b64encode(combined).decode("utf-8"),
                                         "mimeType": "audio/pcm;rate=16000",
                                     }
                                 }
@@ -390,7 +446,9 @@ async def gemini_handler(request):
                             last_stat_ts = now
                             elapsed = now - call_start_ts
                             log(f"📊 Stats @{elapsed:.0f}s — "
-                                f"fwd={fwd_count} pkts | blocked={blocked_count} pkts | "
+                                f"sends={fwd_count} (80ms/ea) | "
+                                f"guard_blocked={blocked_count} | "
+                                f"noise_filtered={noise_blocked_count} | "
                                 f"transcript={len(transcript_log)} lines")
 
                 elif msg.type == aiohttp.WSMsgType.ERROR:
