@@ -169,29 +169,41 @@ def save_customer_feedback(customer_name, brand, item,
 
 def send_call_summary_email(caller_id: str, transcript_lines: list):
     """Send full call transcript to the configured admin email after each call."""
+    import traceback as _tb
+
     gmail_user     = os.getenv("GMAIL_USER", "").strip()
     gmail_password = os.getenv("GMAIL_APP_PASSWORD", "").strip().replace(" ", "")
-    if not gmail_user or not gmail_password:
-        print("[EMAIL]: GMAIL_USER or GMAIL_APP_PASSWORD not set — skipping email.")
+
+    # ── Credential diagnostics ──────────────────────────────────────────────
+    print(f"[EMAIL]: GMAIL_USER={'SET (' + gmail_user[:4] + '...)' if gmail_user else '*** NOT SET ***'}")
+    print(f"[EMAIL]: GMAIL_APP_PASSWORD={'SET (len=' + str(len(gmail_password)) + ')' if gmail_password else '*** NOT SET ***'}")
+    print(f"[EMAIL]: transcript lines = {len(transcript_lines)}")
+
+    if not gmail_user:
+        print("[EMAIL ERROR]: GMAIL_USER env var is missing — cannot send email.")
+        return
+    if not gmail_password:
+        print("[EMAIL ERROR]: GMAIL_APP_PASSWORD env var is missing — cannot send email.")
         return
 
     ts      = datetime.now().strftime("%Y-%m-%d %H:%M IST")
     subject = f"MyDoot Call Transcript — Caller: {caller_id} — {ts}"
     body_lines = [
-        f"MyDoot Customer Care — Call Summary",
+        "MyDoot Customer Care — Call Summary",
         f"Caller ID : {caller_id}",
         f"Time      : {ts}",
-        f"",
+        "",
         "─── TRANSCRIPT ───",
         "",
     ]
     if transcript_lines:
         body_lines.extend(transcript_lines)
     else:
-        body_lines.append("(No transcript captured — transcription may not be supported for this call)")
+        body_lines.append("(No transcript captured — call may have been very short or dropped before any speech)")
     body = "\n".join(body_lines)
 
     try:
+        print(f"[EMAIL]: Connecting to smtp.gmail.com:465 ...")
         msg = MIMEMultipart()
         msg["From"]    = gmail_user
         msg["To"]      = gmail_user
@@ -199,12 +211,23 @@ def send_call_summary_email(caller_id: str, transcript_lines: list):
         msg.attach(MIMEText(body, "plain", "utf-8"))
 
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+            print(f"[EMAIL]: SMTP connected — logging in ...")
             server.login(gmail_user, gmail_password)
+            print(f"[EMAIL]: Login successful — sending message ...")
             server.send_message(msg)
 
-        print(f"[EMAIL]: Transcript sent to {gmail_user}")
+        print(f"[EMAIL]: ✅ Transcript email sent successfully to {gmail_user} "
+              f"| subject: {subject}")
+    except smtplib.SMTPAuthenticationError as e:
+        print(f"[EMAIL ERROR]: ❌ Authentication failed — check GMAIL_APP_PASSWORD "
+              f"(must be a Gmail App Password, not your account password): {e}")
+        _tb.print_exc()
+    except smtplib.SMTPException as e:
+        print(f"[EMAIL ERROR]: ❌ SMTP error: {e}")
+        _tb.print_exc()
     except Exception as e:
-        print(f"[EMAIL ERROR]: {e}")
+        print(f"[EMAIL ERROR]: ❌ Unexpected error: {e}")
+        _tb.print_exc()
 
 
 FUNCTION_MAP = {

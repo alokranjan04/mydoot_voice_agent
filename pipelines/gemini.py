@@ -309,11 +309,8 @@ async def gemini_handler(request):
         elapsed = time.time() - (call_start_ts if 'call_start_ts' in dir() else time.time())
         log(f"📞 Call ended | duration={elapsed:.1f}s | transcript={len(transcript_log)} lines")
         log("📋 TRANSCRIPT:\n" + ("\n".join(transcript_log) if transcript_log else "  (empty)"))
-        try:
-            await asyncio.to_thread(send_call_summary_email, caller_id, transcript_log)
-            log("📧 Transcript email sent")
-        except Exception as mail_err:
-            log(f"⚠️  Email failed: {mail_err}")
+        log("📧 Attempting transcript email ...")
+        await asyncio.to_thread(send_call_summary_email, caller_id, transcript_log)
         if not ws.closed:
             await ws.close()
 
