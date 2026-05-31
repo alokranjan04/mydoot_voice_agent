@@ -25,7 +25,7 @@ NOISE_GATE_FALLBACK_FULL_COUNT      = int(os.getenv("NOISE_GATE_FALLBACK_FULL_CO
 NOISE_GATE_FALLBACK_ENABLED         = os.getenv("NOISE_GATE_FALLBACK", "1").lower() in ("1", "true", "yes")
 # Keep forwarding audio for this many seconds after the last speech packet,
 # so the tail of each utterance reaches Gemini intact.
-SPEECH_TAIL_SECS           = float(os.getenv("SPEECH_TAIL_SECS", "0.9"))
+SPEECH_TAIL_SECS           = float(os.getenv("SPEECH_TAIL_SECS", "0.4"))
 # After the speech tail expires, forward zero-amplitude audio for this long.
 # This gives Gemini's VAD an explicit silence signal so it responds in ~1-2s
 # instead of waiting 20-30s for background noise to go silent on its own.
@@ -386,8 +386,8 @@ async def gemini_handler(request):
                                 f"(turnComplete missing for {now - last_ai_audio_ts:.1f}s)")
                             gemini_turn_end_ts = now - 1.0
 
-                        # Echo guard: 0.5s buffer after turnComplete
-                        guard_active = now - gemini_turn_end_ts < 0.5
+                        # Echo guard: 0.3s buffer after turnComplete
+                        guard_active = now - gemini_turn_end_ts < 0.3
                         if guard_active:
                             blocked_count += 1
                             continue
