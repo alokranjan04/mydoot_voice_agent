@@ -18,7 +18,7 @@ from mydoot_functions import FUNCTION_MAP, send_call_summary_email
 # and not forwarded to Gemini. Increase if fan noise still leaks through;
 # decrease if soft speech is being filtered out.
 NOISE_GATE_RMS             = int(os.getenv("NOISE_GATE_RMS", "60"))
-NOISE_GATE_FALLBACK_RMS     = int(os.getenv("NOISE_GATE_FALLBACK_RMS", "20"))
+NOISE_GATE_FALLBACK_RMS     = int(os.getenv("NOISE_GATE_FALLBACK_RMS", "5"))
 NOISE_GATE_FALLBACK_AFTER_S = float(os.getenv("NOISE_GATE_FALLBACK_AFTER_S", "3.0"))
 NOISE_GATE_FALLBACK_ENABLED = os.getenv("NOISE_GATE_FALLBACK", "1").lower() in ("1", "true", "yes")
 # Keep forwarding audio for this many seconds after the last speech packet,
@@ -406,6 +406,14 @@ async def gemini_handler(request):
                             if now - guard_log_ts > 5.0:
                                 guard_log_ts = now
                                 log(f"⚠️  Noise gate fallback active — lowering threshold to {active_noise_gate}")
+                        if (NOISE_GATE_FALLBACK_ENABLED and greeting_done and fwd_count == 0
+                                and now - call_start_ts > 12.0
+                                and noise_blocked_count >= 50):
+                            if active_noise_gate != 0:
+                                active_noise_gate = 0
+                                if now - guard_log_ts > 5.0:
+                                    guard_log_ts = now
+                                    log("⚠️  Soft audio fallback engaged — noise gate fully disabled")
                         is_speech = rms > active_noise_gate
                         speech_tail_ok = speech_since_last < SPEECH_TAIL_SECS
                         if is_speech:
