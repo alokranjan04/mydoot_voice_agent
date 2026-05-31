@@ -49,6 +49,13 @@ async def gemini_handler(request):
                     "model": model,
                     "generationConfig": {
                         "responseModalities": ["AUDIO"],
+                        "speechConfig": {
+                            "voiceConfig": {
+                                "prebuiltVoiceConfig": {
+                                    "voiceName": "Aoede"
+                                }
+                            }
+                        },
                     },
                     "inputAudioTranscription":  {},
                     "outputAudioTranscription": {},
@@ -88,10 +95,12 @@ async def gemini_handler(request):
 
             # ── 4. Receive loop: audio + tool calls from Gemini ─────────────
             downsample_state  = None
-            last_ai_audio_ts  = 0.0   # track when Gemini last sent audio
+            last_ai_audio_ts  = 0.0   # timestamp of last audio packet from Gemini
+            gemini_speaking   = False  # True from first audio chunk until turnComplete
+            gemini_turn_end_ts = 0.0  # timestamp when Gemini's turn completed
 
             async def g_receiver():
-                nonlocal downsample_state, last_ai_audio_ts
+                nonlocal downsample_state, last_ai_audio_ts, gemini_speaking, gemini_turn_end_ts
                 try:
                     async for raw_msg in g_ws:
                         data = json.loads(raw_msg)
@@ -106,20 +115,18 @@ async def gemini_handler(request):
                         if out_t and out_t.get("text"):
                             transcript_log.append(f"Agent: {out_t['text']}")
 
+                        server_content = data.get("serverContent", {})
+
                         # Audio output — convert Gemini's 24kHz PCM → 8kHz mu-law
-                        for part in (
-                            data.get("serverContent", {})
-                                .get("modelTurn", {})
-                                .get("parts", [])
-                        ):
+                        for part in server_content.get("modelTurn", {}).get("parts", []):
                             if part.get("inlineData"):
                                 pcm24 = base64.b64decode(part["inlineData"]["data"])
                                 pcm8, downsample_state = audioop.ratecv(
                                     pcm24, 2, 1, 24000, 8000, downsample_state
                                 )
-                                pcm8 = audioop.mul(pcm8, 2, 1.4)
                                 mulaw = audioop.lin2ulaw(pcm8, 2)
-                                last_ai_audio_ts = time.time()  # mark AI speaking
+                                gemini_speaking  = True
+                                last_ai_audio_ts = time.time()
                                 if not ws.closed:
                                     await ws.send_str(json.dumps({
                                         "event": "playAudio",
@@ -129,6 +136,11 @@ async def gemini_handler(request):
                                             "payload": base64.b64encode(mulaw).decode("utf-8"),
                                         },
                                     }))
+
+                        # Gemini signals it finished speaking this turn
+                        if server_content.get("turnComplete"):
+                            gemini_speaking    = False
+                            gemini_turn_end_ts = time.time()
 
                         # Tool calls
                         tool_call = data.get("toolCall")
@@ -168,15 +180,18 @@ async def gemini_handler(request):
 
             # ── 5. Forward Vobiz audio → Gemini ─────────────────────────────
             # Vobiz sends mu-law 8kHz; Gemini Live expects PCM 16kHz.
-            # ECHO GUARD: don't send user audio while Gemini is speaking —
-            # echoing AI audio back confuses VAD and causes infinite silence.
+            # ECHO GUARD: block customer audio while Gemini is in its turn,
+            # plus 1.5s buffer after turnComplete to avoid echo/repeat loops.
             upsample_state = None
             async for msg in ws:
                 if msg.type == aiohttp.WSMsgType.TEXT:
                     data = json.loads(msg.data)
                     if data.get("event") == "media":
-                        # Skip if Gemini spoke within the last 1.2 seconds
-                        if time.time() - last_ai_audio_ts < 1.2:
+                        # Block while Gemini is actively speaking its turn
+                        if gemini_speaking:
+                            continue
+                        # Buffer 1.5s after turn ends (clears reverb/echo)
+                        if time.time() - gemini_turn_end_ts < 1.5:
                             continue
                         raw_mulaw = base64.b64decode(data["media"]["payload"])
                         pcm8  = audioop.ulaw2lin(raw_mulaw, 2)
