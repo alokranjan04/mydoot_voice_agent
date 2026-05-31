@@ -17,7 +17,7 @@ from mydoot_functions import FUNCTION_MAP, send_call_summary_email
 # Packets below this RMS are treated as background noise (fan, line hiss, etc.)
 # and not forwarded to Gemini. Increase if fan noise still leaks through;
 # decrease if soft speech is being filtered out.
-NOISE_GATE_RMS             = int(os.getenv("NOISE_GATE_RMS", "200"))
+NOISE_GATE_RMS             = int(os.getenv("NOISE_GATE_RMS", "100"))
 NOISE_GATE_FALLBACK_RMS             = int(os.getenv("NOISE_GATE_FALLBACK_RMS", "20"))
 NOISE_GATE_FALLBACK_AFTER_S         = float(os.getenv("NOISE_GATE_FALLBACK_AFTER_S", "2.0"))
 NOISE_GATE_FALLBACK_FULL_DISABLE_S  = float(os.getenv("NOISE_GATE_FALLBACK_FULL_DISABLE_S", "7.0"))
