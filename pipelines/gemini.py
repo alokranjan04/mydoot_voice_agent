@@ -26,7 +26,6 @@ async def gemini_handler(request):
         return (
             f"{APP_CONFIG['agent']['system_prompt']}\n\n"
             f"REAL-TIME: {datetime.now().strftime('%I:%M %p')} on {datetime.now().strftime('%A')}."
-            f"\n\n{state_engine.get_prompt_injection()}"
         )
 
     model = APP_CONFIG.get("parameters", {}).get("google", {}).get(
