@@ -154,14 +154,7 @@ def save_customer_feedback(customer_name, brand, item,
 
         cells = result.get("updates", {}).get("updatedCells", "?")
         print(f"[FEEDBACK]: Saved successfully — {cells} cells updated.")
-        return {
-            "success": True,
-            "message": (
-                f"{customer_name} ji, aapki complaint humne register kar li hai. "
-                "Hamari service team agle 24 ghanton mein aapse sampark karegi. "
-                "Shukriya MyDoot Customer Care ko call karne ke liye!"
-            ),
-        }
+        return {"success": True}
     except Exception as e:
         print(f"[FEEDBACK ERROR]: {e}")
         return {"success": False, "message": f"Feedback save karne mein error aya: {e}"}
