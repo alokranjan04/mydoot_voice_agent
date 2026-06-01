@@ -21,7 +21,9 @@ SARVAM_STT_URL = "https://api.sarvam.ai/speech-to-text"
 # RMS threshold: packets below this are silence / line noise, not forwarded.
 VAD_SPEECH_THRESHOLD  = int(os.getenv("VAD_SPEECH_THRESHOLD",  "100"))
 # Seconds of silence after speech that signals end-of-utterance.
-VAD_END_SECS          = float(os.getenv("VAD_END_SECS",          "0.7"))
+# 0.5s balances responsiveness vs. cutting off slow speakers.
+# Raise to 0.7 via env if callers are frequently getting cut off.
+VAD_END_SECS          = float(os.getenv("VAD_END_SECS",          "0.5"))
 # Minimum utterance duration to bother sending to STT (avoids noise blips).
 VAD_MIN_SPEECH_SECS   = float(os.getenv("VAD_MIN_SPEECH_SECS",  "0.3"))
 # Hard ceiling — force-flush utterance if customer speaks this long non-stop.
@@ -94,9 +96,12 @@ def _clean_transcript(text: str) -> str:
     return cleaned
 
 
-async def _sarvam_stt(pcm8_bytes: bytes) -> str:
+async def _sarvam_stt(pcm8_bytes: bytes,
+                      session: "aiohttp.ClientSession | None" = None) -> str:
     """
     Transcribe 8 kHz 16-bit mono PCM via Sarvam Saaras v3.
+    Pass a persistent `session` (created once per call) to avoid
+    TCP + TLS handshake overhead on every utterance (~200-300ms saved).
     Returns the transcript string, or "" on failure / empty result.
     """
     if not pcm8_bytes or not SARVAM_API_KEY:
@@ -117,8 +122,9 @@ async def _sarvam_stt(pcm8_bytes: bytes) -> str:
         form.add_field("language_code", "hi-IN")
 
         timeout = aiohttp.ClientTimeout(total=10)
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
+
+        async def _post(sess):
+            async with sess.post(
                 SARVAM_STT_URL,
                 data=form,
                 headers={"api-subscription-key": SARVAM_API_KEY},
@@ -130,6 +136,14 @@ async def _sarvam_stt(pcm8_bytes: bytes) -> str:
                 else:
                     txt = await r.text()
                     print(f"[STT] Sarvam Saaras error {r.status}: {txt[:200]}")
+                    return ""
+
+        if session is not None:
+            return await _post(session)
+        else:
+            async with aiohttp.ClientSession() as s:
+                return await _post(s)
+
     except Exception as e:
         print(f"[STT ERROR] {e}")
     return ""
@@ -441,14 +455,21 @@ async def gemini_handler(request):
             vad_last_speech   = 0.0   # time of last above-threshold packet
             in_speech         = False
 
+            # Persistent HTTP session reuses TCP connection across all STT
+            # calls in this call, avoiding TCP+TLS handshake overhead (~200ms)
+            # per utterance.
+            sarvam_session = aiohttp.ClientSession()
+
             async def _stt_and_send(pcm8_bytes: bytes):
                 """Transcribe utterance and send text turn to Gemini Live."""
                 nonlocal last_customer_ts
-                transcript = await _sarvam_stt(pcm8_bytes)
+                t0 = time.time()
+                transcript = await _sarvam_stt(pcm8_bytes, session=sarvam_session)
+                stt_ms = int((time.time() - t0) * 1000)
                 if not transcript:
-                    log("📝 STT: empty — ignoring")
+                    log(f"📝 STT: empty ({stt_ms}ms) — ignoring")
                     return
-                log(f"📝 STT → Gemini: {transcript!r}")
+                log(f"📝 STT ({stt_ms}ms) → {transcript!r}")
                 line = f"[{_ts()}] Customer: {transcript}"
                 transcript_log.append(line)
                 log(f"🗣  {line}")
@@ -463,6 +484,7 @@ async def gemini_handler(request):
                             "turnComplete": True,
                         }
                     }))
+                    log(f"📤 Gemini send OK (+{int((time.time()-t0)*1000)}ms total)")
                 except Exception as send_err:
                     log(f"❌ Gemini WS send failed after STT: {send_err}")
 
@@ -553,6 +575,12 @@ async def gemini_handler(request):
         print(f"[{_ts()}] ❌ Gemini Live Error: {e}", flush=True)
         traceback.print_exc()
     finally:
+        # Close persistent Sarvam HTTP session (if it was created)
+        try:
+            if 'sarvam_session' in dir():
+                await sarvam_session.close()
+        except Exception:
+            pass
         elapsed = time.time() - (call_start_ts if 'call_start_ts' in dir() else time.time())
         log(f"📞 Call ended | duration={elapsed:.1f}s | transcript={len(transcript_log)} lines")
         if RECORD_CALLS and pcm8_frames:
