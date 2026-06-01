@@ -62,8 +62,8 @@ Customer audio is never sent raw to Gemini. Only clean text transcripts are sent
 │                      │    │ → lin2ulaw              │
 │ VAD: RMS threshold   │    │ → mu-law 8kHz           │
 │ accumulate speech    │    │ → Vobiz playAudio        │
-│ end on 0.5s silence  │    │                         │
-│ min 0.3s utterance   │    │ Tracks turnComplete:    │
+│ end on 0.4s silence  │    │                         │
+│ min 0.5s utterance   │    │ Tracks turnComplete:    │
 │                      │    │ flushes transcript buf  │
 │ Sarvam Saaras v3     │    │ sets gemini_turn_end_ts │
 │ REST → transcript    │    │                         │
@@ -110,8 +110,8 @@ Vobiz WebSocket frame
   Linear PCM, 8kHz, mono, 16-bit
         │
         ▼ Local VAD (RMS threshold = 100)
-  Speech frames accumulated; silence > 0.5s triggers flush (VAD_END_SECS, tunable via env var)
-  Utterances < 0.3s discarded (noise blips)
+  Speech frames accumulated; silence > 0.4s triggers flush (VAD_END_SECS, tunable via env var)
+  Utterances < 0.5s discarded (noise blips)
         │
         ▼ Sarvam Saaras v3 REST  (POST /speech-to-text)
   Persistent aiohttp.ClientSession() per call — avoids TCP+TLS handshake per utterance (~200-300ms saved)
@@ -217,10 +217,55 @@ Customer: fridge mein bilkul thanda nahi ho raha
 
 This block tells Gemini exactly which stage it's in, what's collected, and what single question to ask next.
 
+#### Late-Stage Field Advancement (Latency Optimization)
+
+`pipelines/gemini.py` calls `on_field_collected()` for the current late-stage field **before** calling `get_context()`:
+
+```python
+_cur = service_graph.current_stage()
+if _cur == "address":
+    service_graph.on_field_collected("address", transcript)
+elif _cur == "preferred_time":
+    service_graph.on_field_collected("preferred_time", transcript)
+elif _cur == "customer_name":
+    service_graph.on_field_collected("customer_name", transcript)
+stage_ctx = service_graph.get_context()  # now shows the *next* stage
+```
+
+On the customer_name turn, stage advances to `"done"` before `get_context()` runs → Gemini sees `ALL FIELDS COLLECTED` in its context on the same turn and calls `save_service_request` immediately, eliminating a 5–10 s reasoning round-trip.
+
+#### Agent Speech–Based Stage Advancement (Tool Hallucination Fix)
+
+Keyword extraction in `_update_stage_from_customer()` only covers category and Vehicle Service subcategories. For all other categories (Electrical, Plumbing, Carpentry, Cleaning), the ServiceGraph stage stays stuck at `"subcategory"` the entire call — Gemini never receives `[STAGE CONTEXT: stage=done]` and sometimes generates the booking confirmation *without* calling `save_service_request`.
+
+Fix: in `g_receiver()`, on every `turnComplete`, the agent's buffered speech is scanned with `_AGENT_STAGE_TRIGGERS` patterns. When Gemini asks for a specific field, the ServiceGraph stage is advanced to that field — independently of keyword extraction:
+
+```python
+_AGENT_STAGE_TRIGGERS = [
+    ("address",        [r"\baddress\b", r"\bpata\b", r"\bsociety\b", ...]),
+    ("preferred_time", [r"\bkab\b.{0,50}\b(aaye|visit|chahte|time)\b", ...]),
+    ("customer_name",  [r"\bapna\s+naam\b", r"\byour\s+name\b", ...]),
+]
+# On turnComplete — after flushing agent_buf:
+for _tgt, _pats in _AGENT_STAGE_TRIGGERS:
+    if _tgt_idx > _cur_idx and any(re.search(p, agent_turn_text) for p in _pats):
+        service_graph.state = ServiceState(**{**service_graph.state, "stage": _tgt})
+        break
+```
+
+Combined flow (e.g. Electrical / Short Circuit — no keyword subcat patterns):
+1. Agent asks "apna address batayein" → `turnComplete` → stage = `address`
+2. Customer gives address → late-stage advancement → stage = `preferred_time`
+3. Agent asks "kab aaye" → `turnComplete` → stage = `preferred_time` (confirmed)
+4. Customer gives time → late-stage advancement → stage = `customer_name`
+5. Agent asks "apna naam batayein" → `turnComplete` → stage = `customer_name` (confirmed)
+6. Customer gives name → late-stage advancement → stage = `done`
+7. Gemini receives `[STAGE CONTEXT: stage=done, ALL FIELDS]` → calls `save_service_request` reliably
+
 #### State Updates
 
 - `on_tool_call(args)`: called when `save_service_request` fires — merges all args into state, sets `stage = "done"`
-- `on_field_collected(field, value)`: call mid-conversation to advance stage when a field is confirmed
+- `on_field_collected(field, value)`: called mid-conversation to advance stage when a field is confirmed
 
 ---
 
@@ -322,6 +367,12 @@ if res.get("success"):
     asyncio.create_task(_close_after(ws, g_ws, 15.0, log))  # fallback close
 ```
 
+After tool success, Gemini speaks the confirmation (Hinglish):
+
+> *"[name] ji, aapki request register ho gayi hai. Hamari team jald se jald, ek ghante ke andar aapse sampark karegi. My Doot ko call karne ke liye shukriya!"*
+
+Response time is **"within one hour"** — not 24 hours — reflecting the urgency of home service calls (power cuts, short circuits, water leaks cannot wait a day).
+
 ### Google Sheets Write
 
 Columns A–K (11 total):
@@ -341,6 +392,12 @@ service.spreadsheets().values().append(
 )
 ```
 
+#### Sheets Service Caching
+
+`_get_sheets_service()` caches the service object in `_SHEETS_CACHE` with a 3000 s (50-min) TTL. The discovery-doc fetch + TCP/TLS handshake costs ~500 ms; caching ensures only the first save per warm Cloud Run instance pays this cost. On expiry or on a stale-connection error (`reset`, `eof`, `broken pipe`), the cache is invalidated and the service is rebuilt — the append is retried once automatically.
+
+`_SHEETS_CACHE["headers_written"]` flag eliminates the ~300 ms `GET Sheet1!A1:K1` header check on every save after headers are confirmed present.
+
 ---
 
 ## 8. VAD — Voice Activity Detection
@@ -349,19 +406,27 @@ Local VAD runs before Sarvam STT. It eliminates PSTN line noise from ever reachi
 
 ```python
 VAD_SPEECH_THRESHOLD = 100    # RMS amplitude gate
-VAD_END_SECS         = 0.5    # silence after speech to end utterance (tunable via VAD_END_SECS env var)
-VAD_MIN_SPEECH_SECS  = 0.3    # minimum utterance duration (reject noise blips)
+VAD_END_SECS         = 0.4    # silence after speech to end utterance (tunable via VAD_END_SECS env var)
+VAD_MIN_SPEECH_SECS  = 0.5    # minimum utterance duration (reject noise blips)
 VAD_MAX_SPEECH_SECS  = 30.0   # hard ceiling — force-flush long utterances
 ```
 
 State machine per call:
 ```
 in_speech=False + rms >= threshold → in_speech=True, start accumulating
-in_speech=True  + silence > 0.5s  → flush to Sarvam STT (if duration >= 0.3s)
+in_speech=True  + silence > 0.4s  → flush to Sarvam STT (if duration >= 0.5s)
 in_speech=True  + duration >= 30s → force-flush to Sarvam STT
 ```
 
-`VAD_END_SECS` was reduced from 0.7s to 0.5s, saving 200ms per turn. Combined with the persistent `aiohttp.ClientSession()` (saves ~200-300ms TCP+TLS handshake per utterance), total latency savings per turn are ~400-500ms.
+**Latency reductions (cumulative per turn):**
+
+| Optimization | Savings |
+|---|---|
+| `VAD_END_SECS` 0.7 → 0.4 s | ~300 ms |
+| Persistent `aiohttp.ClientSession()` per call (Sarvam STT) | ~200–300 ms |
+| Cached Sheets service (TTL 3000 s) | ~500 ms per save |
+| `headers_written` flag (skip GET on each save) | ~300 ms per save |
+| Late-stage field advancement (skip save round-trip) | ~5–10 s on name turn |
 
 ---
 
@@ -410,7 +475,7 @@ GitHub Secret: GCP_SA_KEY (full service account JSON)
 Service account: `mydoot-voice@testcnx-169610.iam.gserviceaccount.com`
 Required permission: Editor on sheet `1uW39kklQKc4rhf5REATgKqgwbvSNAhlDVKXyAzOMKCk`
 
-The Sheets service is cached after first initialization (`_CACHED_SERVICES`) and reused for all calls on the same instance.
+The Sheets service is cached with a 3000 s TTL in `_SHEETS_CACHE` and reused for all calls on the same instance. On stale-connection errors the cache is invalidated and the service is force-rebuilt.
 
 ---
 

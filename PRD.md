@@ -104,8 +104,8 @@ Fields collected:
 ### FR-6: Post-Save Confirmation
 - Before calling the tool: say exactly "Ek second, register ho raha hai." (Hinglish) or "One moment, registering now." (English)
 - After save succeeds, speak the confirmation message exactly once — first word must be the customer's name:
-  - Hinglish: "[name] ji, aapki request register ho gayi hai. Hamari team 24 ghante ke andar aapse sampark karegi. My Doot ko call karne ke liye shukriya!"
-  - English: "[name], your request has been registered. Our team will get in touch within 24 hours. Thank you for calling My Doot!"
+  - Hinglish: "[name] ji, aapki request register ho gayi hai. Hamari team jald se jald, ek ghante ke andar aapse sampark karegi. My Doot ko call karne ke liye shukriya!"
+  - English: "[name], your request has been registered. Our team will contact you as soon as possible, within an hour. Thank you for calling My Doot!"
 - After confirmation, go completely silent — do not repeat, do not add anything
 
 ### FR-7: Post-Call Transcript Email
@@ -133,7 +133,7 @@ Fields collected:
 | Requirement | Target |
 |-------------|--------|
 | Call answer latency | < 3 seconds from ring to greeting |
-| Agent response latency (TTFT) | < 2 seconds per turn (VAD_END_SECS=0.5 + persistent aiohttp session saves ~400-500ms) |
+| Agent response latency (TTFT) | < 2 seconds per turn (VAD_END_SECS=0.4 + persistent aiohttp session + TTL-cached Sheets service) |
 | Google Sheets write success | > 99% |
 | Concurrent calls supported | 10 |
 | Uptime | 99.5% (Cloud Run managed) |
@@ -170,7 +170,8 @@ Sheet ID: `1uW39kklQKc4rhf5REATgKqgwbvSNAhlDVKXyAzOMKCk`
 - **STT**: Sarvam Saaras v3 REST API (`saaras:v3`, hi-IN, 8kHz WAV) — replaces Gemini native audio input to eliminate PSTN noise hallucinations
 - **Language model**: Google Gemini 2.5 Flash Native Audio (BidiGenerateContent, text-in / audio-out)
 - **Conversation orchestration**: LangGraph `StateGraph` via `core/service_graph.py`; `DIAGNOSTIC_FLOWS` dict with 20 subcategory fault trees; `diagnosis` stage between subcategory and brand
-- **STT latency optimization**: Persistent `aiohttp.ClientSession()` per call (avoids TCP+TLS handshake per utterance, saves ~200-300ms); `VAD_END_SECS` default 0.5s (tunable via env var), down from 0.7s
+- **STT latency optimization**: Persistent `aiohttp.ClientSession()` per call (avoids TCP+TLS handshake per utterance, saves ~200–300ms); `VAD_END_SECS` default 0.4s (tunable via env var), down from 0.7s
+- **Sheets latency optimization**: `_get_sheets_service()` caches the service object with a 3000s TTL (saves ~500ms discovery-doc + TCP handshake per save); `headers_written` flag skips ~300ms header GET on subsequent saves; stale-connection auto-retry on connection errors
 - **Telephony**: Vobiz SIP (+917971542939)
 - **Audio codec**: mu-law 8kHz (Vobiz ↔ server), PCM 24kHz (Gemini → server)
 - **Infrastructure**: Google Cloud Run (us-central1, project testcnx-169610)

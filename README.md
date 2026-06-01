@@ -81,14 +81,18 @@ Customer responds → Sarvam Saaras v3 STT transcribes
   3. diagnosis     — structured fault diagnosis: DIAGNOSTIC_FLOWS injects
                      per-subcategory questions to identify issue_type,
                      severity (High/Medium/Low), and optional error_code
-  4. brand         — only for Appliance Repair and Vehicle Service
+                     *(skipped for Car Wash, Tyre Change, Battery Replacement, all Cleaning)*
+  4. brand         — only for Appliance Repair and Car/Bike Service
+                     *(skipped for Plumbing, Electrical, Carpentry, Cleaning, Car Wash, Tyre Change, Battery)*
   5. address       — society name + area/locality for technician visit
   6. preferred_time — when to send the technician
   7. customer_name — collected LAST
       ↓
 All fields collected → save_service_request() tool call
       ↓
-Agent speaks confirmation ONCE, then goes silent
+Agent: "[name] ji, aapki request register ho gayi hai. Hamari team jald se jald, ek ghante ke andar aapse sampark karegi."
+      ↓
+Agent goes silent
       ↓
 Call auto-closes after confirmation audio completes
       ↓

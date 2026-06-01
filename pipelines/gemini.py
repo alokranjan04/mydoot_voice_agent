@@ -11,7 +11,7 @@ from aiohttp import web
 
 from config.settings import APP_CONFIG, GEMINI_API_KEY, GEMINI_WS_URL, SARVAM_API_KEY
 from core.state_engine import ConversationStateEngine
-from core.service_graph import ServiceGraph
+from core.service_graph import ServiceGraph, ServiceState
 from mydoot_functions import FUNCTION_MAP, send_call_summary_email, upload_recording_to_gcs
 
 # ── Sarvam Saaras v3 STT ─────────────────────────────────────────────────────
@@ -23,7 +23,7 @@ VAD_SPEECH_THRESHOLD  = int(os.getenv("VAD_SPEECH_THRESHOLD",  "100"))
 # Seconds of silence after speech that signals end-of-utterance.
 # 0.5s balances responsiveness vs. cutting off slow speakers.
 # Raise to 0.7 via env if callers are frequently getting cut off.
-VAD_END_SECS          = float(os.getenv("VAD_END_SECS",          "0.5"))
+VAD_END_SECS          = float(os.getenv("VAD_END_SECS",          "0.4"))
 # Minimum utterance duration to bother sending to STT (avoids noise blips).
 VAD_MIN_SPEECH_SECS   = float(os.getenv("VAD_MIN_SPEECH_SECS",  "0.5"))
 # Hard ceiling — force-flush utterance if customer speaks this long non-stop.
@@ -221,6 +221,36 @@ _SUBCAT_PATTERNS: dict[str, list[tuple[str, list[str]]]] = {
     ],
 }
 
+# Stage-order list (mirrors STAGE_ORDER in service_graph.py) used for index
+# comparisons when advancing stage from agent speech.
+_STAGE_ORDER_LIST = [
+    "category", "subcategory", "diagnosis", "brand",
+    "address", "preferred_time", "customer_name", "done",
+]
+
+# Patterns to detect from Gemini's own speech which field it just asked for.
+# When the agent says "apna address batayein", the ServiceGraph stage advances
+# to "address" so the NEXT customer turn's [STAGE CONTEXT] is correct and the
+# late-stage field advancement code fires on the customer's answer.
+_AGENT_STAGE_TRIGGERS: list[tuple[str, list[str]]] = [
+    ("address", [
+        r"\baddress\b", r"\bpata\b", r"\bsociety\b", r"\blocality\b",
+        r"\bkahan\b.{0,30}\bservice\b", r"\bkahan\b.{0,30}\btechnician\b",
+        r"address\s*batayein", r"apna\s+pata", r"ghar\s+ka\s+pata",
+    ]),
+    ("preferred_time", [
+        r"\bkab\b.{0,50}\b(aaye|aana|visit|chahte|bulana|time|samay|bhejein)\b",
+        r"\bpreferred\s+time\b", r"\bkab\b.{0,30}\btechnician\b",
+        r"\bsamay\b.{0,30}batayein", r"\bdate\b.{0,20}\btime\b",
+        r"\bwhen\b.{0,30}\b(visit|come|technician|would you like)\b",
+    ]),
+    ("customer_name", [
+        r"\bapna\s+naam\b", r"\byour\s+name\b",
+        r"\bnaam\b.{0,30}(batayein|chahiye|register|darj|kya\s+hai)",
+        r"\bname\b.{0,20}(please|register|may i have)",
+    ]),
+]
+
 
 def _update_stage_from_customer(transcript: str, sg: ServiceGraph) -> None:
     """
@@ -416,11 +446,35 @@ async def gemini_handler(request):
                             waiting_for_gemini = False  # customer may speak again
                             ai_dur = gemini_turn_end_ts - last_ai_audio_ts if last_ai_audio_ts else 0
                             # Flush agent buffer as one clean line
-                            if agent_buf.strip():
-                                line = f"[{_ts()}] Agent: {agent_buf.strip()}"
+                            _flushed = agent_buf.strip()
+                            if _flushed:
+                                line = f"[{_ts()}] Agent: {_flushed}"
                                 transcript_log.append(line)
                                 log(f"🤖  {line}")
                                 agent_buf = ""
+                                # ── Stage advancement from agent speech ─────────────
+                                # When Gemini asks for address / preferred_time / name,
+                                # advance ServiceGraph so the NEXT customer turn's
+                                # [STAGE CONTEXT] is correct.  Without this, stage stays
+                                # stuck at "subcategory" for categories where keyword
+                                # extraction has no subcat patterns (e.g. Electrical,
+                                # Plumbing), so Gemini never gets stage="done" context
+                                # and sometimes hallucinates the confirmation without
+                                # calling save_service_request.
+                                if save_done_ts == 0:
+                                    _t = _flushed.lower()
+                                    _cur = service_graph.current_stage()
+                                    _cur_idx = (_STAGE_ORDER_LIST.index(_cur)
+                                                if _cur in _STAGE_ORDER_LIST else 0)
+                                    for _tgt, _pats in _AGENT_STAGE_TRIGGERS:
+                                        _tgt_idx = _STAGE_ORDER_LIST.index(_tgt)
+                                        if (_tgt_idx > _cur_idx
+                                                and any(re.search(p, _t) for p in _pats)):
+                                            service_graph.state = ServiceState(
+                                                **{**service_graph.state, "stage": _tgt})
+                                            log(f"📋 Stage ← agent asked for "
+                                                f"{_tgt!r}: {_cur} → {_tgt}")
+                                            break
                             if not greeting_done:
                                 greeting_done = True
                                 log(f"🔔 turnComplete — GREETING DONE, customer audio now live "
@@ -611,6 +665,18 @@ async def gemini_handler(request):
                 # accurate for this turn (e.g. customer said "टू व्हीलर" in
                 # their first message → advance past subcategory stage now).
                 _update_stage_from_customer(transcript, service_graph)
+                # Advance late-stage fields so Gemini sees the *next* stage
+                # in [STAGE CONTEXT] on THIS turn. On the customer_name turn
+                # this produces stage="done" with ALL FIELDS → Gemini calls
+                # save_service_request immediately, no extra round-trip.
+                _cur = service_graph.current_stage()
+                _words = transcript.strip().split()
+                if _cur == "address" and len(_words) >= 2:
+                    service_graph.on_field_collected("address", transcript.strip())
+                elif _cur == "preferred_time" and len(_words) >= 1:
+                    service_graph.on_field_collected("preferred_time", transcript.strip())
+                elif _cur == "customer_name" and len(_words) >= 1:
+                    service_graph.on_field_collected("customer_name", transcript.strip())
                 stage_ctx = service_graph.get_context()
                 full_text = f"{stage_ctx}\n\nCustomer: {transcript}"
                 log(f"📋 Stage: {service_graph.current_stage()}")

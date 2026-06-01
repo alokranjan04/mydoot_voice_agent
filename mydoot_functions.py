@@ -11,6 +11,7 @@ Expected Google Sheet columns (Sheet1):
 """
 import os
 import json
+import time
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -19,6 +20,11 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
 SPREADSHEET_ID = os.getenv("GOOGLE_SPREADSHEET_ID", "")
+
+# Cached Sheets service — rebuilt when TTL expires or on stale-connection error.
+# Avoids ~500ms discovery-doc + TCP handshake cost on every save call.
+_SHEETS_CACHE: dict = {"service": None, "built_at": 0.0, "headers_written": False}
+_SHEETS_TTL_SECS = 3000  # 50 minutes
 
 
 def _validate_google_creds(data):
@@ -134,11 +140,23 @@ def get_gmail_health():
     }
 
 
-def _get_sheets_service():
-    """Build a fresh Google Sheets service on every call.
-    Not caching the service object prevents stale TCP connections on Cloud Run
-    (long-lived cached services hit 'Connection reset by peer' after idle periods).
+def _get_sheets_service(force_rebuild: bool = False):
+    """Return a Google Sheets service, reusing cached instance if still fresh.
+
+    Rebuilds when:
+    - No cached service yet
+    - TTL expired (3000 s / 50 min)
+    - force_rebuild=True (caller detected a stale-connection error)
+
+    Caching avoids the ~500 ms discovery-doc + TCP/TLS handshake cost on every
+    save.  Cloud Run instances are kept warm between calls so this is safe.
     """
+    now = time.time()
+    if (not force_rebuild
+            and _SHEETS_CACHE["service"]
+            and (now - _SHEETS_CACHE["built_at"]) < _SHEETS_TTL_SECS):
+        return _SHEETS_CACHE["service"], SPREADSHEET_ID
+
     creds_data = get_google_creds()
     if not creds_data:
         print("[FEEDBACK ERROR]: Unable to initialize Google Sheets service — credentials missing or invalid.")
@@ -148,6 +166,10 @@ def _get_sheets_service():
         creds_data, scopes=["https://www.googleapis.com/auth/spreadsheets"]
     )
     service = build("sheets", "v4", credentials=creds)
+    _SHEETS_CACHE["service"] = service
+    _SHEETS_CACHE["built_at"] = now
+    label = "force-rebuilt" if force_rebuild else "built"
+    print(f"[SHEETS] Service {label} (TTL={_SHEETS_TTL_SECS}s).")
     return service, SPREADSHEET_ID
 
 
@@ -366,61 +388,76 @@ def save_service_request(customer_name, category, subcategory, issue_type,
     print(f"[SERVICE REQUEST]: Saving — Customer={customer_name}, "
           f"Category={category}, Sub={subcategory}, Issue={issue_type}")
     print(f"[SERVICE REQUEST]: SpreadsheetID={SPREADSHEET_ID!r}")
-    try:
-        service, spreadsheet_id = _get_sheets_service()
-        if not service:
-            print("[SERVICE REQUEST ERROR]: No Sheets service — check GOOGLE_CREDENTIALS")
-            return {"success": False, "message": "Google Sheets credentials not found."}
 
-        # Write header row if sheet is empty
-        try:
-            result = service.spreadsheets().values().get(
-                spreadsheetId=spreadsheet_id, range="Sheet1!A1:K1"
-            ).execute()
-            if not result.get("values"):
-                headers = [[
-                    "Customer Name", "Category", "Subcategory", "Issue Type",
-                    "Brand", "Model", "Severity", "Address", "Preferred Time",
-                    "Timestamp", "Caller ID",
-                ]]
-                service.spreadsheets().values().update(
-                    spreadsheetId=spreadsheet_id,
-                    range="Sheet1!A1:K1",
-                    valueInputOption="RAW",
-                    body={"values": headers},
-                ).execute()
-                print("[SHEETS]: Header row written.")
-        except Exception as e:
-            print(f"[SHEETS HEADER WARNING]: {e}")
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    values = [[
+        customer_name, category, subcategory, issue_type,
+        brand or "", model or "", severity or "",
+        address, preferred_time, timestamp, caller_id,
+    ]]
 
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        values = [[
-            customer_name,
-            category,
-            subcategory,
-            issue_type,
-            brand or "",
-            model or "",
-            severity or "",
-            address,
-            preferred_time,
-            timestamp,
-            caller_id,
-        ]]
-
-        result = service.spreadsheets().values().append(
-            spreadsheetId=spreadsheet_id,
+    def _append(svc, sid):
+        return svc.spreadsheets().values().append(
+            spreadsheetId=sid,
             range="Sheet1!A2",
             valueInputOption="RAW",
             insertDataOption="INSERT_ROWS",
             body={"values": values},
         ).execute()
 
+    try:
+        service, spreadsheet_id = _get_sheets_service()
+        if not service:
+            print("[SERVICE REQUEST ERROR]: No Sheets service — check GOOGLE_CREDENTIALS")
+            return {"success": False, "message": "Google Sheets credentials not found."}
+
+        # Write header row only if not yet confirmed.
+        # Cached flag avoids an extra ~300 ms GET on every save.
+        if not _SHEETS_CACHE["headers_written"]:
+            try:
+                hdr = service.spreadsheets().values().get(
+                    spreadsheetId=spreadsheet_id, range="Sheet1!A1:K1"
+                ).execute()
+                if not hdr.get("values"):
+                    headers = [[
+                        "Customer Name", "Category", "Subcategory", "Issue Type",
+                        "Brand", "Model", "Severity", "Address", "Preferred Time",
+                        "Timestamp", "Caller ID",
+                    ]]
+                    service.spreadsheets().values().update(
+                        spreadsheetId=spreadsheet_id,
+                        range="Sheet1!A1:K1",
+                        valueInputOption="RAW",
+                        body={"values": headers},
+                    ).execute()
+                    print("[SHEETS]: Header row written.")
+                _SHEETS_CACHE["headers_written"] = True
+            except Exception as e:
+                print(f"[SHEETS HEADER WARNING]: {e}")
+
+        result = _append(service, spreadsheet_id)
         cells = result.get("updates", {}).get("updatedCells", "?")
         print(f"[SERVICE REQUEST]: Saved — {cells} cells updated.")
         return {"success": True}
+
     except Exception as e:
         import traceback as _tb
+        _err_s = str(e).lower()
+        _is_stale = any(s in _err_s for s in
+                        ("connection", "reset", "eof", "broken pipe", "transport", "peer"))
+        if _is_stale:
+            print(f"[SERVICE REQUEST]: Stale connection — rebuilding Sheets service and retrying: {e}")
+            _SHEETS_CACHE["service"] = None
+            _SHEETS_CACHE["built_at"] = 0.0
+            try:
+                svc2, sid2 = _get_sheets_service()
+                if svc2:
+                    result2 = _append(svc2, sid2)
+                    cells2 = result2.get("updates", {}).get("updatedCells", "?")
+                    print(f"[SERVICE REQUEST]: Saved (retry) — {cells2} cells updated.")
+                    return {"success": True}
+            except Exception as retry_e:
+                print(f"[SERVICE REQUEST ERROR] (retry): {retry_e}")
         print(f"[SERVICE REQUEST ERROR]: {e}")
         _tb.print_exc()
         return {"success": False, "message": str(e)}

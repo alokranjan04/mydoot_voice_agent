@@ -1,6 +1,8 @@
 # Code Walkthrough: Mydoot Customer Care Voice Agent
 
-This document explains the technical flow of the system, from the moment a customer calls +917971542939 to the moment their complaint is saved in Google Sheets.
+This document explains the technical flow of the system, from the moment a customer calls +917971542939 to the moment their service request is saved in Google Sheets.
+
+> **Active pipeline:** Gemini Live hybrid — Sarvam Saaras v3 STT + Google Gemini 2.5 Flash Native Audio (text-in / audio-out)
 
 ---
 
@@ -9,12 +11,12 @@ This document explains the technical flow of the system, from the moment a custo
 Everything starts here. `app.py` starts an `aiohttp` async web server on port `5050` and registers all routes.
 
 **What it does at startup:**
-- Reads `GOOGLE_CREDENTIALS` from the environment and writes it to `google-credentials.json` on disk. This enables cloud deployments where secrets live in env vars, not files.
+- Reads `GOOGLE_CREDENTIALS` from the environment and writes it to `google-credentials.json` on disk (cloud deployments pass secrets as env vars, not files).
 - Registers the `/answer` webhook that Vobiz calls when a customer dials +917971542939.
-- Registers `/sarvam-stream` and `/gemini-stream` WebSocket endpoints — one per pipeline.
+- Registers the `/gemini-stream` WebSocket endpoint for the active hybrid pipeline.
 - Serves the dashboard at `/` and the Voice Lab at `/voice-lab`.
 
-**To change the active pipeline**, update `active_provider` in `app_config.json` to `"sarvam"` or `"google"`, or use the toggle on the dashboard.
+**To switch the active pipeline**, change `active_provider` in `app_config.json` to `"sarvam"` or `"google"`.
 
 ---
 
@@ -24,165 +26,265 @@ When Vobiz receives a call on +917971542939, it makes a `POST /answer` request t
 
 The webhook:
 1. Reads the `From` header to extract the caller's phone number (used as `caller_id`).
-2. Checks `active_provider` to decide whether to direct the call to `/sarvam-stream` or `/gemini-stream`.
-3. Returns an XML `<Stream>` response that tells Vobiz to open a **bidirectional WebSocket** — audio flows both ways on this single connection.
+2. Checks `active_provider` in `app_config.json` to choose the pipeline.
+3. Returns an XML `<Stream>` response that tells Vobiz to open a **bidirectional WebSocket** — audio flows both ways on this single connection to `/gemini-stream`.
 
 From this point, the call is a live WebSocket session.
 
 ---
 
-## 3. The Customer Care Logic (`core/state_engine.py`)
+## 3. Conversation Orchestration (`core/service_graph.py`)
 
-The state engine is injected into the LLM system prompt on every single turn. Its job is to tell the LLM exactly where it is in the 5-step collection flow and what it still needs.
+`ServiceGraph` wraps a LangGraph `StateGraph` and holds per-call `ServiceState`. It controls what the agent asks at every stage and injects a `[STAGE CONTEXT]` block into every Gemini turn.
 
-**How it works:**
+### Stage Order
 
-```python
-# Every LLM turn gets this appended to its system prompt:
-CURRENT STATE: COLLECTING_WARRANTY
-COLLECTED: customer_name, product_name, usage_duration
-STILL NEED: warranty_status, complaint
+```
+category → subcategory → diagnosis → brand* → address → preferred_time → customer_name → done
+* brand stage is skipped for Plumbing, Electrical, Carpentry, Cleaning, and simple Vehicle services
 ```
 
-This prevents the model from:
-- Calling `save_customer_feedback` before all fields are collected.
-- Asking for the same information twice.
-- Jumping ahead to the complaint before asking for the warranty.
+### What Each Stage Does
 
-When the LLM calls the `save_customer_feedback` tool, the pipeline records each argument into the state engine via `set_data()`, which advances the state to `COMPLETED`.
+| Stage | What Gemini is told to ask / do |
+|-------|----------------------------------|
+| `category` | Detect service type from customer description (Appliance Repair, Plumbing, Electrical, Carpentry, Cleaning, Vehicle Service, Other) |
+| `subcategory` | Identify specific type within category (e.g. Refrigerator, Pipe Leak, Wiring) |
+| `diagnosis` | Ask 2–3 targeted fault questions from `DIAGNOSTIC_FLOWS`; identify `issue_type` and `severity` |
+| `brand` | Ask brand name — only for Appliance Repair and Vehicle Service (Car/Bike repair) |
+| `address` | Collect society name + area/locality for the technician |
+| `preferred_time` | When does the customer want the technician to visit |
+| `customer_name` | Collect name — always last |
+| `done` | All fields collected: say wait message, call `save_service_request` tool |
 
----
+### Simple Services Fast Path
 
-## 4. The Voice Pipeline (`pipelines/sarvam.py`)
+Certain subcategories have self-evident issue types requiring no diagnosis and no brand:
 
-This is the Listen → Think → Speak loop that runs for the entire duration of the call.
+```python
+AUTO_ISSUE_TYPES = {
+    "Car Wash / Detailing": ("Car Wash / Detailing", "Low"),
+    "Tyre Change":          ("Tyre Change",          "Medium"),
+    "Battery Replacement":  ("Battery Replacement",  "High"),
+    "Home / Deep Cleaning": ("Full Home Cleaning",   "Low"),
+    # ... all Cleaning subcategories
+}
+```
 
-### Listen (STT)
-Raw Mu-law audio from Vobiz is forwarded to **Deepgram Nova-2** over a WebSocket. Deepgram returns:
-- Interim transcripts (partial — used for barge-in detection).
-- Final transcripts (confirmed — triggers the LLM).
-- `UtteranceEnd` events (customer has stopped speaking — triggers LLM if final wasn't fired).
+When one of these subcategories is detected, `advance_stage()` skips diagnosis and brand entirely — stage jumps directly to `address`.
 
-**Barge-in**: If the customer starts speaking while the agent is playing audio (2+ words detected), the current `speak` task is cancelled and the audio buffer on Vobiz is cleared. The agent listens immediately.
+### [STAGE CONTEXT] Block
 
-### Think (LLM)
-The final transcript is appended to the conversation history and sent to **Sarvam 30B** as a streaming HTTP request. The system prompt includes:
-- The full Mydoot Customer Care persona and 5-step collection rules (from `app_config.json`).
-- The current state injection from `state_engine.get_prompt_injection()`.
+On every customer utterance, `service_graph.get_context()` prepends:
 
-The LLM streams back either:
-- **Text** — the agent's spoken response.
-- **Tool call** — `save_customer_feedback` with all 5 collected fields.
+```
+[STAGE CONTEXT — follow these instructions for this turn]
+Stage       : diagnosis
+Collected   : {"category": "Appliance Repair", "subcategory": "Refrigerator"}
+Instruction : Subcategory: 'Refrigerator'. Now run DIAGNOSTIC to identify the issue type.
+              Possible issue types: Cooling Failure / Water Leakage / Compressor Noise / ...
+              Ask these diagnostic questions (one at a time, skip if already answered):
+              Are both fridge and freezer warm, or only one? | Do you hear compressor running?
+              Routing hints: Cooling Failure: not cooling at all... Water Leakage: dripping inside...
+              Once issue type is clear, record issue_type (and severity if obvious) then proceed.
+[END STAGE CONTEXT]
 
-### Speak (TTS)
-Text is split into sentence chunks using a regex boundary. Each sentence is immediately sent to TTS as it arrives — the first sentence starts playing while the rest of the response is still being generated. This cuts perceived latency significantly.
+Customer: fridge mein bilkul thanda nahi ho raha
+```
 
-TTS is attempted in order:
-1. **ElevenLabs** (if `ELEVEN_LABS_API_KEY` is set) — most natural Hindi voice.
-2. **Sarvam Bulbul v2** (fallback) — fast, native Hindi.
+This block tells Gemini exactly which stage it's in, what's collected, and what single question to ask next. Gemini handles all language generation, Hinglish/English switching, and voice output.
 
-The resulting 16kHz PCM is encoded as Mu-law and sent back to Vobiz.
+### Late-Stage Field Advancement (Latency Optimization)
 
-### Tool Execution
-When the LLM emits a `save_customer_feedback` tool call:
-1. The pipeline extracts the 5 arguments and the `caller_id`.
-2. Calls `save_customer_feedback()` in a thread pool (non-blocking).
-3. Returns the tool result to the LLM for the follow-up response (the thank-you confirmation message).
+After each STT transcript, `pipelines/gemini.py` calls `on_field_collected()` for the current late-stage field (address / preferred_time / customer_name) **before** calling `get_context()`. This means:
 
----
+- When the customer gives their name, Gemini sees `stage=done` with ALL FIELDS in its `[STAGE CONTEXT]` on the **same turn** → calls `save_service_request` immediately without needing an extra reasoning round-trip.
+- Without this, stage would stay at `address` for all remaining turns and Gemini would spend 5–10s reasoning "are all fields collected?" before calling the tool.
 
-## 5. The Feedback Save (`mydoot_functions.py`)
+### Agent Speech–Based Stage Advancement (Tool Hallucination Fix)
 
-This module contains all Google Sheets logic.
+`_SUBCAT_PATTERNS` only covers Vehicle Service subcategories. For Electrical, Plumbing, Carpentry, and Cleaning calls, the ServiceGraph stage stays stuck at `"subcategory"` the entire call. Gemini then never receives `[STAGE CONTEXT: stage=done]`, and occasionally generates the booking confirmation *without* calling the `save_service_request` tool (hallucination — the row never reaches Google Sheets).
 
-**`save_customer_feedback(customer_name, product_name, usage_duration, warranty_status, complaint, caller_id)`:**
+Fix: in `g_receiver()`, on every `turnComplete`, the agent's speech for that turn is scanned with `_AGENT_STAGE_TRIGGERS` patterns. When Gemini's words indicate it just asked for a specific field, the ServiceGraph stage is advanced immediately:
 
-1. Loads Google credentials from `google-credentials.json` or `GOOGLE_CREDENTIALS` env var.
-2. Normalizes the RSA private key (fixes newline encoding issues common in env var deployments).
-3. Builds a Google Sheets API client (cached per process).
-4. Checks if the sheet has a header row — if not, writes the 7-column header first.
-5. Appends a new row with all fields plus a timestamp.
-6. Returns a confirmation message that the LLM reads back to the customer.
-
-**Expected Sheet1 columns:** Customer Name | Product Used | Usage Duration | Warranty Status | Complaint | Timestamp | Caller ID
-
----
-
-## 6. The Voice Lab (`routes/voice_lab.py`)
-
-The Voice Lab at `http://localhost:5050/voice-lab` is a browser-based call simulator.
-
-It uses your microphone and speakers to simulate exactly what a Vobiz call looks like:
-- Captures browser audio and converts it to **Mu-law 8kHz** — matching the phone line format.
-- Connects directly to `/sarvam-stream` or `/gemini-stream` over WebSocket.
-- Displays the live transcript and current collection state in real time.
-- Allows provider switching without making a real phone call.
-
-This is the primary tool for testing and tuning the agent's Hinglish conversation flow before going live.
-
----
-
-## 7. Metrics & Monitoring (`metrics/`)
-
-Every call is automatically tracked:
-
-| Metric | What It Measures |
+| Agent says | Stage set to |
 |---|---|
-| **TTFT** | Time from customer's last word to agent's first spoken word |
-| **TTS Characters** | Volume of text sent to TTS (drives cost estimate) |
-| **Cost** | Estimated API cost per call (Deepgram + Sarvam + ElevenLabs) |
-| **Call Recording** | Stereo WAV saved to `recordings/` — caller on left, agent on right |
+| "apna address batayein" / "pata" / "society" / "locality" | `address` |
+| "kab aaye" / "kab visit" / "samay batayein" / "preferred time" | `preferred_time` |
+| "apna naam batayein" / "your name" | `customer_name` |
 
-View the metrics dashboard at `http://localhost:5050/metrics`.
-
----
-
-## 8. How to Modify the Agent
-
-No code changes needed for most customizations — edit `app_config.json`:
-
-| What to Change | Where in app_config.json |
-|---|---|
-| The greeting message | `scripts.greeting` |
-| The system prompt / collection rules | `agent.system_prompt` |
-| Switch pipeline (Sarvam ↔ Gemini) | `active_provider` |
-| LLM temperature | `parameters.sarvam.temperature` |
-| Add a new tool | `tools.sarvam` array + `FUNCTION_MAP` in `mydoot_functions.py` |
+This feeds correctly into the late-stage field advancement above: address question → stage=`address` → customer answers → stage=`preferred_time` → ... → customer gives name → stage=`done` → Gemini receives the explicit "call tool now" instruction reliably.
 
 ---
 
-## 9. Call Flow: End to End
+## 4. The Hybrid Voice Pipeline (`pipelines/gemini.py`)
+
+This is the Listen → Think → Speak loop for the entire call duration.
+
+### Listen: VAD + Sarvam Saaras v3 STT
+
+```
+Vobiz WebSocket (mu-law 8kHz)
+        │
+        ▼ audioop.ulaw2lin → PCM 8kHz, 16-bit
+        │
+        ▼ Local VAD (RMS threshold = 100)
+          in_speech=False + rms >= 100 → start accumulating
+          in_speech=True  + silence > 0.4s → flush to Sarvam STT
+          utterance < 0.5s → discard (reject noise blips)
+        │
+        ▼ Sarvam Saaras v3 REST API (POST, hi-IN, 8kHz WAV)
+          Persistent aiohttp.ClientSession() per call — reuses TCP connection
+        │
+        ▼ Text transcript → _stt_and_send()
+```
+
+Customer audio is **never** sent raw to Gemini. Only clean text transcripts go to the LLM, eliminating hallucinations caused by PSTN line noise.
+
+**`waiting_for_gemini` flag:** Set `True` after each `clientContent` send. Dropped utterances while the flag is set prevent the 1008 "policy violation" WebSocket error caused by sending two turns before Gemini responds.
+
+### Think + Speak: Gemini Live
+
+```
+_stt_and_send():
+  1. ServiceGraph keyword extraction → advance category/subcategory
+  2. Late-stage field advancement → advance address/preferred_time/customer_name
+  3. service_graph.get_context() → [STAGE CONTEXT] block
+  4. Gemini clientContent turn:
+     { "clientContent": { "turns": [{ "role": "user", "parts": [{ "text": "[STAGE CONTEXT]\n\nCustomer: ..." }] }], "turnComplete": true } }
+  5. waiting_for_gemini = True
+
+g_receiver() — runs in parallel:
+  Gemini serverContent.modelTurn.parts[].inlineData
+  └── PCM 24kHz base64
+        ▼ audioop.ratecv(24000 → 8000)
+        ▼ audioop.lin2ulaw
+        ▼ Vobiz playAudio (mu-law 8kHz)
+
+  On turnComplete:
+  └── flush agent transcript buffer
+  └── waiting_for_gemini = False (next customer utterance can proceed)
+```
+
+Gemini handles all LLM reasoning, language generation, Hinglish/English detection, and TTS (Aoede voice — warm, clear female).
+
+### Tool Call: save_service_request
+
+When Gemini has all required fields and stage context shows `done`, it fires the tool:
+
+```python
+# Tool handler in gemini.py
+if fn == "save_service_request":
+    service_graph.on_tool_call(args)          # merge all args into ServiceState
+    args.setdefault("caller_id", caller_id)   # pipeline injects caller phone number
+
+res = await asyncio.to_thread(FUNCTION_MAP[fn], **args)   # non-blocking Sheets write
+
+if res.get("success"):
+    save_executed = True                   # one-save-per-session guard
+    save_done_ts  = time.time()            # activates post-save audio block
+    asyncio.create_task(_close_after(ws, g_ws, 15.0))  # fallback close timer
+```
+
+### Audio Blocking Guards
+
+Four layers prevent audio from disrupting the conversation:
+
+| Guard | Trigger | Effect |
+|-------|---------|--------|
+| **Greeting guard** | startup | Block all customer audio until first `turnComplete` fires (greeting done) |
+| **Echo guard** | per turn | 0.3s silence buffer after `turnComplete` — prevents agent audio echoing back |
+| **Concurrent-send guard** | `waiting_for_gemini=True` | Drop new VAD utterances while Gemini is processing — prevents 1008 errors |
+| **Post-save guard** | `save_done_ts > 0` | Block ALL customer audio after save — call is ending |
+
+---
+
+## 5. The Service Request Save (`mydoot_functions.py`)
+
+### `save_service_request()`
+
+Called from the Gemini pipeline tool handler. Writes one row to Google Sheets:
+
+```
+Sheet1 columns (A–K):
+Customer Name | Category | Subcategory | Issue Type | Brand | Model | Severity | Address | Preferred Time | Timestamp | Caller ID
+```
+
+**Caching:** `_get_sheets_service()` caches the service object with a 3000s (50-min) TTL. The discovery-doc fetch + TCP handshake costs ~500ms; caching ensures only the first call per warm instance pays this cost.
+
+**Header check:** `_SHEETS_CACHE["headers_written"]` flag — once headers are confirmed written, the ~300ms `GET Sheet1!A1:K1` check is skipped on subsequent saves.
+
+**Stale-connection retry:** On any connection error (`reset`, `eof`, `broken pipe`), the cache is invalidated and the append is retried once with a fresh service.
+
+### `send_call_summary_email()`
+
+Called in the `finally` block of `gemini_handler` — runs **after every call** whether it completed, dropped, or errored. Sends the full `Agent: ...` / `Customer: ...` transcript to `GMAIL_USER` via Gmail SMTP SSL (port 465).
+
+---
+
+## 6. Call Flow: End to End
 
 ```
 Customer dials +917971542939
         │
-        ▼
-Vobiz POST /answer
+        ▼ Vobiz POST /answer
+routes/webhook.py → returns XML <Stream wss://.../gemini-stream>
         │
-        ▼ XML <Stream> response
-Vobiz opens WebSocket to /sarvam-stream
+        ▼ Vobiz opens bidirectional WebSocket
+pipelines/gemini.py → gemini_handler()
+  - Opens Gemini Live WebSocket (BidiGenerateContent)
+  - Sends setup: model, systemInstruction, save_service_request tool schema
+  - Instantiates ServiceGraph()
         │
-        ▼ "start" event
-Agent speaks greeting: "Namaste! Aap Mydoot Customer Care mein bol rahe hain..."
+        ▼ Gemini speaks Hinglish greeting (one of 3 scripts, random)
+Agent: "Namaskar! Main माई डूट Customer Care se bol rahi hoon..."
         │
         ▼ customer speaks
-Deepgram → transcript → Sarvam LLM → "Aapka naam kya hai?"
+VAD accumulates → Sarvam STT → "mere fridge mein paani aa raha hai"
         │
-        ▼ customer answers name
-State: COLLECTING_NAME → COLLECTING_PRODUCT
-LLM asks: "Aap kaun sa Mydoot product use karte hain?"
+        ▼ keyword extraction
+ServiceGraph: category=Appliance Repair, subcategory=Refrigerator
+[STAGE CONTEXT: stage=diagnosis, Collected: {category, subcategory}]
+Gemini asks ONE diagnosis question: "Kya cooling bhi band ho gayi hai?"
         │
-        ... (5 steps total) ...
+        ▼ customer answers diagnosis questions
+[STAGE CONTEXT: stage=brand] → Gemini: "Aapka fridge kaunsi company ka hai?"
         │
-        ▼ all 5 fields confirmed
-LLM calls: save_customer_feedback(name, product, duration, warranty, complaint)
+        ▼ customer says "Samsung"
+[STAGE CONTEXT: stage=address] → Gemini: "Aapka address kya hai?"
         │
-        ▼
-Google Sheets: new row appended
+        ▼ customer gives address — pipeline advances stage to preferred_time
+[STAGE CONTEXT: stage=preferred_time] → Gemini: "Aap technician ko kab bulana chahte hain?"
         │
-        ▼
-Agent: "Aapka feedback save ho gaya hai. Shukriya Mydoot se contact karne ke liye!"
+        ▼ customer gives preferred time — pipeline advances stage to customer_name
+[STAGE CONTEXT: stage=customer_name] → Gemini: "Aapka naam kya hai?"
         │
-        ▼
-Call ends
+        ▼ customer says name — pipeline advances stage to done
+[STAGE CONTEXT: stage=done, Collected: {ALL FIELDS}]
+Gemini: "Ek second, register ho raha hai." → calls save_service_request()
+        │
+        ▼ Google Sheets: new row appended (11 columns)
+Gemini: "[name] ji, aapki request register ho gayi hai. Hamari team jald se jald, ek ghante ke andar aapse sampark karegi. My Doot ko call karne ke liye shukriya!"
+        │
+        ▼ Call auto-closes after confirmation audio completes
+        │
+        ▼ finally block → send_call_summary_email() → Gmail SMTP
+Transcript emailed to admin
 ```
+
+---
+
+## 7. How to Modify the Agent
+
+No code changes needed for most customizations — edit `app_config.json`:
+
+| What to Change | Where in `app_config.json` |
+|---|---|
+| Greeting messages (3 scripts) | `scripts.greetings` array |
+| System prompt (language rules, stage instructions, persona) | `agent.system_prompt` |
+| Switch pipeline (Sarvam ↔ Gemini) | `active_provider` |
+| Gemini model / temperature | `parameters.google.model` / `temperature` |
+| Tool schema for save_service_request | `tools.gemini[0].function_declarations[0]` |
+
+To add a new service category or subcategory, update `CATEGORIES` in `core/service_graph.py`.
+To add a new diagnostic flow, add an entry to `DIAGNOSTIC_FLOWS` in the same file.
