@@ -196,6 +196,13 @@ _SUBCAT_PATTERNS: dict[str, list[tuple[str, list[str]]]] = {
             r"\bscooter\b", r"स्कूटर",
             r"\bmotorcycle\b",
         ]),
+        # Car Wash BEFORE Car Service — longer/more-specific match wins first
+        ("Car Wash / Detailing", [
+            r"car.?wash", r"कार.?वॉश", r"wash.?car",
+            r"gaadi.?saaf", r"गाड़ी.?साफ",
+            r"car.?saaf", r"car.?clean",
+            r"vehicle.?clean", r"vehicle.?wash",
+        ]),
         ("Car Service / Repair", [r"\bcar\b", r"कार\b"]),
     ],
     "Appliance Repair": [

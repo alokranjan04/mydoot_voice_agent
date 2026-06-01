@@ -578,6 +578,29 @@ DEFAULT_DIAGNOSTIC = {
 }
 
 
+# ── Simple services: skip diagnosis and brand stages ─────────────────────────
+# These subcategories have a self-evident issue type. No diagnostic questions
+# and no brand are needed — stage jumps directly from subcategory to address.
+#
+# key   = subcategory name (must match CATEGORIES subcategories list exactly)
+# value = (issue_type, severity) to auto-fill when subcategory is detected
+
+AUTO_ISSUE_TYPES: dict[str, tuple[str, str]] = {
+    "Car Wash / Detailing":    ("Car Wash / Detailing",        "Low"),
+    "Tyre Change":             ("Tyre Change",                 "Medium"),
+    "Battery Replacement":     ("Battery Replacement",         "High"),
+    "Home / Deep Cleaning":    ("Full Home Cleaning",          "Low"),
+    "Sofa / Carpet Cleaning":  ("Sofa / Carpet Cleaning",      "Low"),
+    "AC Deep Clean":           ("AC Deep Clean",               "Low"),
+    "Kitchen / Chimney Clean": ("Kitchen / Chimney Cleaning",  "Low"),
+    "Pest Control":            ("General Pest Control",        "Low"),
+    "Other Cleaning":          ("Cleaning Service",            "Low"),
+}
+
+# Subcategory names that skip both diagnosis and brand stages.
+SIMPLE_SERVICES: frozenset[str] = frozenset(AUTO_ISSUE_TYPES)
+
+
 # ── State definition ──────────────────────────────────────────────────────────
 
 class ServiceState(TypedDict):
@@ -644,10 +667,21 @@ def advance_stage(state: ServiceState) -> ServiceState:
             new["stage"] = "diagnosis"
 
     elif current == "subcategory":
-        new["stage"] = "diagnosis"
+        subcat = state.get("subcategory", "")
+        if subcat in SIMPLE_SERVICES:
+            # Auto-fill issue_type + severity; skip diagnosis and brand entirely
+            it, sv = AUTO_ISSUE_TYPES[subcat]
+            if not new.get("issue_type"):
+                new["issue_type"] = it
+            if not new.get("severity"):
+                new["severity"] = sv
+            new["stage"] = "address"
+        else:
+            new["stage"] = "diagnosis"
 
     elif current == "diagnosis":
-        if needs_brand:
+        subcat = state.get("subcategory", "")
+        if needs_brand and subcat not in SIMPLE_SERVICES:
             new["stage"] = "brand"
         else:
             new["stage"] = "address"
