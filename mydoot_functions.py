@@ -20,8 +20,6 @@ from googleapiclient.discovery import build
 
 SPREADSHEET_ID = os.getenv("GOOGLE_SPREADSHEET_ID", "")
 
-_CACHED_SERVICES = {}
-
 
 def _validate_google_creds(data):
     if not isinstance(data, dict):
@@ -137,19 +135,19 @@ def get_gmail_health():
 
 
 def _get_sheets_service():
-    if "sheets" in _CACHED_SERVICES:
-        return _CACHED_SERVICES["sheets"], SPREADSHEET_ID
-
+    """Build a fresh Google Sheets service on every call.
+    Not caching the service object prevents stale TCP connections on Cloud Run
+    (long-lived cached services hit 'Connection reset by peer' after idle periods).
+    """
     creds_data = get_google_creds()
     if not creds_data:
-        print("[FEEDBACK ERROR]: Unable to initialize Google Sheets service because credentials are missing or invalid.")
+        print("[FEEDBACK ERROR]: Unable to initialize Google Sheets service — credentials missing or invalid.")
         return None, None
 
     creds = service_account.Credentials.from_service_account_info(
         creds_data, scopes=["https://www.googleapis.com/auth/spreadsheets"]
     )
     service = build("sheets", "v4", credentials=creds)
-    _CACHED_SERVICES["sheets"] = service
     return service, SPREADSHEET_ID
 
 
@@ -422,7 +420,9 @@ def save_service_request(customer_name, category, subcategory, issue_type,
         print(f"[SERVICE REQUEST]: Saved — {cells} cells updated.")
         return {"success": True}
     except Exception as e:
+        import traceback as _tb
         print(f"[SERVICE REQUEST ERROR]: {e}")
+        _tb.print_exc()
         return {"success": False, "message": str(e)}
 
 

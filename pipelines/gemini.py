@@ -501,12 +501,32 @@ async def gemini_handler(request):
                                         # Fallback close: if confirmation turnComplete never fires
                                         # (e.g. Gemini silent after save), close after 15s.
                                         asyncio.create_task(_close_after(ws, g_ws, 15.0, log))
+                                        tool_result = res
+                                    elif is_save_fn and not res.get("success"):
+                                        # Save failed — send explicit error so Gemini knows
+                                        # not to say "request registered" and instead apologises.
+                                        err = res.get("message", "Unknown error")
+                                        log(f"❌ {fn} FAILED — sheet not written: {err}")
+                                        tool_result = {
+                                            "success": False,
+                                            "status": "SAVE_FAILED",
+                                            "instruction": (
+                                                "SAVE FAILED. Do NOT say the request was registered. "
+                                                "Apologise to the customer: "
+                                                "Hinglish: 'Maafi chahti hoon, abhi ek technical problem aa rahi hai. "
+                                                "Kripya thodi der mein dobara call karein.' "
+                                                "English: 'I apologise, there was a technical issue. "
+                                                "Please call again in a few minutes.'"
+                                            ),
+                                        }
+                                    else:
+                                        tool_result = res
                                     await g_ws.send(json.dumps({
                                         "toolResponse": {
                                             "functionResponses": [{
                                                 "id":       cid,
                                                 "name":     fn,
-                                                "response": {"result": res},
+                                                "response": {"result": tool_result},
                                             }]
                                         }
                                     }))
