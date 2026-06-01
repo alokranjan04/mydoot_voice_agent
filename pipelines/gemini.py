@@ -175,6 +175,7 @@ async def gemini_handler(request):
             greeting_started   = False
             save_done_ts       = 0.0   # timestamp when save_customer_feedback succeeded
             save_executed      = False  # prevent duplicate save calls per session
+            confirmation_done  = False  # True after first turnComplete post-save — blocks further audio
             guard_log_ts       = 0.0   # throttle echo-guard log spam
             agent_buf          = ""    # accumulate agent speech chunks per turn
             customer_buf       = ""    # accumulate customer speech chunks per utterance
@@ -182,7 +183,7 @@ async def gemini_handler(request):
             async def g_receiver():
                 nonlocal downsample_state, last_ai_audio_ts, gemini_turn_end_ts
                 nonlocal greeting_started, greeting_done, save_done_ts, save_executed
-                nonlocal agent_buf, customer_buf
+                nonlocal confirmation_done, agent_buf, customer_buf
                 try:
                     async for raw_msg in g_ws:
                         data = json.loads(raw_msg)
@@ -217,6 +218,8 @@ async def gemini_handler(request):
                         # ── Audio output → Vobiz ────────────────────────────
                         for part in server_content.get("modelTurn", {}).get("parts", []):
                             if part.get("inlineData"):
+                                if confirmation_done:
+                                    continue  # hard-block any audio after confirmation
                                 if not greeting_started:
                                     greeting_started = True
                                     log("🔊 Greeting audio started streaming to caller")
@@ -251,10 +254,15 @@ async def gemini_handler(request):
                                 log(f"🔔 turnComplete — GREETING DONE, customer audio now live "
                                     f"(last audio {ai_dur:.2f}s ago)")
                             elif save_done_ts > 0:
-                                # First turnComplete after save = confirmation finished
-                                # Close immediately (0.1s) so Gemini can't speak a second time
-                                log("✅ Confirmation turnComplete — closing call now")
-                                asyncio.create_task(_close_after(ws, g_ws, 0.1, log))
+                                # First turnComplete after save = confirmation finished.
+                                # Set confirmation_done to hard-block any further Gemini audio,
+                                # then close immediately so no second utterance can play.
+                                if not confirmation_done:
+                                    confirmation_done = True
+                                    log("✅ Confirmation turnComplete — audio blocked, closing now")
+                                    asyncio.create_task(_close_after(ws, g_ws, 0.0, log))
+                                else:
+                                    log("⚠️  Extra turnComplete after confirmation — ignoring")
                             else:
                                 log(f"🔔 turnComplete — echo guard releases in 1.0s "
                                     f"(last audio {ai_dur:.2f}s ago)")
