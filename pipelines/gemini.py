@@ -356,6 +356,8 @@ async def gemini_handler(request):
     log(f"🚀 Gemini Live connecting | model={model}")
     log(f"   API key: {'SET len=' + str(len(GEMINI_API_KEY)) if GEMINI_API_KEY else '*** MISSING ***'}")
 
+    g_ws = None    # defined at function level so g_receiver can reassign via nonlocal on reconnect
+    setup: dict = {}  # populated after connect; accessible to g_receiver for reconnect
     try:
         async with websockets.connect(
             GEMINI_WS_URL,
@@ -419,10 +421,13 @@ async def gemini_handler(request):
             customer_buf       = ""    # accumulate customer speech chunks per utterance
 
             async def g_receiver():
+                nonlocal g_ws
                 nonlocal downsample_state, last_ai_audio_ts, gemini_turn_end_ts
                 nonlocal greeting_started, greeting_done, save_done_ts, save_executed
                 nonlocal confirmation_done, confirmation_audio_secs, waiting_for_gemini
                 nonlocal agent_buf, customer_buf
+                _g_reconnects = 0
+                _reconnected   = False
                 try:
                     async for raw_msg in g_ws:
                         data = json.loads(raw_msg)
@@ -648,6 +653,46 @@ async def gemini_handler(request):
                         if data.get("error"):
                             log(f"❌ Gemini error message: {data['error']}")
 
+                except websockets.exceptions.ConnectionClosedError as ex:
+                    if _g_reconnects < 1 and not save_executed and not ws.closed:
+                        _g_reconnects += 1
+                        log(f"🔄 Gemini WS dropped — reconnecting (1/1): {type(ex).__name__}: {ex}")
+                        waiting_for_gemini = True
+                        try:
+                            _old_g_ws = g_ws
+                            g_ws = await websockets.connect(
+                                GEMINI_WS_URL,
+                                open_timeout=15,
+                                ping_interval=20,
+                                ping_timeout=20,
+                            )
+                            await g_ws.send(json.dumps(setup))
+                            _r2 = await asyncio.wait_for(g_ws.recv(), timeout=10.0)
+                            if json.loads(_r2).get("error"):
+                                raise Exception(f"Reconnect setup error: {json.loads(_r2)['error']}")
+                            try:
+                                await _old_g_ws.close()
+                            except Exception:
+                                pass
+                            _resume_ctx = service_graph.get_context()
+                            await g_ws.send(json.dumps({
+                                "clientContent": {
+                                    "turns": [{"role": "user", "parts": [{"text": _resume_ctx + "\n\n[Continue the conversation from the current stage. Do not mention any interruption.]"}]}],
+                                    "turnComplete": True,
+                                }
+                            }))
+                            waiting_for_gemini = True
+                            log("✅ Gemini reconnected — scheduling new receiver task")
+                            _reconnected = True
+                            asyncio.create_task(g_receiver())
+                            return  # exit this g_receiver instance; new one takes over
+                        except Exception as _re_err:
+                            log(f"❌ Gemini reconnect failed: {_re_err}")
+                            traceback.print_exc()
+                            # fall through to finally → close call
+                    else:
+                        log(f"❌ g_receiver ConnectionClosedError (no retry): {type(ex).__name__}: {ex}")
+                        traceback.print_exc()
                 except Exception as ex:
                     log(f"❌ g_receiver error: {type(ex).__name__}: {ex}")
                     traceback.print_exc()
@@ -669,9 +714,9 @@ async def gemini_handler(request):
                     gemini_turn_end_ts = time.time() - 1.0
                     waiting_for_gemini = False  # unstick VAD loop
                     # If Gemini closed before the call was intentionally ended
-                    # (no save + confirmation yet), close Vobiz WS immediately
-                    # so the call ends cleanly instead of hanging for 25s.
-                    if not ws.closed and not confirmation_done and save_done_ts == 0:
+                    # (no save + confirmation yet), AND this is not a reconnect,
+                    # close Vobiz WS immediately so the call ends cleanly.
+                    if not ws.closed and not confirmation_done and save_done_ts == 0 and not _reconnected:
                         log("📴 Gemini WS closed unexpectedly — closing call now")
                         asyncio.create_task(ws.close())
 
@@ -904,6 +949,12 @@ async def gemini_handler(request):
         print(f"[{_ts()}] ❌ Gemini Live Error: {e}", flush=True)
         traceback.print_exc()
     finally:
+        # Close reconnected Gemini WS (the async with block only closes the initial one)
+        if g_ws and not g_ws.closed:
+            try:
+                await g_ws.close()
+            except Exception:
+                pass
         # Close persistent Sarvam HTTP session (if it was created)
         try:
             if 'sarvam_session' in dir():
