@@ -556,6 +556,13 @@ async def gemini_handler(request):
                         transcript_log.append(f"[{_ts()}] Customer: {_clean_transcript(customer_buf.strip())}")
                     log("🔁 g_receiver exiting — releasing echo guard")
                     gemini_turn_end_ts = time.time() - 1.0
+                    waiting_for_gemini = False  # unstick VAD loop
+                    # If Gemini closed before the call was intentionally ended
+                    # (no save + confirmation yet), close Vobiz WS immediately
+                    # so the call ends cleanly instead of hanging for 25s.
+                    if not ws.closed and not confirmation_done and save_done_ts == 0:
+                        log("📴 Gemini WS closed unexpectedly — closing call now")
+                        asyncio.create_task(ws.close())
 
             asyncio.create_task(g_receiver())
 
@@ -589,6 +596,13 @@ async def gemini_handler(request):
                     log(f"📝 STT: empty ({stt_ms}ms) — ignoring")
                     return
                 log(f"📝 STT ({stt_ms}ms) → {transcript!r}")
+                # Re-check after STT: a concurrent task (started before
+                # waiting_for_gemini was set) may have already sent a turn.
+                # Sending two clientContent turns before Gemini responds
+                # triggers 1008 "operation not supported".
+                if waiting_for_gemini:
+                    log(f"📝 STT concurrent-drop (Gemini busy): {transcript!r}")
+                    return
                 line = f"[{_ts()}] Customer: {transcript}"
                 transcript_log.append(line)
                 log(f"🗣  {line}")
