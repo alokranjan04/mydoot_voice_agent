@@ -114,7 +114,7 @@
             }
         ]
     },
-    "active_provider": "sarvam",
+    "active_provider": "google",
     "parameters": {
         "sarvam": {
             "model": "sarvam-30b",

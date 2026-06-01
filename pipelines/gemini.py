@@ -3,38 +3,30 @@
 Gemini Live Multimodal pipeline for Mydoot Customer Care.
 Uses websockets library + BidiGenerateContent (v1beta) — audio in / audio out.
 """
-import asyncio, audioop, base64, json, os, time, traceback, wave
+import asyncio, audioop, base64, io, json, os, time, traceback, wave
 from datetime import datetime
 import aiohttp
 import websockets
 from aiohttp import web
 
-from config.settings import APP_CONFIG, GEMINI_API_KEY, GEMINI_WS_URL
+from config.settings import APP_CONFIG, GEMINI_API_KEY, GEMINI_WS_URL, SARVAM_API_KEY
 from core.state_engine import ConversationStateEngine
 from mydoot_functions import FUNCTION_MAP, send_call_summary_email, upload_recording_to_gcs
 
-# ── Audio pipeline tuning ────────────────────────────────────────────────────
-# Packets below this RMS are treated as background noise (fan, line hiss, etc.)
-# and not forwarded to Gemini. Increase if fan noise still leaks through;
-# decrease if soft speech is being filtered out.
-NOISE_GATE_RMS             = int(os.getenv("NOISE_GATE_RMS", "100"))
-NOISE_GATE_FALLBACK_RMS             = int(os.getenv("NOISE_GATE_FALLBACK_RMS", "20"))
-NOISE_GATE_FALLBACK_AFTER_S         = float(os.getenv("NOISE_GATE_FALLBACK_AFTER_S", "1.5"))
-NOISE_GATE_FALLBACK_FULL_DISABLE_S  = float(os.getenv("NOISE_GATE_FALLBACK_FULL_DISABLE_S", "4.0"))
-NOISE_GATE_FALLBACK_FULL_COUNT      = int(os.getenv("NOISE_GATE_FALLBACK_FULL_COUNT", "20"))
-NOISE_GATE_FALLBACK_ENABLED         = os.getenv("NOISE_GATE_FALLBACK", "1").lower() in ("1", "true", "yes")
-# Keep forwarding audio for this many seconds after the last speech packet,
-# so the tail of each utterance reaches Gemini intact.
-SPEECH_TAIL_SECS           = float(os.getenv("SPEECH_TAIL_SECS", "0.4"))
-# After the speech tail expires, forward zero-amplitude audio for this long.
-# This gives Gemini's VAD an explicit silence signal so it responds in ~1-2s
-# instead of waiting 20-30s for background noise to go silent on its own.
-SILENCE_SEND_SECS          = float(os.getenv("SILENCE_SEND_SECS", "5.0"))
-# Accumulate this many 20ms frames before sending one Gemini message.
-# 4 × 20ms = 80ms chunks → ~12 sends/s instead of 50.
-AUDIO_BATCH_FRAMES         = 4
-# Enable per-packet audio RMS debug logging for noise-gate tuning.
-NOISE_GATE_DEBUG           = os.getenv("NOISE_GATE_DEBUG", "0").lower() in ("1", "true", "yes")
+# ── Sarvam Saaras v3 STT ─────────────────────────────────────────────────────
+SARVAM_STT_URL = "https://api.sarvam.ai/speech-to-text"
+
+# ── VAD (Voice Activity Detection) — local, before STT ───────────────────────
+# RMS threshold: packets below this are silence / line noise, not forwarded.
+VAD_SPEECH_THRESHOLD  = int(os.getenv("VAD_SPEECH_THRESHOLD",  "100"))
+# Seconds of silence after speech that signals end-of-utterance.
+VAD_END_SECS          = float(os.getenv("VAD_END_SECS",          "0.7"))
+# Minimum utterance duration to bother sending to STT (avoids noise blips).
+VAD_MIN_SPEECH_SECS   = float(os.getenv("VAD_MIN_SPEECH_SECS",  "0.3"))
+# Hard ceiling — force-flush utterance if customer speaks this long non-stop.
+VAD_MAX_SPEECH_SECS   = float(os.getenv("VAD_MAX_SPEECH_SECS",  "30.0"))
+
+# ── Call recording ────────────────────────────────────────────────────────────
 # Set RECORD_CALLS=1 to save each call's inbound PSTN audio as a WAV file.
 # Files are written to RECORDINGS_DIR (default: ./recordings/).
 # Use these WAV files with test_asr_compare.py to benchmark ASR services.
@@ -101,6 +93,47 @@ def _clean_transcript(text: str) -> str:
     return cleaned
 
 
+async def _sarvam_stt(pcm8_bytes: bytes) -> str:
+    """
+    Transcribe 8 kHz 16-bit mono PCM via Sarvam Saaras v3.
+    Returns the transcript string, or "" on failure / empty result.
+    """
+    if not pcm8_bytes or not SARVAM_API_KEY:
+        return ""
+    try:
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(8000)
+            wf.writeframes(pcm8_bytes)
+        wav_bytes = buf.getvalue()
+
+        form = aiohttp.FormData()
+        form.add_field("file", wav_bytes,
+                       filename="audio.wav", content_type="audio/wav")
+        form.add_field("model", "saaras:v3")
+        form.add_field("language_code", "hi-IN")
+
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                SARVAM_STT_URL,
+                data=form,
+                headers={"api-subscription-key": SARVAM_API_KEY},
+                timeout=timeout,
+            ) as r:
+                if r.status == 200:
+                    result = await r.json()
+                    return result.get("transcript", "").strip()
+                else:
+                    txt = await r.text()
+                    print(f"[STT] Sarvam Saaras error {r.status}: {txt[:200]}")
+    except Exception as e:
+        print(f"[STT ERROR] {e}")
+    return ""
+
+
 async def gemini_handler(request):
     ws = web.WebSocketResponse(protocols=["audio.drachtio.org"])
     await ws.prepare(request)
@@ -141,7 +174,6 @@ async def gemini_handler(request):
                     "generationConfig": {
                         "responseModalities": ["AUDIO"],
                     },
-                    "inputAudioTranscription":  {},
                     "outputAudioTranscription": {},
                     "systemInstruction": {
                         "parts": [{"text": get_system_prompt()}],
@@ -185,7 +217,6 @@ async def gemini_handler(request):
             save_executed           = False  # prevent duplicate save calls per session
             confirmation_done       = False  # True once confirmation audio is blocked
             confirmation_audio_secs = 0.0   # seconds of audio forwarded after save_done_ts set
-            guard_log_ts       = 0.0   # throttle echo-guard log spam
             agent_buf          = ""    # accumulate agent speech chunks per turn
             customer_buf       = ""    # accumulate customer speech chunks per utterance
 
@@ -388,25 +419,42 @@ async def gemini_handler(request):
 
             asyncio.create_task(g_receiver())
 
-            # ── 5. Forward Vobiz audio → Gemini ─────────────────────────────
-            upsample_state       = None
-            call_start_ts        = time.time()
-            MAX_CALL_SECS        = 600   # 10 min hard limit
-            fwd_count            = 0     # total Gemini sends (each = AUDIO_BATCH_FRAMES packets)
-            blocked_count        = 0     # packets dropped by echo/greeting/save guards
-            noise_blocked_count  = 0     # packets filtered by noise gate (total)
-            last_speech_ts       = 0.0   # timestamp of last above-threshold audio packet
-            audio_batch          = []    # accumulate frames before sending
-            last_stat_ts         = time.time()
-            # Per-turn counters — reset each time the agent finishes speaking.
-            # Used so the noise gate fallback re-evaluates every turn, not just
-            # at the start of the call (fwd_count > 0 forever after first exchange).
-            turn_fwd_count       = 0     # speech packets forwarded since last turnComplete
-            turn_noise_blocked   = 0     # noise gate blocks since last turnComplete
-            last_seen_turn_end   = 0.0   # tracks last gemini_turn_end_ts we reset against
+            # ── 5. Vobiz audio → VAD → Sarvam Saaras v3 STT → Gemini text ──────
+            # Audio is NOT sent to Gemini as raw audio. Instead:
+            #   • Local VAD accumulates audio above RMS threshold
+            #   • Silence after speech triggers Sarvam Saaras v3 transcription
+            #   • Transcript is sent to Gemini Live as a text clientContent turn
+            #   • Gemini Live responds with audio (native TTS voice)
+            call_start_ts     = time.time()
+            MAX_CALL_SECS     = 600
+            last_customer_ts  = 0.0   # time last transcript was sent to Gemini
+            # VAD state
+            speech_buf        = []    # accumulated 8 kHz PCM bytes for current utterance
+            speech_start_ts   = 0.0
+            vad_last_speech   = 0.0   # time of last above-threshold packet
+            in_speech         = False
+
+            async def _stt_and_send(pcm8_bytes: bytes):
+                """Transcribe utterance and send text turn to Gemini Live."""
+                nonlocal last_customer_ts
+                transcript = await _sarvam_stt(pcm8_bytes)
+                if not transcript:
+                    log("📝 STT: empty — ignoring")
+                    return
+                log(f"📝 STT → Gemini: {transcript!r}")
+                line = f"[{_ts()}] Customer: {transcript}"
+                transcript_log.append(line)
+                log(f"🗣  {line}")
+                last_customer_ts = time.time()
+                if not g_ws.closed:
+                    await g_ws.send(json.dumps({
+                        "clientContent": {
+                            "turns": [{"role": "user", "parts": [{"text": transcript}]}],
+                            "turnComplete": True,
+                        }
+                    }))
 
             async for msg in ws:
-                # Hard timeout
                 if time.time() - call_start_ts > MAX_CALL_SECS:
                     log(f"⏱ Call timeout ({MAX_CALL_SECS}s) — closing.")
                     break
@@ -416,157 +464,74 @@ async def gemini_handler(request):
                     if data.get("event") == "media":
                         now = time.time()
 
-                        # Block audio for 15s after save so confirmation plays uninterrupted.
-                        if save_done_ts and now - save_done_ts < 15.0:
-                            blocked_count += 1
-                            if now - guard_log_ts > 3.0:
-                                guard_log_ts = now
-                                log(f"🔒 Post-save guard — {15.0 - (now - save_done_ts):.0f}s remaining")
-                            continue
-
-                        # 2-second startup guard — blocks only the initial connection
-                        # burst. After 2s, the noise gate (threshold 200) handles
-                        # background noise and the native audio model handles
-                        # interruptions naturally. Customers can say "Hindi" or
-                        # "English" at any point during or after the greeting.
-                        if not greeting_done:
-                            if now - call_start_ts > 2.0:
-                                greeting_done = True
-                                log(f"🔔 Greeting guard released at "
-                                    f"{now - call_start_ts:.1f}s — customer audio live")
-                            else:
-                                blocked_count += 1
-                                continue
-
-                        # Safety: if Gemini sent audio but turnComplete never
-                        # arrived, unblock after 8s
-                        if (last_ai_audio_ts > gemini_turn_end_ts and
-                                now - last_ai_audio_ts > 8.0):
-                            log(f"⚠️  Echo guard safety timeout — forcing release "
-                                f"(turnComplete missing for {now - last_ai_audio_ts:.1f}s)")
-                            gemini_turn_end_ts = now - 1.0
-
-                        # Echo guard: 0.3s buffer after turnComplete
-                        guard_active = now - gemini_turn_end_ts < 0.3
-                        if guard_active:
-                            blocked_count += 1
-                            continue
-
-                        # ── Reset per-turn counters when agent's turn ends ────
-                        if gemini_turn_end_ts != last_seen_turn_end:
-                            last_seen_turn_end = gemini_turn_end_ts
-                            turn_fwd_count   = 0
-                            turn_noise_blocked = 0
-
-                        # ── Inactivity timeout: close call if customer silent 20s ─
-                        if (save_done_ts == 0 and gemini_turn_end_ts > 0
-                                and turn_fwd_count == 0
-                                and now - gemini_turn_end_ts > 20.0):
-                            log("⏱ Inactivity — no customer speech for 20s after agent turn, closing")
-                            break
-
                         raw_mulaw = base64.b64decode(data["media"]["payload"])
-                        pcm8  = audioop.ulaw2lin(raw_mulaw, 2)
+                        pcm8      = audioop.ulaw2lin(raw_mulaw, 2)
                         if RECORD_CALLS:
                             pcm8_frames.append(pcm8)
-                        pcm16, upsample_state = audioop.ratecv(
-                            pcm8, 2, 1, 8000, 16000, upsample_state
-                        )
 
-                        # ── Noise gate: filter fan/background noise ──────────
-                        # Fallback uses per-turn counters (turn_fwd_count, turn_noise_blocked)
-                        # so the threshold re-evaluates after every agent response, not just
-                        # at the start of the call (fwd_count stays > 0 after first exchange).
-                        rms = audioop.rms(pcm16, 2)
-                        speech_since_last = now - last_speech_ts
-                        active_noise_gate = NOISE_GATE_RMS
-                        if (NOISE_GATE_FALLBACK_ENABLED and greeting_done
-                                and turn_fwd_count == 0
-                                and gemini_turn_end_ts > 0
-                                and now - gemini_turn_end_ts > NOISE_GATE_FALLBACK_AFTER_S
-                                and turn_noise_blocked >= 50):
-                            active_noise_gate = NOISE_GATE_FALLBACK_RMS
-                            if now - guard_log_ts > 3.0:
-                                guard_log_ts = now
-                                log(f"⚠️  Noise gate fallback — threshold → {active_noise_gate} "
-                                    f"(turn_blocked={turn_noise_blocked})")
-                        if (NOISE_GATE_FALLBACK_ENABLED and greeting_done
-                                and turn_fwd_count == 0
-                                and gemini_turn_end_ts > 0
-                                and now - gemini_turn_end_ts > NOISE_GATE_FALLBACK_FULL_DISABLE_S
-                                and turn_noise_blocked >= NOISE_GATE_FALLBACK_FULL_COUNT):
-                            if active_noise_gate != 0:
-                                active_noise_gate = 0
-                                if now - guard_log_ts > 3.0:
-                                    guard_log_ts = now
-                                    log("⚠️  Soft audio fallback — noise gate fully disabled")
-                        is_speech = rms > active_noise_gate
-                        speech_tail_ok = speech_since_last < SPEECH_TAIL_SECS
-                        if is_speech:
-                            last_speech_ts = now
-                        if NOISE_GATE_DEBUG or active_noise_gate != NOISE_GATE_RMS:
-                            log(
-                                f"🔍 Noise debug | rms={rms} | threshold={active_noise_gate} | "
-                                f"is_speech={is_speech} | tail_ok={speech_tail_ok} | "
-                                f"since_last_speech={speech_since_last:.3f}s | "
-                                f"turn_blocked={turn_noise_blocked}"
-                            )
-                        if not is_speech and not speech_tail_ok:
-                            noise_blocked_count += 1
-                            turn_noise_blocked  += 1
-                            # Silence injection reference: the later of last real speech
-                            # OR the agent's last turnComplete + echo guard. This ensures
-                            # Gemini always receives a fresh silence window after each
-                            # agent turn, even when last_speech_ts is from a previous turn.
-                            _silence_ref = max(
-                                last_speech_ts,
-                                gemini_turn_end_ts + 0.3 if gemini_turn_end_ts > 0 else 0.0,
-                            )
-                            since_ref = now - _silence_ref
-                            if since_ref < SPEECH_TAIL_SECS + SILENCE_SEND_SECS:
-                                # Replace background noise with zero-amplitude audio.
-                                # Gemini's VAD sees clean silence → detects end-of-speech
-                                # → responds in ~1-2s instead of waiting 20-30s.
-                                pcm16 = bytes(len(pcm16))
-                            else:
-                                # Beyond silence window — drop entirely to save bandwidth.
-                                if now - guard_log_ts > 5.0:
-                                    guard_log_ts = now
-                                    log(f"🔇 Noise gate — rms={rms} < {active_noise_gate} | "
-                                        f"{noise_blocked_count} pkts filtered so far")
-                                continue
-
-                        # ── Batch 4 frames (80ms) before sending to Gemini ───
-                        audio_batch.append(pcm16)
-                        if len(audio_batch) < AUDIO_BATCH_FRAMES:
+                        # ── Post-save guard: block all input after save ────
+                        if save_done_ts > 0:
                             continue
 
-                        combined = b"".join(audio_batch)
-                        audio_batch.clear()
-                        try:
-                            await g_ws.send(json.dumps({
-                                "realtimeInput": {
-                                    "audio": {
-                                        "data":     base64.b64encode(combined).decode("utf-8"),
-                                        "mimeType": "audio/pcm;rate=16000",
-                                    }
-                                }
-                            }))
-                            fwd_count     += 1
-                            turn_fwd_count += 1
-                        except Exception:
-                            log("❌ Gemini WS closed mid-send — ending call")
+                        # ── Greeting guard: wait for Gemini to finish greeting ─
+                        if not greeting_done:
+                            # Safety release at 20s in case turnComplete never fires
+                            if now - call_start_ts > 20.0:
+                                greeting_done = True
+                                log(f"🔔 Greeting guard safety-released at "
+                                    f"{now - call_start_ts:.1f}s")
+                            else:
+                                continue
+
+                        # ── Safety: release echo guard if turnComplete missing ─
+                        if (last_ai_audio_ts > gemini_turn_end_ts and
+                                now - last_ai_audio_ts > 8.0):
+                            log(f"⚠️  Echo guard safety timeout — forcing release")
+                            gemini_turn_end_ts = now - 1.0
+
+                        # ── Echo guard: 0.3s buffer after agent turn ──────────
+                        if now - gemini_turn_end_ts < 0.3:
+                            continue
+
+                        # ── Inactivity timeout (25s no speech after agent turn) ─
+                        if (save_done_ts == 0
+                                and gemini_turn_end_ts > 0
+                                and last_customer_ts < gemini_turn_end_ts
+                                and now - gemini_turn_end_ts > 25.0):
+                            log("⏱ Inactivity — no customer speech for 25s, closing")
                             break
 
-                        # Periodic stats log every 10s
-                        if now - last_stat_ts > 10.0:
-                            last_stat_ts = now
-                            elapsed = now - call_start_ts
-                            log(f"📊 Stats @{elapsed:.0f}s — "
-                                f"sends={fwd_count} (80ms/ea) | "
-                                f"guard_blocked={blocked_count} | "
-                                f"noise_filtered={noise_blocked_count} | "
-                                f"transcript={len(transcript_log)} lines")
+                        # ── VAD ───────────────────────────────────────────────
+                        rms = audioop.rms(pcm8, 2)
+
+                        if rms >= VAD_SPEECH_THRESHOLD:
+                            if not in_speech:
+                                in_speech       = True
+                                speech_start_ts = now
+                                speech_buf.clear()
+                                log(f"🎙 Speech start (rms={rms})")
+                            speech_buf.append(pcm8)
+                            vad_last_speech = now
+                            # Hard ceiling — force-flush if utterance runs too long
+                            if now - speech_start_ts >= VAD_MAX_SPEECH_SECS:
+                                combined   = b"".join(speech_buf)
+                                speech_buf.clear()
+                                in_speech  = False
+                                log(f"🔁 Utterance max duration — flushing to STT")
+                                asyncio.create_task(_stt_and_send(combined))
+
+                        elif in_speech:
+                            speech_buf.append(pcm8)  # keep silence tail for natural phrase end
+                            if now - vad_last_speech >= VAD_END_SECS:
+                                combined  = b"".join(speech_buf)
+                                speech_buf.clear()
+                                in_speech = False
+                                duration  = now - speech_start_ts
+                                log(f"🔇 Speech end — {duration:.2f}s")
+                                if duration >= VAD_MIN_SPEECH_SECS:
+                                    asyncio.create_task(_stt_and_send(combined))
+                                else:
+                                    log(f"⏭ Too short ({duration:.2f}s) — ignoring")
 
                 elif msg.type == aiohttp.WSMsgType.ERROR:
                     log(f"❌ Vobiz WS error: {ws.exception()}")
