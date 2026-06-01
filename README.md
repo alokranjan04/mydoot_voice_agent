@@ -11,8 +11,8 @@ A customer calls **+917971542939**. The AI agent:
 
 1. Answers immediately with a Hinglish greeting, then auto-detects language (English or Hinglish)
 2. Conducts the entire call in English if the customer responds in English, otherwise Hinglish
-3. Identifies the service category (Appliance Repair, Plumbing, Electrical, Carpentry, Cleaning, Vehicle Service, or Other) and guides through subcategory, problem, address, and preferred visit time
-4. Saves a structured 10-field service request to Google Sheets
+3. Identifies the service category (Appliance Repair, Plumbing, Electrical, Carpentry, Cleaning, Vehicle Service, or Other) and guides through subcategory, structured diagnosis (issue type + severity), address, and preferred visit time
+4. Saves a structured 11-field service request to Google Sheets
 5. Emails the full call transcript to the admin after every call
 
 No hold music. No missed calls. No incomplete forms.
@@ -47,9 +47,11 @@ Customer Phone Call
         │
         ├── core/service_graph.py — LangGraph ServiceGraph
         │               ↓  Injects [STAGE CONTEXT] with each turn
-        │               ↓  Tracks: category → subcategory → problem
+        │               ↓  Tracks: category → subcategory → diagnosis
         │                          → brand → address → preferred_time
         │                          → customer_name → done
+        │               ↓  DIAGNOSTIC_FLOWS: 20-subcategory fault tree
+        │                  (issue_type, severity, error_code)
         ▼
  Gemini Live (gemini-2.5-flash-native-audio-latest)
  • LLM + TTS in one model (text-in / audio-out)
@@ -60,7 +62,7 @@ Customer Phone Call
         ▼
  save_service_request() tool call
         │
-        ├── Google Sheets API ──► Append row to Sheet1 (10 columns)
+        ├── Google Sheets API ──► Append row to Sheet1 (11 columns)
         └── Gmail SMTP ──────────► Send transcript email to admin (after call)
 ```
 
@@ -76,7 +78,9 @@ Customer responds → Sarvam Saaras v3 STT transcribes
 [STAGE CONTEXT] injected → Gemini guided through stages:
   1. category      — detect service type from customer description
   2. subcategory   — specific type (e.g. Refrigerator, Pipe Leak, Wiring)
-  3. problem       — what exactly is wrong / what work is needed
+  3. diagnosis     — structured fault diagnosis: DIAGNOSTIC_FLOWS injects
+                     per-subcategory questions to identify issue_type,
+                     severity (High/Medium/Low), and optional error_code
   4. brand         — only for Appliance Repair and Vehicle Service
   5. address       — society name + area/locality for technician visit
   6. preferred_time — when to send the technician
@@ -118,18 +122,19 @@ The agent handles **any home or office service request** across these categories
 | 1 | Customer Name | Kumud Ranjan |
 | 2 | Category | Plumbing |
 | 3 | Subcategory | Pipe Leak |
-| 4 | Problem | Water leaking from bathroom pipe since 2 days |
+| 4 | Issue Type | Water Leakage Indoor |
 | 5 | Brand | Samsung *(Appliance/Vehicle only)* |
 | 6 | Model | *(optional)* |
-| 7 | Address | Sector 15, Noida |
-| 8 | Preferred Time | kal subah 10 baje |
-| 9 | Timestamp | *(auto)* |
-| 10 | Caller ID | *(auto)* |
+| 7 | Severity | High / Medium / Low *(auto-derived)* |
+| 8 | Address | Sector 15, Noida |
+| 9 | Preferred Time | kal subah 10 baje |
+| 10 | Timestamp | *(auto)* |
+| 11 | Caller ID | *(auto)* |
 
-### Google Sheet Columns (A–J)
+### Google Sheet Columns (A–K)
 
 ```
-Customer Name | Category | Subcategory | Problem | Brand | Model | Address | Preferred Time | Timestamp | Caller ID
+Customer Name | Category | Subcategory | Issue Type | Brand | Model | Severity | Address | Preferred Time | Timestamp | Caller ID
 ```
 
 Sheet: [mydoot_Customer_Care](https://docs.google.com/spreadsheets/d/1uW39kklQKc4rhf5REATgKqgwbvSNAhlDVKXyAzOMKCk)

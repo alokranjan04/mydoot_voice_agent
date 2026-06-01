@@ -28,7 +28,7 @@ An always-available AI voice agent that:
 2. Auto-detects language (English or Hinglish) after the first response
 3. Guides the customer through a structured service request form via natural conversation
 4. Uses LangGraph to orchestrate the conversation stage by stage
-5. Saves a complete 10-field structured record to Google Sheets
+5. Saves a complete 11-field structured record to Google Sheets
 6. Emails the full transcript to the admin after every call
 
 No hold time. No missed fields. No data entry lag.
@@ -66,9 +66,11 @@ The agent uses LangGraph (`core/service_graph.py`) to guide the conversation thr
 
 Stage order:
 ```
-category → subcategory → problem → brand* → address → preferred_time → customer_name → done
+category → subcategory → diagnosis → brand* → address → preferred_time → customer_name → done
 *brand only asked for Appliance Repair and Vehicle Service categories
 ```
+
+The **diagnosis** stage uses `DIAGNOSTIC_FLOWS` (20 subcategory entries in `core/service_graph.py`) to inject targeted questions per fault type, identify the structured `issue_type`, and auto-derive `severity`.
 
 Fields collected:
 
@@ -76,12 +78,14 @@ Fields collected:
 |---|-------|----------|-------|
 | 1 | category | Yes | Detected from description: Appliance Repair / Plumbing / Electrical / Carpentry / Cleaning / Vehicle Service / Other |
 | 2 | subcategory | Yes | Specific type within category (e.g. Refrigerator, Pipe Leak, Wiring) |
-| 3 | problem | Yes | Detailed description of the issue |
-| 4 | brand | Conditional | Required for Appliance Repair and Vehicle Service; empty for others |
-| 5 | model | No | Optional — captured if mentioned |
-| 6 | address | Yes | Society name + area/locality for technician |
-| 7 | preferred_time | Yes | When customer wants the technician to visit |
-| 8 | customer_name | Yes | Collected LAST |
+| 3 | issue_type | Yes | Structured fault label from DIAGNOSTIC_FLOWS (e.g. Cooling Failure, Water Leakage Indoor, MCB Tripping) |
+| 4 | severity | Auto | Derived from issue_type via severity_map: High / Medium / Low |
+| 5 | error_code | No | Appliance display error code if shown (e.g. E3, F1); empty otherwise |
+| 6 | brand | Conditional | Required for Appliance Repair and Vehicle Service; empty for others |
+| 7 | model | No | Optional — captured if mentioned |
+| 8 | address | Yes | Society name + area/locality for technician |
+| 9 | preferred_time | Yes | When customer wants the technician to visit |
+| 10 | customer_name | Yes | Collected LAST |
 
 ### FR-4: Conversational Rules
 - One question at a time — always the next missing field per stage
@@ -94,7 +98,7 @@ Fields collected:
 - On completing all required fields, call `save_service_request` tool immediately
 - Do NOT say "request registered" before the tool call succeeds
 - Write one row per call to Google Sheets (Sheet1, appended, never overwrite)
-- Sheet columns (A–J): Customer Name | Category | Subcategory | Problem | Brand | Model | Address | Preferred Time | Timestamp | Caller ID
+- Sheet columns (A–K): Customer Name | Category | Subcategory | Issue Type | Brand | Model | Severity | Address | Preferred Time | Timestamp | Caller ID
 - `save_executed` flag prevents duplicate Sheet rows per session
 
 ### FR-6: Post-Save Confirmation
@@ -129,7 +133,7 @@ Fields collected:
 | Requirement | Target |
 |-------------|--------|
 | Call answer latency | < 3 seconds from ring to greeting |
-| Agent response latency (TTFT) | < 2 seconds per turn |
+| Agent response latency (TTFT) | < 2 seconds per turn (VAD_END_SECS=0.5 + persistent aiohttp session saves ~400-500ms) |
 | Google Sheets write success | > 99% |
 | Concurrent calls supported | 10 |
 | Uptime | 99.5% (Cloud Run managed) |
@@ -148,13 +152,14 @@ Fields collected:
 | A | Customer Name | String | Kumud Ranjan |
 | B | Category | String | Plumbing |
 | C | Subcategory | String | Pipe Leak |
-| D | Problem | String | Water leaking from bathroom pipe |
+| D | Issue Type | String | Water Leakage Indoor |
 | E | Brand | String | Samsung *(Appliance/Vehicle only)* |
 | F | Model | String | *(optional)* |
-| G | Address | String | Sector 15, Noida |
-| H | Preferred Time | String | kal subah 10 baje |
-| I | Timestamp | DateTime | 2026-06-01 10:15:22 |
-| J | Caller ID | String | 917042915552 |
+| G | Severity | String | High / Medium / Low |
+| H | Address | String | Sector 15, Noida |
+| I | Preferred Time | String | kal subah 10 baje |
+| J | Timestamp | DateTime | 2026-06-01 10:15:22 |
+| K | Caller ID | String | 917042915552 |
 
 Sheet ID: `1uW39kklQKc4rhf5REATgKqgwbvSNAhlDVKXyAzOMKCk`
 
@@ -164,7 +169,8 @@ Sheet ID: `1uW39kklQKc4rhf5REATgKqgwbvSNAhlDVKXyAzOMKCk`
 
 - **STT**: Sarvam Saaras v3 REST API (`saaras:v3`, hi-IN, 8kHz WAV) — replaces Gemini native audio input to eliminate PSTN noise hallucinations
 - **Language model**: Google Gemini 2.5 Flash Native Audio (BidiGenerateContent, text-in / audio-out)
-- **Conversation orchestration**: LangGraph `StateGraph` via `core/service_graph.py`
+- **Conversation orchestration**: LangGraph `StateGraph` via `core/service_graph.py`; `DIAGNOSTIC_FLOWS` dict with 20 subcategory fault trees; `diagnosis` stage between subcategory and brand
+- **STT latency optimization**: Persistent `aiohttp.ClientSession()` per call (avoids TCP+TLS handshake per utterance, saves ~200-300ms); `VAD_END_SECS` default 0.5s (tunable via env var), down from 0.7s
 - **Telephony**: Vobiz SIP (+917971542939)
 - **Audio codec**: mu-law 8kHz (Vobiz ↔ server), PCM 24kHz (Gemini → server)
 - **Infrastructure**: Google Cloud Run (us-central1, project testcnx-169610)
@@ -192,7 +198,7 @@ Sheet ID: `1uW39kklQKc4rhf5REATgKqgwbvSNAhlDVKXyAzOMKCk`
 - CRM or ticketing system integration (Freshdesk, Zoho, etc.)
 - SMS/WhatsApp confirmation to customer after registration
 - Outbound call-back scheduling
-- Sentiment analysis or complaint severity scoring
+- Sentiment analysis
 - Regional languages beyond English and Hinglish
 - Real-time dashboard for request volume/trends
 - IVR menu (press 1 for plumbing, press 2 for electrical)

@@ -62,7 +62,7 @@ Customer audio is never sent raw to Gemini. Only clean text transcripts are sent
 │                      │    │ → lin2ulaw              │
 │ VAD: RMS threshold   │    │ → mu-law 8kHz           │
 │ accumulate speech    │    │ → Vobiz playAudio        │
-│ end on 0.7s silence  │    │                         │
+│ end on 0.5s silence  │    │                         │
 │ min 0.3s utterance   │    │ Tracks turnComplete:    │
 │                      │    │ flushes transcript buf  │
 │ Sarvam Saaras v3     │    │ sets gemini_turn_end_ts │
@@ -80,7 +80,7 @@ Customer audio is never sent raw to Gemini. Only clean text transcripts are sent
 │    Triggered when Gemini has all required fields                    │
 │    service_graph.on_tool_call(args) → state = done                 │
 │    Handler: mydoot_functions.py                                     │
-│    - Appends row to Google Sheets (10 columns)                      │
+│    - Appends row to Google Sheets (11 columns, A–K)                 │
 │    - Returns success to Gemini                                      │
 │    - Gemini speaks confirmation once, then goes silent              │
 │    - Call closes after confirmation audio ≥ 2.5s completes         │
@@ -110,10 +110,11 @@ Vobiz WebSocket frame
   Linear PCM, 8kHz, mono, 16-bit
         │
         ▼ Local VAD (RMS threshold = 100)
-  Speech frames accumulated; silence > 0.7s triggers flush
+  Speech frames accumulated; silence > 0.5s triggers flush (VAD_END_SECS, tunable via env var)
   Utterances < 0.3s discarded (noise blips)
         │
         ▼ Sarvam Saaras v3 REST  (POST /speech-to-text)
+  Persistent aiohttp.ClientSession() per call — avoids TCP+TLS handshake per utterance (~200-300ms saved)
   model=saaras:v3 | language_code=hi-IN | file=audio.wav (8kHz WAV)
         │
         ▼ Transcript string (Hinglish / English)
@@ -169,9 +170,33 @@ CATEGORIES = {
 #### Stage Routing
 
 ```
-category → subcategory → problem → brand* → address → preferred_time → customer_name → done
+category → subcategory → diagnosis → brand* → address → preferred_time → customer_name → done
 *brand stage is skipped for categories where needs_brand=False
 ```
+
+The **diagnosis** stage replaces the old free-text `problem` stage. It injects category-specific questions from `DIAGNOSTIC_FLOWS` to identify the structured `issue_type` and auto-derive `severity`.
+
+#### DIAGNOSTIC_FLOWS
+
+`DIAGNOSTIC_FLOWS` is a dict in `core/service_graph.py` with entries for 20 subcategories:
+
+```python
+DIAGNOSTIC_FLOWS = {
+    "TV / Television": {
+        "issue_types": ["Power Failure", "Display Failure", "No Sound", "Remote Not Working", ...],
+        "questions": ["Is the power indicator light glowing?", "Is there any picture on screen?"],
+        "hints": "If no power light → Power Failure (High). If picture but no sound → No Sound (Low).",
+        "severity_map": {"Power Failure": "High", "Display Failure": "High", "No Sound": "Low", ...}
+    },
+    "Refrigerator": { ... },
+    "Washing Machine": { ... },
+    "AC / Air Conditioner": { ... },
+    "Water Purifier": { ... },
+    # ... 15 more subcategories
+}
+```
+
+Each entry drives the `[STAGE CONTEXT]` block for the diagnosis stage, telling Gemini which questions to ask and how to map answers to a specific `issue_type` and `severity`.
 
 #### [STAGE CONTEXT] Injection
 
@@ -179,12 +204,15 @@ On each customer utterance, `service_graph.get_context()` prepends a block:
 
 ```
 [STAGE CONTEXT — follow these instructions for this turn]
-Stage       : address
-Collected   : {"category": "Plumbing", "subcategory": "Pipe Leak", "problem": "Water leaking from bathroom pipe"}
-Instruction : ASK: What is your address? We need your society name and area/locality to send a technician.
+Stage       : diagnosis
+Collected   : {"category": "Appliance Repair", "subcategory": "Refrigerator"}
+Issue types : Cooling Failure, Water Leakage, Noisy Operation, Power Failure, Ice Build-up
+Diagnosis Q : Is the compressor running (humming sound)? Is there any cooling at all?
+Hints       : No cooling + compressor not running → Cooling Failure (High). Water below → Water Leakage (Medium).
+Instruction : Ask ONE diagnosis question. Once issue is clear, set issue_type and move to brand stage.
 [END STAGE CONTEXT]
 
-Customer: ghar mein pipe se paani aa raha hai
+Customer: fridge mein bilkul thanda nahi ho raha
 ```
 
 This block tells Gemini exactly which stage it's in, what's collected, and what single question to ask next.
@@ -265,13 +293,15 @@ Defined in `app_config.json` under `tools.gemini`, executed in `mydoot_functions
       "customer_name":  { "type": "STRING" },
       "category":       { "type": "STRING" },
       "subcategory":    { "type": "STRING" },
-      "problem":        { "type": "STRING" },
+      "issue_type":     { "type": "STRING", "description": "Structured fault label from DIAGNOSTIC_FLOWS, e.g. Cooling Failure, MCB Tripping" },
       "brand":          { "type": "STRING" },
       "model":          { "type": "STRING" },
+      "severity":       { "type": "STRING", "description": "High / Medium / Low — auto-derived from issue_type" },
+      "error_code":     { "type": "STRING", "description": "Appliance display error code if any, e.g. E3, F1" },
       "address":        { "type": "STRING" },
       "preferred_time": { "type": "STRING" }
     },
-    "required": ["customer_name","category","subcategory","problem","address","preferred_time"]
+    "required": ["customer_name","category","subcategory","issue_type","address","preferred_time"]
   }
 }
 ```
@@ -294,6 +324,8 @@ if res.get("success"):
 
 ### Google Sheets Write
 
+Columns A–K (11 total):
+
 ```python
 service.spreadsheets().values().append(
     spreadsheetId=SPREADSHEET_ID,
@@ -301,8 +333,9 @@ service.spreadsheets().values().append(
     valueInputOption="RAW",
     insertDataOption="INSERT_ROWS",
     body={"values": [[
-        customer_name, category, subcategory, problem,
-        brand, model, address, preferred_time,
+        customer_name, category, subcategory, issue_type,
+        brand, model, severity,
+        address, preferred_time,
         timestamp, caller_id
     ]]}
 )
@@ -316,7 +349,7 @@ Local VAD runs before Sarvam STT. It eliminates PSTN line noise from ever reachi
 
 ```python
 VAD_SPEECH_THRESHOLD = 100    # RMS amplitude gate
-VAD_END_SECS         = 0.7    # silence after speech to end utterance
+VAD_END_SECS         = 0.5    # silence after speech to end utterance (tunable via VAD_END_SECS env var)
 VAD_MIN_SPEECH_SECS  = 0.3    # minimum utterance duration (reject noise blips)
 VAD_MAX_SPEECH_SECS  = 30.0   # hard ceiling — force-flush long utterances
 ```
@@ -324,9 +357,11 @@ VAD_MAX_SPEECH_SECS  = 30.0   # hard ceiling — force-flush long utterances
 State machine per call:
 ```
 in_speech=False + rms >= threshold → in_speech=True, start accumulating
-in_speech=True  + silence > 0.7s  → flush to Sarvam STT (if duration >= 0.3s)
+in_speech=True  + silence > 0.5s  → flush to Sarvam STT (if duration >= 0.3s)
 in_speech=True  + duration >= 30s → force-flush to Sarvam STT
 ```
+
+`VAD_END_SECS` was reduced from 0.7s to 0.5s, saving 200ms per turn. Combined with the persistent `aiohttp.ClientSession()` (saves ~200-300ms TCP+TLS handshake per utterance), total latency savings per turn are ~400-500ms.
 
 ---
 
