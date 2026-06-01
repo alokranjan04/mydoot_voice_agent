@@ -19,9 +19,9 @@ from mydoot_functions import FUNCTION_MAP, send_call_summary_email, upload_recor
 # decrease if soft speech is being filtered out.
 NOISE_GATE_RMS             = int(os.getenv("NOISE_GATE_RMS", "100"))
 NOISE_GATE_FALLBACK_RMS             = int(os.getenv("NOISE_GATE_FALLBACK_RMS", "20"))
-NOISE_GATE_FALLBACK_AFTER_S         = float(os.getenv("NOISE_GATE_FALLBACK_AFTER_S", "2.0"))
-NOISE_GATE_FALLBACK_FULL_DISABLE_S  = float(os.getenv("NOISE_GATE_FALLBACK_FULL_DISABLE_S", "7.0"))
-NOISE_GATE_FALLBACK_FULL_COUNT      = int(os.getenv("NOISE_GATE_FALLBACK_FULL_COUNT", "40"))
+NOISE_GATE_FALLBACK_AFTER_S         = float(os.getenv("NOISE_GATE_FALLBACK_AFTER_S", "1.5"))
+NOISE_GATE_FALLBACK_FULL_DISABLE_S  = float(os.getenv("NOISE_GATE_FALLBACK_FULL_DISABLE_S", "4.0"))
+NOISE_GATE_FALLBACK_FULL_COUNT      = int(os.getenv("NOISE_GATE_FALLBACK_FULL_COUNT", "20"))
 NOISE_GATE_FALLBACK_ENABLED         = os.getenv("NOISE_GATE_FALLBACK", "1").lower() in ("1", "true", "yes")
 # Keep forwarding audio for this many seconds after the last speech packet,
 # so the tail of each utterance reaches Gemini intact.
