@@ -446,13 +446,15 @@ async def gemini_handler(request):
                 transcript_log.append(line)
                 log(f"🗣  {line}")
                 last_customer_ts = time.time()
-                if not g_ws.closed:
+                try:
                     await g_ws.send(json.dumps({
                         "clientContent": {
                             "turns": [{"role": "user", "parts": [{"text": transcript}]}],
                             "turnComplete": True,
                         }
                     }))
+                except Exception as send_err:
+                    log(f"❌ Gemini WS send failed after STT: {send_err}")
 
             async for msg in ws:
                 if time.time() - call_start_ts > MAX_CALL_SECS:
