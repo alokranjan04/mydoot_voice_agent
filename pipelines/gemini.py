@@ -44,8 +44,9 @@ BARGE_IN_SUSTAIN_SECS  = float(os.getenv("BARGE_IN_SUSTAIN_SECS", "0.3"))
 RECORD_CALLS               = os.getenv("RECORD_CALLS", "0").lower() in ("1", "true", "yes")
 RECORDINGS_DIR             = os.getenv("RECORDINGS_DIR", "recordings")
 # Hard time ceiling on audio forwarding after save. The confirmation is ~6s.
-# Set large enough to survive a slow Sheets API (cold-start can be 5-8s).
-MAX_CONFIRMATION_AUDIO_SECS = 12.0
+# 8s gives enough room for the message to complete and cuts off any Gemini
+# repetition (the model occasionally repeats the closing line twice).
+MAX_CONFIRMATION_AUDIO_SECS = 8.0
 # Minimum post-save audio that must have played before a turnComplete is
 # allowed to close the call. The wait message ("Ek second...") is ~2s.
 # Requiring 2.5s ensures the wait-message's own turnComplete is NOT treated
@@ -115,6 +116,14 @@ async def _sarvam_stt(pcm8_bytes: bytes,
     if not pcm8_bytes or not SARVAM_API_KEY:
         return ""
     try:
+        # Normalise amplitude — PSTN calls are often quiet (peak RMS 300–800).
+        # Boosting to a target peak near 24000 (75% of 16-bit max) improves
+        # Sarvam's recognition of soft speech and short Hindi phonemes.
+        peak = audioop.max(pcm8_bytes, 2)
+        if 0 < peak < 12000:
+            gain = min(24000 / peak, 8.0)   # cap at 8× to avoid noise blowup
+            pcm8_bytes = audioop.mul(pcm8_bytes, 2, gain)
+
         buf = io.BytesIO()
         with wave.open(buf, "wb") as wf:
             wf.setnchannels(1)
@@ -729,30 +738,30 @@ async def gemini_handler(request):
                 _words  = transcript.strip().split()
                 _clean_t = transcript.strip().rstrip("।.?! ").lower()
 
-                if service_graph.pending is not None:
-                    _pf = service_graph.pending["field"]
-                    _pv = service_graph.pending["value"]
-                    if _is_confirmation(_clean_t):
-                        service_graph.confirm_pending()
-                        log(f"✅ Confirmed {_pf!r} = {_pv!r} → stage={service_graph.current_stage()!r}")
-                    else:
-                        # Correction or ambiguous — discard old pending
-                        service_graph.clear_pending()
-                        log(f"🔄 Correction for {_pf!r}: {transcript!r} — re-capturing")
-                        # If the correction itself looks like a valid value, store it as new pending
-                        if _pf == "address" and len(_words) >= 2:
-                            service_graph.set_pending("address", transcript.strip())
-                        elif _pf == "preferred_time" and len(_words) >= 1:
-                            service_graph.set_pending("preferred_time", transcript.strip())
-                        # customer_name: too ambiguous to parse from a correction phrase — let Gemini re-ask
-                elif _cur == "address" and len(_words) >= 2:
-                    service_graph.set_pending("address", transcript.strip())
+                # ── Address and preferred_time: capture immediately, no confirmation ──
+                # Only customer_name uses the confirmation loop (to avoid
+                # saving a completely misheared name to Google Sheets).
+                if _cur == "address" and len(_words) >= 2:
+                    service_graph.on_field_collected("address", transcript.strip())
                 elif _cur == "preferred_time" and len(_words) >= 1:
-                    service_graph.set_pending("preferred_time", transcript.strip())
+                    service_graph.on_field_collected("preferred_time", transcript.strip())
                 elif _cur == "customer_name" and len(_words) >= 1:
-                    # Don't treat a bare affirmative as the customer's name
-                    if _clean_t not in _NAME_AFFIRMATIONS:
-                        service_graph.set_pending("customer_name", transcript.strip())
+                    if service_graph.pending is not None:
+                        # Waiting to confirm the captured name
+                        _pv = service_graph.pending["value"]
+                        if _is_confirmation(_clean_t):
+                            service_graph.confirm_pending()
+                            log(f"✅ Name confirmed: {_pv!r} → stage=done")
+                        else:
+                            # Customer gave a different/corrected name — re-capture
+                            service_graph.clear_pending()
+                            log(f"🔄 Name correction: {transcript!r} — re-capturing")
+                            if _clean_t not in _NAME_AFFIRMATIONS:
+                                service_graph.set_pending("customer_name", transcript.strip())
+                    else:
+                        # First time hearing the name — store as pending for confirmation
+                        if _clean_t not in _NAME_AFFIRMATIONS:
+                            service_graph.set_pending("customer_name", transcript.strip())
                 stage_ctx = service_graph.get_context()
                 full_text = f"{stage_ctx}\n\nCustomer: {transcript}"
                 log(f"📋 Stage: {service_graph.current_stage()}")
