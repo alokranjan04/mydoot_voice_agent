@@ -776,15 +776,23 @@ def get_stage_context(state: ServiceState) -> str:
         )
 
     elif stage == "customer_name":
-        instruction = "ASK: May I have your name to register the request?"
+        instruction = (
+            "ASK the customer's name directly — do NOT ask yes/no permission. "
+            "Hinglish: 'Aapka naam kya hai?' / English: 'What is your name?' "
+            "One direct question only. If customer responds with only 'haan', 'ji', 'yes', or "
+            "any affirmative without stating a name — ask again: 'Kripya apna naam batayein.'"
+        )
 
     elif stage == "done":
         summary = json.dumps(collected, ensure_ascii=False)
         instruction = (
             f"ALL FIELDS COLLECTED: {summary}. "
-            "Say ONLY 'Ek second, register ho raha hai.' THEN immediately call "
-            "save_service_request tool with all collected values. "
-            "After tool success, speak confirmation starting with customer's name, then STOP."
+            "Call save_service_request tool IMMEDIATELY — do NOT say anything to the customer "
+            "before calling the tool. After tool success, speak the confirmation — "
+            "first word must be the customer's name: "
+            "'[name] ji, aapki request register ho gayi hai. Hamari team jald se jald, "
+            "ek ghante ke andar aapse sampark karegi. My Doot ko call karne ke liye shukriya!' "
+            "Then go COMPLETELY SILENT."
         )
 
     else:
@@ -802,6 +810,49 @@ def get_stage_context(state: ServiceState) -> str:
     return "\n".join(lines)
 
 
+def get_confirmation_context(state: ServiceState, field: str, value: str) -> str:
+    """
+    Generate [STAGE CONTEXT] for the confirmation sub-step.
+    Injected when the pipeline has captured a value but is waiting for
+    the customer to say haan/yes before the stage advances.
+    """
+    collected = {}
+    for k in ["category", "subcategory", "issue_type", "brand", "model",
+              "severity", "error_code", "address", "preferred_time", "customer_name"]:
+        if state.get(k):
+            collected[k] = state[k]
+
+    field_display = {
+        "address": "address",
+        "preferred_time": "preferred time",
+        "customer_name": "name",
+    }.get(field, field)
+
+    next_hint = {
+        "address": "advance to preferred_time",
+        "preferred_time": "advance to customer_name",
+        "customer_name": "advance to done, then call save_service_request immediately",
+    }.get(field, "advance to next step")
+
+    instruction = (
+        f"You just collected {field_display} = \"{value}\". "
+        f"CONFIRM with a brief echo — one sentence only: "
+        f"Hinglish — \"{value}, sahi hai?\" / English — \"{value} — is that correct?\" "
+        f"If customer says haan/yes/theek/bilkul/sahi/correct → {next_hint}. "
+        f"If customer says nahi/no or gives a different value → note the correction and confirm the new value before advancing."
+    )
+
+    lines = [
+        "[STAGE CONTEXT — follow these instructions for this turn]",
+        f"Stage       : confirming {field_display}",
+    ]
+    if collected:
+        lines.append(f"Collected   : {json.dumps(collected, ensure_ascii=False)}")
+    lines.append(f"Instruction : {instruction}")
+    lines.append("[END STAGE CONTEXT]")
+    return "\n".join(lines)
+
+
 # ── Lightweight state machine ─────────────────────────────────────────────────
 
 class ServiceGraph:
@@ -815,6 +866,7 @@ class ServiceGraph:
     def __init__(self):
         self.state: ServiceState = initial_state()
         self._graph = self._build_graph() if LANGGRAPH_AVAILABLE else None
+        self._pending: Optional[dict] = None  # {"field": str, "value": str} — awaiting confirmation
 
     def _build_graph(self):
         from langgraph.graph import StateGraph as SG, END as LG_END
@@ -855,8 +907,32 @@ class ServiceGraph:
 
     # ── Public API ────────────────────────────────────────────────────────
 
+    @property
+    def pending(self) -> Optional[dict]:
+        """Currently pending field/value awaiting customer confirmation, or None."""
+        return self._pending
+
+    def set_pending(self, field: str, value: str) -> None:
+        """Store a captured value pending confirmation. Does NOT advance stage yet."""
+        self._pending = {"field": field, "value": value}
+
+    def confirm_pending(self) -> None:
+        """Customer confirmed — commit the pending value and advance the stage."""
+        if self._pending:
+            field, value = self._pending["field"], self._pending["value"]
+            self._pending = None
+            self.on_field_collected(field, value)
+
+    def clear_pending(self) -> None:
+        """Customer corrected or unclear — discard pending without advancing."""
+        self._pending = None
+
     def get_context(self) -> str:
         """Return the [STAGE CONTEXT] block to prepend to this Gemini turn."""
+        if self._pending:
+            return get_confirmation_context(
+                self.state, self._pending["field"], self._pending["value"]
+            )
         return get_stage_context(self.state)
 
     def on_field_collected(self, field: str, value: str):

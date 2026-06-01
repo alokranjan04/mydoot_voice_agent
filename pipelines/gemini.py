@@ -259,6 +259,35 @@ _AGENT_STAGE_TRIGGERS: list[tuple[str, list[str]]] = [
     ]),
 ]
 
+# Confirmation words — customer agreeing that the agent's echo is correct.
+# Used in the pending-confirmation check to decide whether to commit a field.
+_CONFIRM_WORDS: frozenset = frozenset({
+    "हाँ", "हां", "ha", "haan", "han", "yes", "yeah", "yep",
+    "okay", "ok", "sure", "ji", "bilkul", "theek", "sahi", "correct",
+    "right", "absolutely", "perfect", "हाँ जी", "जी हाँ", "जी हां",
+    "theek hai", "sahi hai", "bilkul sahi", "haan ji", "ji haan",
+    "yes correct", "yes that's right", "yes that is correct",
+})
+
+def _is_confirmation(text: str) -> bool:
+    """
+    True if `text` is a short affirmative with no correction/denial content.
+    Confirmation: 'haan', 'theek hai', 'sahi hai', 'yes correct' (≤5 words).
+    NOT a confirmation: 'nahi', 'galat', 'actually', 'different', corrections.
+    """
+    t = text.strip().rstrip("।.?! ").lower()
+    words = t.split()
+    if len(words) > 5:
+        return False
+    has_affirm = any(w in _CONFIRM_WORDS for w in words) or t in _CONFIRM_WORDS
+    has_denial = any(re.search(p, t) for p in [
+        r"\bnahi\b", r"\bnahin\b", r"\bno\b", r"\bnot\b",
+        r"galat", r"गलत", r"नहीं", r"correction", r"different",
+        r"change", r"wrong", r"actually", r"instead",
+    ])
+    return has_affirm and not has_denial
+
+
 # Short affirmative words/phrases that must NOT be treated as the customer's name.
 # When customer says "जी हाँ" at the customer_name stage they are agreeing to give
 # their name — not stating it. Filtering these prevents wrong name capture.
@@ -688,22 +717,42 @@ async def gemini_handler(request):
                 # accurate for this turn (e.g. customer said "टू व्हीलर" in
                 # their first message → advance past subcategory stage now).
                 _update_stage_from_customer(transcript, service_graph)
-                # Advance late-stage fields so Gemini sees the *next* stage
-                # in [STAGE CONTEXT] on THIS turn. On the customer_name turn
-                # this produces stage="done" with ALL FIELDS → Gemini calls
-                # save_service_request immediately, no extra round-trip.
-                _cur = service_graph.current_stage()
-                _words = transcript.strip().split()
-                if _cur == "address" and len(_words) >= 2:
-                    service_graph.on_field_collected("address", transcript.strip())
+                # ── Late-stage field collection with confirmation ──────────
+                # Each of address / preferred_time / customer_name goes through
+                # a two-step cycle:
+                #   1. Customer provides value → set_pending (stage unchanged)
+                #   2. Gemini echoes value ("X, sahi hai?") → customer confirms
+                #      → confirm_pending() → stage advances
+                # If customer corrects instead of confirming, we store the new
+                # value as the next pending and confirm that one instead.
+                _cur    = service_graph.current_stage()
+                _words  = transcript.strip().split()
+                _clean_t = transcript.strip().rstrip("।.?! ").lower()
+
+                if service_graph.pending is not None:
+                    _pf = service_graph.pending["field"]
+                    _pv = service_graph.pending["value"]
+                    if _is_confirmation(_clean_t):
+                        service_graph.confirm_pending()
+                        log(f"✅ Confirmed {_pf!r} = {_pv!r} → stage={service_graph.current_stage()!r}")
+                    else:
+                        # Correction or ambiguous — discard old pending
+                        service_graph.clear_pending()
+                        log(f"🔄 Correction for {_pf!r}: {transcript!r} — re-capturing")
+                        # If the correction itself looks like a valid value, store it as new pending
+                        if _pf == "address" and len(_words) >= 2:
+                            service_graph.set_pending("address", transcript.strip())
+                        elif _pf == "preferred_time" and len(_words) >= 1:
+                            service_graph.set_pending("preferred_time", transcript.strip())
+                        # customer_name: too ambiguous to parse from a correction phrase — let Gemini re-ask
+                elif _cur == "address" and len(_words) >= 2:
+                    service_graph.set_pending("address", transcript.strip())
                 elif _cur == "preferred_time" and len(_words) >= 1:
-                    service_graph.on_field_collected("preferred_time", transcript.strip())
+                    service_graph.set_pending("preferred_time", transcript.strip())
                 elif _cur == "customer_name" and len(_words) >= 1:
-                    # Don't treat a bare affirmative ("जी हाँ", "haan", "yes") as
-                    # the customer's name — they're agreeing to give it, not stating it.
-                    _clean_t = transcript.strip().rstrip("।.?!").lower()
+                    # Don't treat a bare affirmative as the customer's name
                     if _clean_t not in _NAME_AFFIRMATIONS:
-                        service_graph.on_field_collected("customer_name", transcript.strip())
+                        service_graph.set_pending("customer_name", transcript.strip())
                 stage_ctx = service_graph.get_context()
                 full_text = f"{stage_ctx}\n\nCustomer: {transcript}"
                 log(f"📋 Stage: {service_graph.current_stage()}")
