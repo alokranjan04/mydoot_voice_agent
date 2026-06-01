@@ -11,6 +11,7 @@ from aiohttp import web
 
 from config.settings import APP_CONFIG, GEMINI_API_KEY, GEMINI_WS_URL, SARVAM_API_KEY
 from core.state_engine import ConversationStateEngine
+from core.service_graph import ServiceGraph
 from mydoot_functions import FUNCTION_MAP, send_call_summary_email, upload_recording_to_gcs
 
 # ── Sarvam Saaras v3 STT ─────────────────────────────────────────────────────
@@ -140,6 +141,7 @@ async def gemini_handler(request):
 
     caller_id      = request.query.get("caller_id", "Unknown")
     state_engine   = ConversationStateEngine()
+    service_graph  = ServiceGraph()
     transcript_log = []     # ["Agent: ...", "Customer: ..."]
     call_ts        = datetime.now().strftime("%Y%m%d_%H%M%S")
     pcm8_frames    = []     # raw 8kHz PCM16 frames for WAV recording (RECORD_CALLS=1)
@@ -275,12 +277,12 @@ async def gemini_handler(request):
                                 # can close the call — prevents the wait-message's own
                                 # turnComplete from triggering a close when the Sheets
                                 # API returns in <80ms (faster than the audio arrives).
+                                pcm24 = base64.b64decode(part["inlineData"]["data"])
                                 if save_done_ts > 0:
                                     confirmation_audio_secs += len(pcm24) / 48000
                                 if not greeting_started:
                                     greeting_started = True
                                     log("🔊 Greeting audio started streaming to caller")
-                                pcm24 = base64.b64decode(part["inlineData"]["data"])
                                 pcm8, downsample_state = audioop.ratecv(
                                     pcm24, 2, 1, 24000, 8000, downsample_state
                                 )
@@ -359,8 +361,13 @@ async def gemini_handler(request):
                                             state_engine.set_data(k, args[k])
                                     args.setdefault("caller_id", caller_id)
 
-                                if fn == "save_customer_feedback" and save_executed:
-                                    log("⚠️  Duplicate save_customer_feedback call — skipping. "
+                                if fn == "save_service_request":
+                                    service_graph.on_tool_call(args)
+                                    args.setdefault("caller_id", caller_id)
+
+                                is_save_fn = fn in ("save_customer_feedback", "save_service_request")
+                                if is_save_fn and save_executed:
+                                    log(f"⚠️  Duplicate {fn} call — skipping. "
                                         "Returning success so Gemini doesn't retry.")
                                     await g_ws.send(json.dumps({
                                         "toolResponse": {
@@ -374,7 +381,7 @@ async def gemini_handler(request):
                                 elif fn in FUNCTION_MAP:
                                     res = await asyncio.to_thread(FUNCTION_MAP[fn], **args)
                                     log(f"🔧 Tool result: {res}")
-                                    if fn == "save_customer_feedback" and res.get("success"):
+                                    if is_save_fn and res.get("success"):
                                         save_executed = True
                                         save_done_ts = time.time()
                                         log("🔒 Post-save guard active — blocking audio for 15s")
@@ -446,10 +453,13 @@ async def gemini_handler(request):
                 transcript_log.append(line)
                 log(f"🗣  {line}")
                 last_customer_ts = time.time()
+                stage_ctx = service_graph.get_context()
+                full_text = f"{stage_ctx}\n\nCustomer: {transcript}"
+                log(f"📋 Stage: {service_graph.current_stage()}")
                 try:
                     await g_ws.send(json.dumps({
                         "clientContent": {
-                            "turns": [{"role": "user", "parts": [{"text": transcript}]}],
+                            "turns": [{"role": "user", "parts": [{"text": full_text}]}],
                             "turnComplete": True,
                         }
                     }))

@@ -7,6 +7,8 @@ psutil==6.1.1
 PyPDF2==3.0.1
 python-multipart==0.0.20
 
+langgraph>=0.2
+
 # Optional / Helper dependencies
 google-api-python-client==2.155.0
 google-auth-httplib2==0.2.0

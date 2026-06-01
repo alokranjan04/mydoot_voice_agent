@@ -352,6 +352,79 @@ def upload_recording_to_gcs(local_path: str, caller_id: str) -> str:
         return ""
 
 
+def save_service_request(customer_name, category, subcategory, problem,
+                          address, preferred_time,
+                          brand="", model="",
+                          caller_id=""):
+    """
+    Save a structured service request to Google Sheets (LangGraph pipeline).
+
+    Sheet columns (A–J):
+      A: Customer Name | B: Category | C: Subcategory | D: Problem
+      E: Brand | F: Model | G: Address | H: Preferred Time
+      I: Timestamp | J: Caller ID
+    """
+    print(f"[SERVICE REQUEST]: Saving — Customer={customer_name}, "
+          f"Category={category}, Sub={subcategory}")
+    print(f"[SERVICE REQUEST]: SpreadsheetID={SPREADSHEET_ID!r}")
+    try:
+        service, spreadsheet_id = _get_sheets_service()
+        if not service:
+            print("[SERVICE REQUEST ERROR]: No Sheets service — check GOOGLE_CREDENTIALS")
+            return {"success": False, "message": "Google Sheets credentials not found."}
+
+        # Write new header row if sheet is empty
+        try:
+            result = service.spreadsheets().values().get(
+                spreadsheetId=spreadsheet_id, range="Sheet1!A1:J1"
+            ).execute()
+            if not result.get("values"):
+                headers = [[
+                    "Customer Name", "Category", "Subcategory", "Problem",
+                    "Brand", "Model", "Address", "Preferred Time",
+                    "Timestamp", "Caller ID",
+                ]]
+                service.spreadsheets().values().update(
+                    spreadsheetId=spreadsheet_id,
+                    range="Sheet1!A1:J1",
+                    valueInputOption="RAW",
+                    body={"values": headers},
+                ).execute()
+                print("[SHEETS]: Header row written.")
+        except Exception as e:
+            print(f"[SHEETS HEADER WARNING]: {e}")
+
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        values = [[
+            customer_name,
+            category,
+            subcategory,
+            problem,
+            brand or "",
+            model or "",
+            address,
+            preferred_time,
+            timestamp,
+            caller_id,
+        ]]
+
+        result = service.spreadsheets().values().append(
+            spreadsheetId=spreadsheet_id,
+            range="Sheet1!A2",
+            valueInputOption="RAW",
+            insertDataOption="INSERT_ROWS",
+            body={"values": values},
+        ).execute()
+
+        cells = result.get("updates", {}).get("updatedCells", "?")
+        print(f"[SERVICE REQUEST]: Saved — {cells} cells updated.")
+        return {"success": True}
+    except Exception as e:
+        print(f"[SERVICE REQUEST ERROR]: {e}")
+        return {"success": False, "message": str(e)}
+
+
 FUNCTION_MAP = {
     "save_customer_feedback": save_customer_feedback,
+    "save_service_request":   save_service_request,
 }
