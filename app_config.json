@@ -18,7 +18,7 @@
                 "type": "function",
                 "function": {
                     "name": "save_customer_feedback",
-                    "description": "Call this ONLY after collecting ALL 5 pieces of information: customer_name, product_name, usage_duration, warranty_status, and complaint. Saves feedback to Google Sheets.",
+                    "description": "MANDATORY: Call this immediately after collecting ALL 7 fields. Do NOT say complaint is registered without calling this tool first.",
                     "parameters": {
                         "type": "object",
                         "properties": {
@@ -26,13 +26,21 @@
                                 "type": "string",
                                 "description": "Full name of the customer"
                             },
-                            "product_name": {
+                            "brand": {
                                 "type": "string",
-                                "description": "Name of the Mydoot product the customer uses"
+                                "description": "Brand or company name of the appliance, e.g. Samsung, LG, Voltas, Whirlpool. For home service jobs (plumbing, carpentry, electrical, etc.) use 'N/A'."
+                            },
+                            "item": {
+                                "type": "string",
+                                "description": "Type of appliance, device, or home service. For appliance repair: TV, Refrigerator, Washing Machine, AC, Geyser, Laptop, etc. For home services: Plumbing, Carpentry, Electrical Work, Waterproofing/Seelan, Painting, CCTV Installation, etc."
+                            },
+                            "product_used_since": {
+                                "type": "string",
+                                "description": "When the customer started using the product or when the problem began, e.g. '2022', 'January 2023', '3 saal pehle'"
                             },
                             "usage_duration": {
                                 "type": "string",
-                                "description": "How long the customer has been using the product, e.g. '6 months', '2 years'"
+                                "description": "How long the product has been in use or how long the problem has existed, e.g. '2 years', '6 months', '3 saal'"
                             },
                             "warranty_status": {
                                 "type": "string",
@@ -45,10 +53,14 @@
                             },
                             "complaint": {
                                 "type": "string",
-                                "description": "The customer's complaint or feedback about the product"
+                                "description": "Detailed description of the customer's complaint or issue"
+                            },
+                            "area": {
+                                "type": "string",
+                                "description": "Society name and area/locality — required for home service jobs (plumbing, carpentry, electrical, etc.), optional for appliance repair"
                             }
                         },
-                        "required": ["customer_name", "product_name", "usage_duration", "warranty_status", "complaint"]
+                        "required": ["customer_name", "brand", "item", "product_used_since", "usage_duration", "warranty_status", "complaint"]
                     }
                 }
             }
@@ -102,7 +114,7 @@
             }
         ]
     },
-    "active_provider": "google",
+    "active_provider": "sarvam",
     "parameters": {
         "sarvam": {
             "model": "sarvam-30b",

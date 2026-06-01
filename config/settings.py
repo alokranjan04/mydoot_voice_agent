@@ -17,10 +17,15 @@ GEMINI_WS_URL = (
     f".v1beta.GenerativeService.BidiGenerateContent?key={GEMINI_API_KEY}"
 )
 
-# SIMPLIFIED STT URL
+# Deepgram streaming STT
+# encoding=mulaw matches Vobiz audio/x-mulaw;rate=8000
+# sample_rate=8000 must match the actual Vobiz stream rate
+# endpointing=400 — detect end-of-speech after 400ms silence
+# utterance_end_ms=1000 — flush partial hypothesis after 1s gap
 DG_URL = (
     "wss://api.deepgram.com/v1/listen"
-    "?model=nova-2&language=hi&encoding=mulaw&sample_rate=16000&interim_results=true"
+    "?model=nova-2&language=hi&encoding=mulaw&sample_rate=8000"
+    "&interim_results=true&endpointing=400&utterance_end_ms=1000"
 )
 
 _CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "app_config.json")
