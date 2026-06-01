@@ -179,17 +179,20 @@ def _ensure_header_row(service, spreadsheet_id):
 def save_customer_feedback(customer_name, brand, item,
                            product_used_since, usage_duration,
                            warranty_status, complaint,
-                           caller_id=""):
+                           caller_id="", area=""):
     """
     Save customer feedback to Google Sheets.
 
     Sheet columns (A–I):
       A: Customer Name | B: Brand  | C: Item
       D: Product Used Since | E: Usage Duration | F: Warranty Status
-      G: Complaint | H: Timestamp | I: Caller ID
+      G: Complaint (includes Area for home service jobs) | H: Timestamp | I: Caller ID
     """
     print(f"[FEEDBACK]: Saving — Customer={customer_name}, Brand={brand}, Item={item}")
     print(f"[FEEDBACK]: SpreadsheetID={SPREADSHEET_ID!r} | GOOGLE_CREDENTIALS set={bool(os.getenv('GOOGLE_CREDENTIALS'))}")
+    # Append area to complaint for home service jobs
+    if area and area.strip():
+        complaint = f"{complaint} | Area: {area.strip()}"
     try:
         service, spreadsheet_id = _get_sheets_service()
         if not service:

@@ -40,6 +40,10 @@ NOISE_GATE_DEBUG           = os.getenv("NOISE_GATE_DEBUG", "0").lower() in ("1",
 # Use these WAV files with test_asr_compare.py to benchmark ASR services.
 RECORD_CALLS               = os.getenv("RECORD_CALLS", "0").lower() in ("1", "true", "yes")
 RECORDINGS_DIR             = os.getenv("RECORDINGS_DIR", "recordings")
+# Max seconds of Gemini audio to forward after save_customer_feedback succeeds.
+# The confirmation message is ~5-6s. After this window, all audio is blocked so
+# the model cannot play the confirmation a second time in the same turn.
+MAX_CONFIRMATION_AUDIO_SECS = 8.0
 
 
 def _ts():
@@ -220,6 +224,16 @@ async def gemini_handler(request):
                             if part.get("inlineData"):
                                 if confirmation_done:
                                     continue  # hard-block any audio after confirmation
+                                # Time-based cutoff: both confirmation utterances arrive before
+                                # turnComplete fires, so we can't rely on the flag alone.
+                                # Block audio > MAX_CONFIRMATION_AUDIO_SECS after save.
+                                if (save_done_ts > 0 and
+                                        time.time() - save_done_ts > MAX_CONFIRMATION_AUDIO_SECS):
+                                    if not confirmation_done:
+                                        confirmation_done = True
+                                        log(f"🔇 Post-save audio cutoff ({MAX_CONFIRMATION_AUDIO_SECS}s) — blocking")
+                                        asyncio.create_task(_close_after(ws, g_ws, 0.0, log))
+                                    continue
                                 if not greeting_started:
                                     greeting_started = True
                                     log("🔊 Greeting audio started streaming to caller")
