@@ -130,8 +130,8 @@ Vobiz WebSocket (mu-law 8kHz)
         │
         ▼ Local VAD (RMS threshold = 100)
           in_speech=False + rms >= 100 → start accumulating
-          in_speech=True  + silence > 0.4s → flush to Sarvam STT
-          utterance < 0.5s → discard (reject noise blips)
+          in_speech=True  + silence > 0.3s → flush to Sarvam STT
+          utterance < 0.3s → discard (reject noise blips)
         │
         ▼ Sarvam Saaras v3 REST API (POST, hi-IN, 8kHz WAV)
           Persistent aiohttp.ClientSession() per call — reuses TCP connection
@@ -141,7 +141,7 @@ Vobiz WebSocket (mu-law 8kHz)
 
 Customer audio is **never** sent raw to Gemini. Only clean text transcripts go to the LLM, eliminating hallucinations caused by PSTN line noise.
 
-**`waiting_for_gemini` flag:** Set `True` after each `clientContent` send. Dropped utterances while the flag is set prevent the 1008 "policy violation" WebSocket error caused by sending two turns before Gemini responds.
+**`waiting_for_gemini` flag:** Set `True` after each `clientContent` send. Dropped utterances while the flag is set prevent the 1008 "policy violation" WebSocket error caused by sending two turns before Gemini responds. Barge-in resets this to `False` so the interrupting utterance is not dropped.
 
 ### Think + Speak: Gemini Live
 
@@ -186,14 +186,36 @@ if res.get("success"):
     asyncio.create_task(_close_after(ws, g_ws, 15.0))  # fallback close timer
 ```
 
+### Barge-in Detection
+
+When the customer starts speaking while the agent is talking, barge-in stops the agent's audio immediately:
+
+```
+VAD loop (while agent is speaking):
+  rms >= BARGE_IN_RMS_THRESHOLD (350) for >= BARGE_IN_SUSTAIN_SECS (0.3s)
+        │
+        ▼  Confirmed human interruption (not fan/background noise)
+  barge_in_active = True
+  {"event": "clear"} → Vobiz (stops audio playback on caller's phone)
+  waiting_for_gemini = False (allow new utterance through)
+  barge-in frames → speech_buf (utterance start not lost)
+        │
+  g_receiver: all new Gemini audio chunks are dropped while barge_in_active=True
+        │
+  Customer utterance → STT → Gemini → barge_in_active = False (on send)
+```
+
+**Two-threshold design**: VAD threshold (100 RMS) catches all speech. Barge-in threshold (350 RMS) is 3.5× higher — fan hum, TV, and ambient noise stay below 350; a person speaking into a phone handset exceeds it. The 0.3s sustain requirement further rejects transient loud sounds (door slams, coughs).
+
 ### Audio Blocking Guards
 
-Four layers prevent audio from disrupting the conversation:
+Five layers prevent audio from disrupting the conversation:
 
 | Guard | Trigger | Effect |
 |-------|---------|--------|
 | **Greeting guard** | startup | Block all customer audio until first `turnComplete` fires (greeting done) |
 | **Echo guard** | per turn | 0.3s silence buffer after `turnComplete` — prevents agent audio echoing back |
+| **Barge-in guard** | `barge_in_active=True` | Drop Gemini audio chunks after customer interrupts — prevents overlap |
 | **Concurrent-send guard** | `waiting_for_gemini=True` | Drop new VAD utterances while Gemini is processing — prevents 1008 errors |
 | **Post-save guard** | `save_done_ts > 0` | Block ALL customer audio after save — call is ending |
 

@@ -21,13 +21,21 @@ SARVAM_STT_URL = "https://api.sarvam.ai/speech-to-text"
 # RMS threshold: packets below this are silence / line noise, not forwarded.
 VAD_SPEECH_THRESHOLD  = int(os.getenv("VAD_SPEECH_THRESHOLD",  "100"))
 # Seconds of silence after speech that signals end-of-utterance.
-# 0.5s balances responsiveness vs. cutting off slow speakers.
-# Raise to 0.7 via env if callers are frequently getting cut off.
-VAD_END_SECS          = float(os.getenv("VAD_END_SECS",          "0.4"))
+# 0.3s keeps latency low; raise to 0.5 via env if callers get cut off.
+VAD_END_SECS          = float(os.getenv("VAD_END_SECS",          "0.3"))
 # Minimum utterance duration to bother sending to STT (avoids noise blips).
-VAD_MIN_SPEECH_SECS   = float(os.getenv("VAD_MIN_SPEECH_SECS",  "0.5"))
+# 0.3s catches short responses like "LG", "haan", "kal" (0.5 would drop these).
+VAD_MIN_SPEECH_SECS   = float(os.getenv("VAD_MIN_SPEECH_SECS",  "0.3"))
 # Hard ceiling — force-flush utterance if customer speaks this long non-stop.
 VAD_MAX_SPEECH_SECS   = float(os.getenv("VAD_MAX_SPEECH_SECS",  "30.0"))
+
+# ── Barge-in detection ────────────────────────────────────────────────────────
+# RMS threshold for barge-in — much higher than VAD_SPEECH_THRESHOLD so that
+# fan noise and background sounds do NOT trigger it; only nearby human speech.
+BARGE_IN_RMS_THRESHOLD = int(os.getenv("BARGE_IN_RMS_THRESHOLD", "350"))
+# Seconds of sustained above-threshold RMS required to confirm barge-in.
+# Prevents single loud noises (door slam, cough) from cutting off the agent.
+BARGE_IN_SUSTAIN_SECS  = float(os.getenv("BARGE_IN_SUSTAIN_SECS", "0.3"))
 
 # ── Call recording ────────────────────────────────────────────────────────────
 # Set RECORD_CALLS=1 to save each call's inbound PSTN audio as a WAV file.
@@ -245,11 +253,20 @@ _AGENT_STAGE_TRIGGERS: list[tuple[str, list[str]]] = [
         r"\bwhen\b.{0,30}\b(visit|come|technician|would you like)\b",
     ]),
     ("customer_name", [
-        r"\bapna\s+naam\b", r"\byour\s+name\b",
-        r"\bnaam\b.{0,30}(batayein|chahiye|register|darj|kya\s+hai)",
-        r"\bname\b.{0,20}(please|register|may i have)",
+        r"\bapna\s+naam\b", r"\baapka\s+naam\b", r"\byour\s+name\b",
+        r"\bnaam\b.{0,40}(batayein|chahiye|register|darj|kya\s+hai|jaan\s+sak)",
+        r"\bname\b.{0,20}(please|register|may i have|what is)",
     ]),
 ]
+
+# Short affirmative words/phrases that must NOT be treated as the customer's name.
+# When customer says "जी हाँ" at the customer_name stage they are agreeing to give
+# their name — not stating it. Filtering these prevents wrong name capture.
+_NAME_AFFIRMATIONS: frozenset = frozenset({
+    "हाँ", "हां", "ha", "haan", "yes", "okay", "ok", "sure",
+    "ji", "bilkul", "theek hai", "theek", "sahi",
+    "जी हाँ", "जी हां", "हाँ जी", "हां जी", "ji haan", "ji ha", "ji han",
+})
 
 
 def _update_stage_from_customer(transcript: str, sg: ServiceGraph) -> None:
@@ -404,6 +421,8 @@ async def gemini_handler(request):
                             if part.get("inlineData"):
                                 if confirmation_done:
                                     continue  # hard-block any audio after confirmation
+                                if barge_in_active:
+                                    continue  # customer interrupted — drop remaining agent audio
                                 # Time-based cutoff: block audio > MAX_CONFIRMATION_AUDIO_SECS
                                 # after save. Prevents double-confirmation even when both
                                 # utterances arrive before a single turnComplete fires.
@@ -634,6 +653,10 @@ async def gemini_handler(request):
             speech_start_ts   = 0.0
             vad_last_speech   = 0.0   # time of last above-threshold packet
             in_speech         = False
+            # Barge-in state
+            barge_in_buf      = []    # accumulate frames during potential barge-in
+            barge_in_start_ts = 0.0   # when high-RMS streak started
+            barge_in_active   = False  # True = drop Gemini audio; customer interrupted
 
             # Persistent HTTP session reuses TCP connection across all STT
             # calls in this call, avoiding TCP+TLS handshake overhead (~200ms)
@@ -642,7 +665,7 @@ async def gemini_handler(request):
 
             async def _stt_and_send(pcm8_bytes: bytes):
                 """Transcribe utterance and send text turn to Gemini Live."""
-                nonlocal last_customer_ts, waiting_for_gemini
+                nonlocal last_customer_ts, waiting_for_gemini, barge_in_active
                 t0 = time.time()
                 transcript = await _sarvam_stt(pcm8_bytes, session=sarvam_session)
                 stt_ms = int((time.time() - t0) * 1000)
@@ -676,7 +699,11 @@ async def gemini_handler(request):
                 elif _cur == "preferred_time" and len(_words) >= 1:
                     service_graph.on_field_collected("preferred_time", transcript.strip())
                 elif _cur == "customer_name" and len(_words) >= 1:
-                    service_graph.on_field_collected("customer_name", transcript.strip())
+                    # Don't treat a bare affirmative ("जी हाँ", "haan", "yes") as
+                    # the customer's name — they're agreeing to give it, not stating it.
+                    _clean_t = transcript.strip().rstrip("।.?!").lower()
+                    if _clean_t not in _NAME_AFFIRMATIONS:
+                        service_graph.on_field_collected("customer_name", transcript.strip())
                 stage_ctx = service_graph.get_context()
                 full_text = f"{stage_ctx}\n\nCustomer: {transcript}"
                 log(f"📋 Stage: {service_graph.current_stage()}")
@@ -687,7 +714,8 @@ async def gemini_handler(request):
                             "turnComplete": True,
                         }
                     }))
-                    waiting_for_gemini = True  # block new utterances until Gemini responds
+                    waiting_for_gemini = True   # block new utterances until Gemini responds
+                    barge_in_active   = False   # clear interrupt flag — new response incoming
                     log(f"📤 Gemini send OK (+{int((time.time()-t0)*1000)}ms total)")
                 except Exception as send_err:
                     log(f"❌ Gemini WS send failed after STT: {send_err}")
@@ -739,8 +767,44 @@ async def gemini_handler(request):
                             log("⏱ Inactivity — no customer speech for 25s, closing")
                             break
 
-                        # ── VAD ───────────────────────────────────────────────
+                        # ── VAD + Barge-in ────────────────────────────────────
                         rms = audioop.rms(pcm8, 2)
+
+                        # ── Barge-in: stop agent audio when customer interrupts ─
+                        # Only fires while agent is actively speaking. Requires
+                        # BARGE_IN_SUSTAIN_SECS of sustained high-RMS so fan
+                        # noise and background sounds do NOT trigger it.
+                        _agent_speaking = (
+                            waiting_for_gemini
+                            and last_ai_audio_ts > 0
+                            and now - last_ai_audio_ts < 2.0
+                        )
+                        if _agent_speaking and not barge_in_active:
+                            if rms >= BARGE_IN_RMS_THRESHOLD:
+                                if barge_in_start_ts == 0.0:
+                                    barge_in_start_ts = now
+                                    barge_in_buf.clear()
+                                barge_in_buf.append(pcm8)
+                                if now - barge_in_start_ts >= BARGE_IN_SUSTAIN_SECS:
+                                    barge_in_active = True
+                                    log(f"⚡ Barge-in (rms={rms}, "
+                                        f"sustained={now - barge_in_start_ts:.2f}s) — stopping agent audio")
+                                    barge_in_start_ts = 0.0
+                                    if not ws.closed:
+                                        await ws.send_str(json.dumps({"event": "clear"}))
+                                    waiting_for_gemini = False  # let this utterance through
+                                    # Transfer barge-in frames → speech_buf (don't lose start)
+                                    speech_buf.clear()
+                                    speech_buf.extend(barge_in_buf)
+                                    barge_in_buf.clear()
+                                    in_speech       = True
+                                    speech_start_ts = now - BARGE_IN_SUSTAIN_SECS
+                                    vad_last_speech = now
+                            else:
+                                # RMS dropped below threshold — reset accumulator
+                                if barge_in_start_ts != 0.0:
+                                    barge_in_start_ts = 0.0
+                                    barge_in_buf.clear()
 
                         if rms >= VAD_SPEECH_THRESHOLD:
                             if not in_speech:
