@@ -1,6 +1,6 @@
 # PRD: Mydoot Customer Care — AI Voice Agent
 
-**Version:** 4.0
+**Version:** 4.1
 **Owner:** Alok Ranjan
 **Phone Number:** +917971542939
 **Last Updated:** June 2026
@@ -93,6 +93,7 @@ Fields collected:
 - Accept category/subcategory hints from natural description: "mere fridge mein paani aa raha hai" → category=Appliance Repair, subcategory=Refrigerator
 - Never go silent — if unclear, ask one short clarifying question
 - If customer gives garbled or inaudible response, ask once to repeat
+- **Confirm before advancing**: after each field is provided, echo it back and ask "sahi hai?" / "is that correct?" — only move to the next field after the customer confirms. If customer corrects, echo the new value and confirm again before advancing.
 
 ### FR-5: Data Persistence
 - On completing all required fields, call `save_service_request` tool immediately
@@ -102,7 +103,7 @@ Fields collected:
 - `save_executed` flag prevents duplicate Sheet rows per session
 
 ### FR-6: Post-Save Confirmation
-- Before calling the tool: say exactly "Ek second, register ho raha hai." (Hinglish) or "One moment, registering now." (English)
+- Call `save_service_request` tool IMMEDIATELY when all fields are confirmed — do NOT say anything to the customer before the tool call
 - After save succeeds, speak the confirmation message exactly once — first word must be the customer's name:
   - Hinglish: "[name] ji, aapki request register ho gayi hai. Hamari team jald se jald, ek ghante ke andar aapse sampark karegi. My Doot ko call karne ke liye shukriya!"
   - English: "[name], your request has been registered. Our team will contact you as soon as possible, within an hour. Thank you for calling My Doot!"
@@ -120,11 +121,12 @@ Fields collected:
 - Female verb forms for self-reference in Hindi: "kar sakti hoon", "karungi", "bataungi"
 - Gender-neutral forms when addressing the customer: "kar rahe hain" (not "kar rahi hain")
 
-### FR-9: Noise Rejection (VAD)
+### FR-9: Noise Rejection (VAD) and Barge-in
 - Customer audio is processed through a local Voice Activity Detector (VAD) before STT
 - Only audio above RMS threshold (default: 100) is sent to Sarvam Saaras v3
-- Utterances shorter than 0.3s are discarded (avoids noise blips)
+- Utterances shorter than 0.3 s are discarded (avoids noise blips); silence gap of 0.3 s ends utterance
 - This prevents PSTN line noise from triggering hallucinated transcriptions
+- **Barge-in**: when the customer speaks while the agent is talking, a sustained RMS ≥ 350 for ≥ 0.3 s stops the agent's audio immediately (Vobiz `{"event": "clear"}`) and processes the customer's interruption. The high threshold (3.5× VAD) ensures fan noise and background sounds do NOT trigger barge-in.
 
 ---
 
@@ -133,7 +135,7 @@ Fields collected:
 | Requirement | Target |
 |-------------|--------|
 | Call answer latency | < 3 seconds from ring to greeting |
-| Agent response latency (TTFT) | < 2 seconds per turn (VAD_END_SECS=0.4 + persistent aiohttp session + TTL-cached Sheets service) |
+| Agent response latency (TTFT) | < 3 seconds per turn (VAD_END_SECS=0.3 + VAD_MIN=0.3 + persistent aiohttp session + TTL-cached Sheets service) |
 | Google Sheets write success | > 99% |
 | Concurrent calls supported | 10 |
 | Uptime | 99.5% (Cloud Run managed) |
@@ -170,7 +172,7 @@ Sheet ID: `1uW39kklQKc4rhf5REATgKqgwbvSNAhlDVKXyAzOMKCk`
 - **STT**: Sarvam Saaras v3 REST API (`saaras:v3`, hi-IN, 8kHz WAV) — replaces Gemini native audio input to eliminate PSTN noise hallucinations
 - **Language model**: Google Gemini 2.5 Flash Native Audio (BidiGenerateContent, text-in / audio-out)
 - **Conversation orchestration**: LangGraph `StateGraph` via `core/service_graph.py`; `DIAGNOSTIC_FLOWS` dict with 20 subcategory fault trees; `diagnosis` stage between subcategory and brand
-- **STT latency optimization**: Persistent `aiohttp.ClientSession()` per call (avoids TCP+TLS handshake per utterance, saves ~200–300ms); `VAD_END_SECS` default 0.4s (tunable via env var), down from 0.7s
+- **STT latency optimization**: Persistent `aiohttp.ClientSession()` per call (avoids TCP+TLS handshake per utterance, saves ~200–300ms); `VAD_END_SECS` default 0.3 s, `VAD_MIN_SPEECH_SECS` default 0.3 s (catches short responses like "LG", "haan", "kal")
 - **Sheets latency optimization**: `_get_sheets_service()` caches the service object with a 3000s TTL (saves ~500ms discovery-doc + TCP handshake per save); `headers_written` flag skips ~300ms header GET on subsequent saves; stale-connection auto-retry on connection errors
 - **Telephony**: Vobiz SIP (+917971542939)
 - **Audio codec**: mu-law 8kHz (Vobiz ↔ server), PCM 24kHz (Gemini → server)

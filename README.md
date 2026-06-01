@@ -12,8 +12,10 @@ A customer calls **+917971542939**. The AI agent:
 1. Answers immediately with a Hinglish greeting, then auto-detects language (English or Hinglish)
 2. Conducts the entire call in English if the customer responds in English, otherwise Hinglish
 3. Identifies the service category (Appliance Repair, Plumbing, Electrical, Carpentry, Cleaning, Vehicle Service, or Other) and guides through subcategory, structured diagnosis (issue type + severity), address, and preferred visit time
-4. Saves a structured 11-field service request to Google Sheets
-5. Emails the full call transcript to the admin after every call
+4. **Confirms each collected field** by echoing it back ("Sector 15, Noida, sahi hai?") — only advances after the customer confirms; corrects if the customer gives a different value
+5. Supports **barge-in** — if the customer speaks while the agent is talking, agent audio stops immediately (RMS threshold filters out background noise/fan sounds)
+6. Saves a structured 11-field service request to Google Sheets
+7. Emails the full call transcript to the admin after every call
 
 No hold music. No missed calls. No incomplete forms.
 
@@ -84,11 +86,15 @@ Customer responds → Sarvam Saaras v3 STT transcribes
                      *(skipped for Car Wash, Tyre Change, Battery Replacement, all Cleaning)*
   4. brand         — only for Appliance Repair and Car/Bike Service
                      *(skipped for Plumbing, Electrical, Carpentry, Cleaning, Car Wash, Tyre Change, Battery)*
-  5. address       — society name + area/locality for technician visit
-  6. preferred_time — when to send the technician
-  7. customer_name — collected LAST
+  5. address       — customer provides → agent echoes "X, sahi hai?" → customer confirms
+  6. preferred_time — customer provides → agent echoes → customer confirms
+  7. customer_name — collected LAST; same confirm loop
       ↓
-All fields collected → save_service_request() tool call
+Each of steps 5–7 uses a two-step confirmation cycle:
+  Customer provides value → agent echoes it → customer confirms → stage advances
+  (If customer corrects: new value is echoed and confirmed before advancing)
+      ↓
+Customer confirms name → save_service_request() tool call IMMEDIATELY
       ↓
 Agent: "[name] ji, aapki request register ho gayi hai. Hamari team jald se jald, ek ghante ke andar aapse sampark karegi."
       ↓

@@ -148,8 +148,14 @@ Customer audio is **never** sent raw to Gemini. Only clean text transcripts go t
 ```
 _stt_and_send():
   1. ServiceGraph keyword extraction → advance category/subcategory
-  2. Late-stage field advancement → advance address/preferred_time/customer_name
+  2. Late-stage confirmation loop (address / preferred_time / customer_name):
+       If service_graph.pending is set:
+         → _is_confirmation(text)? → confirm_pending() → stage advances
+         → else (correction)      → clear_pending(); re-capture new value as pending
+       Else (no pending yet):
+         → set_pending(field, value) — stage stays; Gemini will echo for confirmation
   3. service_graph.get_context() → [STAGE CONTEXT] block
+       (returns confirmation context if pending, otherwise regular stage context)
   4. Gemini clientContent turn:
      { "clientContent": { "turns": [{ "role": "user", "parts": [{ "text": "[STAGE CONTEXT]\n\nCustomer: ..." }] }], "turnComplete": true } }
   5. waiting_for_gemini = True
@@ -275,15 +281,24 @@ Gemini asks ONE diagnosis question: "Kya cooling bhi band ho gayi hai?"
         ▼ customer says "Samsung"
 [STAGE CONTEXT: stage=address] → Gemini: "Aapka address kya hai?"
         │
-        ▼ customer gives address — pipeline advances stage to preferred_time
+        ▼ customer gives address → set_pending("address", "Sector 15, Noida")
+[STAGE CONTEXT: confirming address] → Gemini: "Sector 15, Noida, sahi hai?"
+        │
+        ▼ customer says "haan" → confirm_pending() → stage=preferred_time
 [STAGE CONTEXT: stage=preferred_time] → Gemini: "Aap technician ko kab bulana chahte hain?"
         │
-        ▼ customer gives preferred time — pipeline advances stage to customer_name
+        ▼ customer gives time → set_pending("preferred_time", "kal subah 10 baje")
+[STAGE CONTEXT: confirming preferred_time] → Gemini: "Kal subah 10 baje, sahi hai?"
+        │
+        ▼ customer says "haan" → confirm_pending() → stage=customer_name
 [STAGE CONTEXT: stage=customer_name] → Gemini: "Aapka naam kya hai?"
         │
-        ▼ customer says name — pipeline advances stage to done
+        ▼ customer says name → set_pending("customer_name", "Alok Ranjan")
+[STAGE CONTEXT: confirming name] → Gemini: "Alok Ranjan, sahi hai?"
+        │
+        ▼ customer says "haan" → confirm_pending() → stage=done
 [STAGE CONTEXT: stage=done, Collected: {ALL FIELDS}]
-Gemini: "Ek second, register ho raha hai." → calls save_service_request()
+Gemini calls save_service_request() IMMEDIATELY — no wait message before tool call
         │
         ▼ Google Sheets: new row appended (11 columns)
 Gemini: "[name] ji, aapki request register ho gayi hai. Hamari team jald se jald, ek ghante ke andar aapse sampark karegi. My Doot ko call karne ke liye shukriya!"

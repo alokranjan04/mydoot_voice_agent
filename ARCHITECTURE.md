@@ -60,10 +60,12 @@ Customer audio is never sent raw to Gemini. Only clean text transcripts are sent
 │ mu-law 8kHz          │    │ PCM 24kHz               │
 │ → ulaw2lin → PCM 8k  │    │ → ratecv(24000→8000)    │
 │                      │    │ → lin2ulaw              │
-│ VAD: RMS threshold   │    │ → mu-law 8kHz           │
+│ VAD: RMS ≥ 100       │    │ → mu-law 8kHz           │
 │ accumulate speech    │    │ → Vobiz playAudio        │
-│ end on 0.4s silence  │    │                         │
-│ min 0.5s utterance   │    │ Tracks turnComplete:    │
+│ end on 0.3s silence  │    │ (blocked if barge_in_   │
+│ min 0.3s utterance   │    │  active=True)           │
+│                      │    │                         │
+│ Barge-in: RMS ≥ 350  │    │ Tracks turnComplete:    │
 │                      │    │ flushes transcript buf  │
 │ Sarvam Saaras v3     │    │ sets gemini_turn_end_ts │
 │ REST → transcript    │    │                         │
@@ -110,8 +112,8 @@ Vobiz WebSocket frame
   Linear PCM, 8kHz, mono, 16-bit
         │
         ▼ Local VAD (RMS threshold = 100)
-  Speech frames accumulated; silence > 0.4s triggers flush (VAD_END_SECS, tunable via env var)
-  Utterances < 0.5s discarded (noise blips)
+  Speech frames accumulated; silence > 0.3s triggers flush (VAD_END_SECS, tunable via env var)
+  Utterances < 0.3s discarded (noise blips)
         │
         ▼ Sarvam Saaras v3 REST  (POST /speech-to-text)
   Persistent aiohttp.ClientSession() per call — avoids TCP+TLS handshake per utterance (~200-300ms saved)
@@ -217,22 +219,36 @@ Customer: fridge mein bilkul thanda nahi ho raha
 
 This block tells Gemini exactly which stage it's in, what's collected, and what single question to ask next.
 
-#### Late-Stage Field Advancement (Latency Optimization)
+#### Confirmation Loop (Late-Stage Fields)
 
-`pipelines/gemini.py` calls `on_field_collected()` for the current late-stage field **before** calling `get_context()`:
+Each of the three late-stage fields — address, preferred_time, customer_name — goes through a two-step confirmation cycle before the stage advances:
 
-```python
-_cur = service_graph.current_stage()
-if _cur == "address":
-    service_graph.on_field_collected("address", transcript)
-elif _cur == "preferred_time":
-    service_graph.on_field_collected("preferred_time", transcript)
-elif _cur == "customer_name":
-    service_graph.on_field_collected("customer_name", transcript)
-stage_ctx = service_graph.get_context()  # now shows the *next* stage
+```
+1. Customer provides value  → set_pending(field, value)   [stage unchanged]
+2. Gemini echoes the value  → "Sector 15, Noida, sahi hai?"
+3. Customer confirms        → confirm_pending()            [stage advances]
+   Customer corrects        → clear_pending() + set_pending(field, newValue) [re-confirm]
 ```
 
-On the customer_name turn, stage advances to `"done"` before `get_context()` runs → Gemini sees `ALL FIELDS COLLECTED` in its context on the same turn and calls `save_service_request` immediately, eliminating a 5–10 s reasoning round-trip.
+`ServiceGraph` stores the pending field/value in `self._pending`. `get_context()` returns `get_confirmation_context()` when pending is set — injecting a confirmation-specific `[STAGE CONTEXT]` block that tells Gemini exactly what to echo and when to advance. Only after customer confirms does `confirm_pending()` call `on_field_collected()` and advance the stage.
+
+```python
+# _stt_and_send() — late-stage with confirmation
+if service_graph.pending is not None:
+    if _is_confirmation(_clean_t):          # "haan", "sahi hai", "yes correct"
+        service_graph.confirm_pending()     # commits field, advances stage
+    else:
+        service_graph.clear_pending()       # discard; re-capture if correction
+        if pf == "address" and len(_words) >= 2:
+            service_graph.set_pending("address", transcript.strip())
+        elif pf == "preferred_time":
+            service_graph.set_pending("preferred_time", transcript.strip())
+elif _cur == "address" and len(_words) >= 2:
+    service_graph.set_pending("address", transcript.strip())
+# ... preferred_time, customer_name same pattern
+```
+
+On the customer_name confirmation turn, `confirm_pending()` calls `on_field_collected("customer_name", ...)` which advances stage to `"done"`. `get_context()` then returns the done instruction → Gemini calls `save_service_request` immediately on that same turn — no extra round-trip.
 
 #### Agent Speech–Based Stage Advancement (Tool Hallucination Fix)
 
@@ -269,9 +285,9 @@ Combined flow (e.g. Electrical / Short Circuit — no keyword subcat patterns):
 
 ---
 
-## 5. Echo Guard and Audio Blocking Logic
+## 5. Echo Guard, Barge-in, and Audio Blocking Logic
 
-Four distinct audio control layers protect conversation integrity:
+Five distinct audio control layers protect conversation integrity:
 
 ### Layer 1 — Greeting Guard (startup)
 All customer audio is blocked until the first `turnComplete` event fires (`greeting_done` flag). Prevents background noise from interrupting the greeting. Safety release: force-released at 20 seconds.
@@ -279,11 +295,21 @@ All customer audio is blocked until the first `turnComplete` event fires (`greet
 ### Layer 2 — Echo Guard (per turn)
 After every `turnComplete`, a 0.3-second buffer blocks customer audio. Prevents Gemini's own audio being echoed back as customer speech. Safety timeout releases guard if `turnComplete` is missing for > 8 seconds after last audio.
 
-### Layer 3 — Post-Save Guard (end of call)
+### Layer 3 — Barge-in Guard (mid-agent-speech)
+While the agent is actively speaking (`waiting_for_gemini=True` and recent AI audio), the VAD loop monitors for a sustained high-RMS signal:
+
+```python
+BARGE_IN_RMS_THRESHOLD = 350   # 3.5× higher than VAD threshold — filters fan/background noise
+BARGE_IN_SUSTAIN_SECS  = 0.3   # sustained human speech, not a door slam or cough
+```
+
+When confirmed: `barge_in_active=True` is set → `{"event": "clear"}` is sent to Vobiz (stops audio playback) → `g_receiver` drops all subsequent Gemini audio chunks → accumulated frames are seeded into `speech_buf` (utterance start preserved) → `waiting_for_gemini=False` (utterance allowed through). Clears when next STT turn is sent to Gemini.
+
+### Layer 4 — Post-Save Guard (end of call)
 After `save_service_request` succeeds, ALL customer audio (from Vobiz) is blocked — `save_done_ts` is set and the VAD loop skips all packets.
 
-### Layer 4 — Confirmation Audio Guard (close timing)
-`confirmation_audio_secs` (float) accumulates PCM bytes of Gemini audio played after save. A `turnComplete` can only trigger call close when `confirmation_audio_secs >= 2.5` seconds. This prevents the wait-message ("Ek second...") ~2s `turnComplete` from prematurely closing the call before the ~6s confirmation plays.
+### Layer 5 — Confirmation Audio Guard (close timing)
+`confirmation_audio_secs` (float) accumulates PCM bytes of Gemini audio played after save. A `turnComplete` can only trigger call close when `confirmation_audio_secs >= 2.5` seconds. Prevents any premature close before the ~6s confirmation message completes.
 
 ```
 Fallback close: asyncio.create_task(_close_after(ws, g_ws, 15.0)) is always created on save,
@@ -405,28 +431,35 @@ service.spreadsheets().values().append(
 Local VAD runs before Sarvam STT. It eliminates PSTN line noise from ever reaching the ASR engine.
 
 ```python
-VAD_SPEECH_THRESHOLD = 100    # RMS amplitude gate
-VAD_END_SECS         = 0.4    # silence after speech to end utterance (tunable via VAD_END_SECS env var)
-VAD_MIN_SPEECH_SECS  = 0.5    # minimum utterance duration (reject noise blips)
-VAD_MAX_SPEECH_SECS  = 30.0   # hard ceiling — force-flush long utterances
+VAD_SPEECH_THRESHOLD   = 100    # RMS amplitude gate for speech detection
+VAD_END_SECS           = 0.3    # silence after speech to end utterance (tunable via env var)
+VAD_MIN_SPEECH_SECS    = 0.3    # minimum utterance duration — catches short responses like "LG", "haan"
+VAD_MAX_SPEECH_SECS    = 30.0   # hard ceiling — force-flush long utterances
+
+BARGE_IN_RMS_THRESHOLD = 350    # high-RMS threshold: fan/background noise stays below this
+BARGE_IN_SUSTAIN_SECS  = 0.3    # sustained duration to confirm human interruption vs. single loud noise
 ```
 
 State machine per call:
 ```
-in_speech=False + rms >= threshold → in_speech=True, start accumulating
-in_speech=True  + silence > 0.4s  → flush to Sarvam STT (if duration >= 0.5s)
+in_speech=False + rms >= 100  → in_speech=True, start accumulating
+in_speech=True  + silence > 0.3s → flush to Sarvam STT (if duration >= 0.3s)
 in_speech=True  + duration >= 30s → force-flush to Sarvam STT
+
+barge-in detection (agent speaking):
+  rms >= 350 sustained >= 0.3s → clear Vobiz audio, barge_in_active=True
 ```
 
 **Latency reductions (cumulative per turn):**
 
 | Optimization | Savings |
 |---|---|
-| `VAD_END_SECS` 0.7 → 0.4 s | ~300 ms |
+| `VAD_END_SECS` 0.7 → 0.3 s | ~400 ms |
+| `VAD_MIN_SPEECH_SECS` 0.5 → 0.3 s | prevents dropped short responses (saves re-ask round-trip) |
 | Persistent `aiohttp.ClientSession()` per call (Sarvam STT) | ~200–300 ms |
 | Cached Sheets service (TTL 3000 s) | ~500 ms per save |
 | `headers_written` flag (skip GET on each save) | ~300 ms per save |
-| Late-stage field advancement (skip save round-trip) | ~5–10 s on name turn |
+| Confirmation loop: confirm_pending() → stage=done on name turn | ~5–10 s saved vs extra round-trip |
 
 ---
 
