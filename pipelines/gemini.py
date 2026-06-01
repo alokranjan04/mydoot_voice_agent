@@ -40,11 +40,14 @@ NOISE_GATE_DEBUG           = os.getenv("NOISE_GATE_DEBUG", "0").lower() in ("1",
 # Use these WAV files with test_asr_compare.py to benchmark ASR services.
 RECORD_CALLS               = os.getenv("RECORD_CALLS", "0").lower() in ("1", "true", "yes")
 RECORDINGS_DIR             = os.getenv("RECORDINGS_DIR", "recordings")
-# Max seconds of Gemini audio to forward after save_customer_feedback succeeds.
-# The confirmation message is ~5-7s. After this window, audio is blocked so
-# the model cannot play the confirmation a second time. Set generously to
-# accommodate slow saves (Sheets cold start can take several seconds).
+# Hard time ceiling on audio forwarding after save. The confirmation is ~6s.
+# Set large enough to survive a slow Sheets API (cold-start can be 5-8s).
 MAX_CONFIRMATION_AUDIO_SECS = 12.0
+# Minimum post-save audio that must have played before a turnComplete is
+# allowed to close the call. The wait message ("Ek second...") is ~2s.
+# Requiring 2.5s ensures the wait-message's own turnComplete is NOT treated
+# as the confirmation-done signal, even when the tool call arrives early.
+CONFIRMATION_MIN_AUDIO_SECS = 2.5
 
 
 def _ts():
@@ -181,7 +184,7 @@ async def gemini_handler(request):
             save_done_ts            = 0.0   # timestamp when save_customer_feedback succeeded
             save_executed           = False  # prevent duplicate save calls per session
             confirmation_done       = False  # True once confirmation audio is blocked
-            confirmation_audio_sent = False  # True once any audio is forwarded AFTER toolResponse
+            confirmation_audio_secs = 0.0   # seconds of audio forwarded after save_done_ts set
             guard_log_ts       = 0.0   # throttle echo-guard log spam
             agent_buf          = ""    # accumulate agent speech chunks per turn
             customer_buf       = ""    # accumulate customer speech chunks per utterance
@@ -189,7 +192,7 @@ async def gemini_handler(request):
             async def g_receiver():
                 nonlocal downsample_state, last_ai_audio_ts, gemini_turn_end_ts
                 nonlocal greeting_started, greeting_done, save_done_ts, save_executed
-                nonlocal confirmation_done, confirmation_audio_sent, agent_buf, customer_buf
+                nonlocal confirmation_done, confirmation_audio_secs, agent_buf, customer_buf
                 try:
                     async for raw_msg in g_ws:
                         data = json.loads(raw_msg)
@@ -236,12 +239,13 @@ async def gemini_handler(request):
                                         log(f"🔇 Post-save audio cutoff ({MAX_CONFIRMATION_AUDIO_SECS}s) — blocking")
                                         asyncio.create_task(_close_after(ws, g_ws, 0.0, log))
                                     continue
-                                # Track that confirmation audio has started flowing
-                                # (audio arriving AFTER the tool response was sent).
-                                # This prevents the wait-message's turnComplete from
-                                # triggering a close when save completes very quickly.
+                                # Accumulate post-save audio seconds. Requires
+                                # CONFIRMATION_MIN_AUDIO_SECS before any turnComplete
+                                # can close the call — prevents the wait-message's own
+                                # turnComplete from triggering a close when the Sheets
+                                # API returns in <80ms (faster than the audio arrives).
                                 if save_done_ts > 0:
-                                    confirmation_audio_sent = True
+                                    confirmation_audio_secs += len(pcm24) / 48000
                                 if not greeting_started:
                                     greeting_started = True
                                     log("🔊 Greeting audio started streaming to caller")
@@ -276,19 +280,17 @@ async def gemini_handler(request):
                                 log(f"🔔 turnComplete — GREETING DONE, customer audio now live "
                                     f"(last audio {ai_dur:.2f}s ago)")
                             elif save_done_ts > 0:
-                                if confirmation_audio_sent and not confirmation_done:
-                                    # Confirmation audio was sent AND turn ended = spoken once.
-                                    # Close immediately so Gemini can't start a second utterance.
+                                if confirmation_audio_secs >= CONFIRMATION_MIN_AUDIO_SECS and not confirmation_done:
+                                    # Enough confirmation audio has played — close now.
                                     confirmation_done = True
-                                    log("✅ Confirmation turnComplete — closing now")
+                                    log(f"✅ Confirmation turnComplete (audio={confirmation_audio_secs:.1f}s) — closing")
                                     asyncio.create_task(_close_after(ws, g_ws, 0.0, log))
                                 elif confirmation_done:
                                     log("⚠️  Extra turnComplete after confirmation — ignoring")
                                 else:
-                                    # save_done but no confirmation audio yet: this is the
-                                    # wait-message's turnComplete (race: save completed before
-                                    # wait-message finished). Do NOT close — wait for confirmation.
-                                    log("ℹ️  turnComplete after save — confirmation audio not yet started")
+                                    # Not enough audio yet — this is the wait-message's turnComplete
+                                    # (save completed before wait-message audio arrived). Do NOT close.
+                                    log(f"ℹ️  turnComplete after save — audio {confirmation_audio_secs:.1f}s < {CONFIRMATION_MIN_AUDIO_SECS}s, waiting for confirmation")
                             else:
                                 log(f"🔔 turnComplete — echo guard releases in 1.0s "
                                     f"(last audio {ai_dur:.2f}s ago)")
