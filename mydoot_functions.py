@@ -15,7 +15,9 @@ import time
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
+
+_IST = timezone(timedelta(hours=5, minutes=30))
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
@@ -224,7 +226,7 @@ def save_customer_feedback(customer_name, brand, item,
 
         _ensure_header_row(service, spreadsheet_id)
 
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        timestamp = datetime.now(_IST).strftime("%Y-%m-%d %H:%M:%S")
         values = [[
             customer_name,
             brand,
@@ -272,7 +274,7 @@ def send_call_summary_email(caller_id: str, transcript_lines: list):
         print("[EMAIL ERROR]: GMAIL_APP_PASSWORD env var is missing — cannot send email.")
         return
 
-    ts      = datetime.now().strftime("%Y-%m-%d %H:%M IST")
+    ts      = datetime.now(_IST).strftime("%Y-%m-%d %H:%M IST")
     subject = f"MyDoot Call Transcript — Caller: {caller_id} — {ts}"
     body_lines = [
         "MyDoot Customer Care — Call Summary",
@@ -352,7 +354,7 @@ def upload_recording_to_gcs(local_path: str, caller_id: str) -> str:
         bucket = client.bucket(bucket_name)
 
         filename   = os.path.basename(local_path)
-        date_str   = datetime.now().strftime("%Y-%m-%d")
+        date_str   = datetime.now(_IST).strftime("%Y-%m-%d")
         blob_name  = f"recordings/{caller_id}/{date_str}/{filename}"
 
         blob = bucket.blob(blob_name)
@@ -389,7 +391,7 @@ def save_service_request(customer_name, category, subcategory, issue_type,
           f"Category={category}, Sub={subcategory}, Issue={issue_type}")
     print(f"[SERVICE REQUEST]: SpreadsheetID={SPREADSHEET_ID!r}")
 
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    timestamp = datetime.now(_IST).strftime("%Y-%m-%d %H:%M:%S")
     values = [[
         customer_name, category, subcategory, issue_type,
         brand or "", model or "", severity or "",
