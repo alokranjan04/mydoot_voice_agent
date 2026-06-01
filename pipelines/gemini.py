@@ -3,7 +3,7 @@
 Gemini Live Multimodal pipeline for Mydoot Customer Care.
 Uses websockets library + BidiGenerateContent (v1beta) — audio in / audio out.
 """
-import asyncio, audioop, base64, json, os, time, traceback
+import asyncio, audioop, base64, json, os, time, traceback, wave
 from datetime import datetime
 import aiohttp
 import websockets
@@ -11,7 +11,7 @@ from aiohttp import web
 
 from config.settings import APP_CONFIG, GEMINI_API_KEY, GEMINI_WS_URL
 from core.state_engine import ConversationStateEngine
-from mydoot_functions import FUNCTION_MAP, send_call_summary_email
+from mydoot_functions import FUNCTION_MAP, send_call_summary_email, upload_recording_to_gcs
 
 # ── Audio pipeline tuning ────────────────────────────────────────────────────
 # Packets below this RMS are treated as background noise (fan, line hiss, etc.)
@@ -35,6 +35,11 @@ SILENCE_SEND_SECS          = float(os.getenv("SILENCE_SEND_SECS", "5.0"))
 AUDIO_BATCH_FRAMES         = 4
 # Enable per-packet audio RMS debug logging for noise-gate tuning.
 NOISE_GATE_DEBUG           = os.getenv("NOISE_GATE_DEBUG", "0").lower() in ("1", "true", "yes")
+# Set RECORD_CALLS=1 to save each call's inbound PSTN audio as a WAV file.
+# Files are written to RECORDINGS_DIR (default: ./recordings/).
+# Use these WAV files with test_asr_compare.py to benchmark ASR services.
+RECORD_CALLS               = os.getenv("RECORD_CALLS", "0").lower() in ("1", "true", "yes")
+RECORDINGS_DIR             = os.getenv("RECORDINGS_DIR", "recordings")
 
 
 def _ts():
@@ -95,6 +100,8 @@ async def gemini_handler(request):
     caller_id      = request.query.get("caller_id", "Unknown")
     state_engine   = ConversationStateEngine()
     transcript_log = []     # ["Agent: ...", "Customer: ..."]
+    call_ts        = datetime.now().strftime("%Y%m%d_%H%M%S")
+    pcm8_frames    = []     # raw 8kHz PCM16 frames for WAV recording (RECORD_CALLS=1)
 
     def log(msg):
         print(f"[{_ts()}] caller={caller_id} | {msg}", flush=True)
@@ -245,9 +252,9 @@ async def gemini_handler(request):
                                     f"(last audio {ai_dur:.2f}s ago)")
                             elif save_done_ts > 0:
                                 # First turnComplete after save = confirmation finished
-                                # Close call immediately so Gemini can't repeat it
+                                # Close immediately (0.1s) so Gemini can't speak a second time
                                 log("✅ Confirmation turnComplete — closing call now")
-                                asyncio.create_task(_close_after(ws, g_ws, 0.5, log))
+                                asyncio.create_task(_close_after(ws, g_ws, 0.1, log))
                             else:
                                 log(f"🔔 turnComplete — echo guard releases in 1.0s "
                                     f"(last audio {ai_dur:.2f}s ago)")
@@ -266,6 +273,18 @@ async def gemini_handler(request):
                                 log(f"🔧 Tool call: {fn} | args={json.dumps(args)}")
 
                                 if fn == "save_customer_feedback":
+                                    # Normalize warranty_status — customers often say "1","2","3"
+                                    # when the agent presents numbered options verbally.
+                                    # Mapping prevents the raw digit from confusing the model
+                                    # and causing the "1111...1111" audio preamble bug.
+                                    w = args.get("warranty_status", "")
+                                    if w in ("1", "yes", "Yes", "YES", "haan", "ha", "ha ji"):
+                                        args["warranty_status"] = "Yes - Under Warranty"
+                                    elif w in ("2", "no", "No", "NO", "nahi", "nahin", "nahi ji"):
+                                        args["warranty_status"] = "No - Out of Warranty"
+                                    elif w in ("3", "pata nahi", "don't know", "dont know",
+                                               "unknown", "not sure", "nahi pata"):
+                                        args["warranty_status"] = "Customer Does Not Know"
                                     for k in ["customer_name", "brand", "item",
                                               "product_used_since", "usage_duration",
                                               "warranty_status", "complaint"]:
@@ -292,8 +311,8 @@ async def gemini_handler(request):
                                         save_executed = True
                                         save_done_ts = time.time()
                                         log("🔒 Post-save guard active — blocking audio for 15s")
-                                        # Schedule call close after 8s (confirmation takes ~5s)
-                                        asyncio.create_task(_close_after(ws, g_ws, 8.0, log))
+                                        # Fallback close after 6s if turnComplete never fires
+                                        asyncio.create_task(_close_after(ws, g_ws, 6.0, log))
                                     await g_ws.send(json.dumps({
                                         "toolResponse": {
                                             "functionResponses": [{
@@ -411,6 +430,8 @@ async def gemini_handler(request):
 
                         raw_mulaw = base64.b64decode(data["media"]["payload"])
                         pcm8  = audioop.ulaw2lin(raw_mulaw, 2)
+                        if RECORD_CALLS:
+                            pcm8_frames.append(pcm8)
                         pcm16, upsample_state = audioop.ratecv(
                             pcm8, 2, 1, 8000, 16000, upsample_state
                         )
@@ -520,6 +541,21 @@ async def gemini_handler(request):
     finally:
         elapsed = time.time() - (call_start_ts if 'call_start_ts' in dir() else time.time())
         log(f"📞 Call ended | duration={elapsed:.1f}s | transcript={len(transcript_log)} lines")
+        if RECORD_CALLS and pcm8_frames:
+            try:
+                os.makedirs(RECORDINGS_DIR, exist_ok=True)
+                wav_path = os.path.join(RECORDINGS_DIR, f"{caller_id}_{call_ts}.wav")
+                with wave.open(wav_path, "wb") as wf:
+                    wf.setnchannels(1)
+                    wf.setsampwidth(2)   # 16-bit PCM
+                    wf.setframerate(8000)
+                    wf.writeframes(b"".join(pcm8_frames))
+                log(f"🎙️  Recording saved → {wav_path} ({len(pcm8_frames)} frames, {elapsed:.0f}s)")
+                gcs_uri = await asyncio.to_thread(upload_recording_to_gcs, wav_path, caller_id)
+                if gcs_uri:
+                    log(f"☁️  Recording uploaded → {gcs_uri}")
+            except Exception as rec_err:
+                log(f"⚠️  Recording save failed: {rec_err}")
         log("📋 TRANSCRIPT:\n" + ("\n".join(transcript_log) if transcript_log else "  (empty)"))
         log("📧 Attempting transcript email ...")
         await asyncio.to_thread(send_call_summary_email, caller_id, transcript_log)

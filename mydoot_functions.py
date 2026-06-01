@@ -293,6 +293,62 @@ def send_call_summary_email(caller_id: str, transcript_lines: list):
         _tb.print_exc()
 
 
+def upload_recording_to_gcs(local_path: str, caller_id: str) -> str:
+    """
+    Upload a call recording WAV to Google Cloud Storage.
+
+    Returns the gs:// URI on success, empty string on failure or if not configured.
+
+    Required env var:
+        GCS_RECORDINGS_BUCKET  — GCS bucket name (e.g. "mydoot-call-recordings")
+
+    Optional env var:
+        GCS_DELETE_LOCAL       — set to "1" to delete the local WAV after upload
+    """
+    bucket_name = os.getenv("GCS_RECORDINGS_BUCKET", "").strip()
+    if not bucket_name:
+        return ""
+
+    try:
+        from google.cloud import storage as gcs
+    except ImportError:
+        print("[GCS] google-cloud-storage not installed — skipping upload")
+        return ""
+
+    creds_data = get_google_creds()
+    if not creds_data:
+        print("[GCS] No credentials — skipping upload")
+        return ""
+
+    try:
+        creds = service_account.Credentials.from_service_account_info(
+            creds_data,
+            scopes=["https://www.googleapis.com/auth/cloud-platform"],
+        )
+        client = gcs.Client(credentials=creds, project=creds_data.get("project_id"))
+        bucket = client.bucket(bucket_name)
+
+        filename   = os.path.basename(local_path)
+        date_str   = datetime.now().strftime("%Y-%m-%d")
+        blob_name  = f"recordings/{caller_id}/{date_str}/{filename}"
+
+        blob = bucket.blob(blob_name)
+        blob.upload_from_filename(local_path, content_type="audio/wav")
+
+        gcs_uri = f"gs://{bucket_name}/{blob_name}"
+        print(f"[GCS] Recording uploaded: {gcs_uri}")
+
+        if os.getenv("GCS_DELETE_LOCAL", "0").lower() in ("1", "true", "yes"):
+            os.remove(local_path)
+            print(f"[GCS] Local file deleted: {local_path}")
+
+        return gcs_uri
+
+    except Exception as e:
+        print(f"[GCS ERROR] Upload failed for {local_path}: {e}")
+        return ""
+
+
 FUNCTION_MAP = {
     "save_customer_feedback": save_customer_feedback,
 }
