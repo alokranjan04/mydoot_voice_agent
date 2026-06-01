@@ -293,6 +293,41 @@ def send_call_summary_email(caller_id: str, transcript_lines: list):
         _tb.print_exc()
 
 
+def transcribe_with_sarvam(wav_path: str) -> str:
+    """
+    Transcribe a call recording WAV using Sarvam Saaras V2 batch API.
+
+    Returns the transcript string on success, empty string on failure.
+    Requires SARVAM_API_KEY env var.
+    Sarvam has ~8% WER on Hindi vs ~22% for Gemini — gives more accurate
+    post-call transcripts for the email and Google Sheet review.
+    """
+    sarvam_key = os.getenv("SARVAM_API_KEY", "").strip()
+    if not sarvam_key:
+        return ""
+    if not os.path.isfile(wav_path):
+        print(f"[SARVAM STT]: File not found: {wav_path}")
+        return ""
+
+    try:
+        import requests as _req
+        with open(wav_path, "rb") as f:
+            resp = _req.post(
+                "https://api.sarvam.ai/speech-to-text",
+                headers={"api-subscription-key": sarvam_key},
+                files={"file": (os.path.basename(wav_path), f, "audio/wav")},
+                data={"model": "saaras:v2", "language_code": "hi-IN"},
+                timeout=120,
+            )
+        resp.raise_for_status()
+        text = resp.json().get("transcript", "").strip()
+        print(f"[SARVAM STT]: {len(text)} chars — {text[:120]}")
+        return text
+    except Exception as e:
+        print(f"[SARVAM STT ERROR]: {e}")
+        return ""
+
+
 def upload_recording_to_gcs(local_path: str, caller_id: str) -> str:
     """
     Upload a call recording WAV to Google Cloud Storage.

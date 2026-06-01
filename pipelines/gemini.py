@@ -11,7 +11,7 @@ from aiohttp import web
 
 from config.settings import APP_CONFIG, GEMINI_API_KEY, GEMINI_WS_URL
 from core.state_engine import ConversationStateEngine
-from mydoot_functions import FUNCTION_MAP, send_call_summary_email, upload_recording_to_gcs
+from mydoot_functions import FUNCTION_MAP, send_call_summary_email, upload_recording_to_gcs, transcribe_with_sarvam
 
 # ── Audio pipeline tuning ────────────────────────────────────────────────────
 # Packets below this RMS are treated as background noise (fan, line hiss, etc.)
@@ -542,6 +542,16 @@ async def gemini_handler(request):
                 gcs_uri = await asyncio.to_thread(upload_recording_to_gcs, wav_path, caller_id)
                 if gcs_uri:
                     log(f"☁️  Recording uploaded → {gcs_uri}")
+                # Sarvam post-call transcription — more accurate Hindi ASR (~8% WER)
+                log("🗣  Running Sarvam transcription on recording...")
+                sarvam_text = await asyncio.to_thread(transcribe_with_sarvam, wav_path)
+                if sarvam_text:
+                    transcript_log.append(
+                        f"\n─── Sarvam AI Transcription (hi-IN) ───\n{sarvam_text}"
+                    )
+                    log(f"🗣  Sarvam transcript: {sarvam_text[:120]}")
+                else:
+                    log("⚠️  Sarvam transcription returned empty (check SARVAM_API_KEY)")
             except Exception as rec_err:
                 log(f"⚠️  Recording save failed: {rec_err}")
         log("📋 TRANSCRIPT:\n" + ("\n".join(transcript_log) if transcript_log else "  (empty)"))
