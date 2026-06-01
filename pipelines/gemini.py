@@ -11,7 +11,7 @@ from aiohttp import web
 
 from config.settings import APP_CONFIG, GEMINI_API_KEY, GEMINI_WS_URL
 from core.state_engine import ConversationStateEngine
-from mydoot_functions import FUNCTION_MAP, send_call_summary_email
+from mydoot_functions import FUNCTION_MAP, send_call_summary_email, upload_recording_to_gcs
 
 # ── Audio pipeline tuning ────────────────────────────────────────────────────
 # Packets below this RMS are treated as background noise (fan, line hiss, etc.)
@@ -539,6 +539,9 @@ async def gemini_handler(request):
                     wf.setframerate(8000)
                     wf.writeframes(b"".join(pcm8_frames))
                 log(f"🎙️  Recording saved → {wav_path} ({len(pcm8_frames)} frames, {elapsed:.0f}s)")
+                gcs_uri = await asyncio.to_thread(upload_recording_to_gcs, wav_path, caller_id)
+                if gcs_uri:
+                    log(f"☁️  Recording uploaded → {gcs_uri}")
             except Exception as rec_err:
                 log(f"⚠️  Recording save failed: {rec_err}")
         log("📋 TRANSCRIPT:\n" + ("\n".join(transcript_log) if transcript_log else "  (empty)"))
