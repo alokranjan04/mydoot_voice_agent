@@ -1,22 +1,23 @@
 # PRD: Mydoot Customer Care — AI Voice Agent
 
-**Version:** 3.0
+**Version:** 4.0
 **Owner:** Alok Ranjan
 **Phone Number:** +917971542939
-**Last Updated:** May 2026
+**Last Updated:** June 2026
 
 ---
 
 ## 1. Problem Statement
 
-Home appliance customers have complaints — their TV won't turn on, the AC is not cooling, the washing machine leaks. When they call for help:
+Customers needing home services — appliance repair, plumbing, electrical work, carpentry, cleaning, vehicle service — call a number and often face:
 
-- Lines are often busy or unmanned outside business hours
-- Agents take details inconsistently (some miss the brand, some skip warranty status)
-- Data rarely makes it into a structured format for follow-up
-- Customers wait on hold, get frustrated, hang up
+- Lines busy or unmanned outside business hours
+- Agents taking details inconsistently (missing address, skipping problem description)
+- Data never entering a structured format for service dispatch
+- No confirmation that the request was logged
+- Customers waiting on hold, getting frustrated, hanging up
 
-**Result:** Complaints are lost, service teams have incomplete data, and customers feel unheard.
+**Result:** Service requests are lost, technicians lack context, and customers feel unheard.
 
 ---
 
@@ -24,10 +25,11 @@ Home appliance customers have complaints — their TV won't turn on, the AC is n
 
 An always-available AI voice agent that:
 1. Answers every call instantly, 24/7
-2. Asks language preference (English or Hinglish) and adapts immediately
-3. Collects all 7 required fields in a single conversation
-4. Saves a complete structured record to Google Sheets
-5. Emails the full transcript to the admin after every call
+2. Auto-detects language (English or Hinglish) after the first response
+3. Guides the customer through a structured service request form via natural conversation
+4. Uses LangGraph to orchestrate the conversation stage by stage
+5. Saves a complete 10-field structured record to Google Sheets
+6. Emails the full transcript to the admin after every call
 
 No hold time. No missed fields. No data entry lag.
 
@@ -37,8 +39,8 @@ No hold time. No missed fields. No data entry lag.
 
 | User | Role |
 |------|------|
-| End Customer | Calls to register a complaint about any home or office appliance |
-| Support Manager | Reviews Google Sheet, assigns service tickets |
+| End Customer | Calls to book a home or appliance service |
+| Technician Dispatcher | Reviews Google Sheet, assigns technicians |
 | Admin (Alok Ranjan) | Receives transcript emails, monitors system |
 
 ---
@@ -50,52 +52,57 @@ No hold time. No missed fields. No data entry lag.
 - No call should go unanswered due to concurrency limits (up to 10 simultaneous)
 - Call must work 24/7/365
 
-### FR-2: Bilingual Greeting and Language Selection
-- On call connect, the agent speaks a greeting that contains both English and Hindi phrases (one of 3 scripts, chosen randomly)
-- After the greeting, the agent asks the customer which language they prefer
-- If the customer says "English" or responds in clear English: conduct the entire call in English only
-- If the customer says "Hindi", responds in Hindi, or the response is unclear or mixed: conduct the entire call in Hinglish
+### FR-2: Language Auto-Detection (Silent)
+- On call connect, the agent speaks a Hinglish greeting (one of 3 scripts, chosen randomly)
+- After the customer's first full response, the agent silently detects language:
+  - Customer responds exclusively in clear English with no Hindi words → conduct entire call in English
+  - All other cases (Hindi, Hinglish, mixed, unclear, garbled, silent) → conduct entire call in Hinglish
 - Default when in doubt: Hinglish
-- The language choice is fixed for the rest of the call — no switching
+- Language is fixed for the rest of the call — no switching
+- Agent never asks the customer to choose a language
 
-### FR-3: 7-Field Data Collection
-The agent must collect all 7 fields before saving:
+### FR-3: Structured Service Request Collection (LangGraph-Guided)
+The agent uses LangGraph (`core/service_graph.py`) to guide the conversation through stages in order. A `[STAGE CONTEXT]` block is injected with each customer turn telling Gemini exactly what to ask next.
 
-| # | Field | Validation |
-|---|-------|-----------|
-| 1 | Complaint | Free text description of the problem |
-| 2 | Brand | Any brand (Samsung, Apple, LG, HP, Bajaj, etc.) |
-| 3 | Item | Any appliance or device — TV, laptop, AC, mixer, MacBook, etc. |
-| 4 | Product Used Since | Year or relative period (e.g., "2022", "3 saal pehle") |
-| 5 | Usage Duration | Duration (e.g., "3 saal", "6 mahine") |
-| 6 | Warranty Status | Enum: "Yes - Under Warranty" / "No - Out of Warranty" / "Customer Does Not Know" |
-| 7 | Customer Name | Free text, as spoken |
+Stage order:
+```
+category → subcategory → problem → brand* → address → preferred_time → customer_name → done
+*brand only asked for Appliance Repair and Vehicle Service categories
+```
 
-Fields 4 and 5 are collected with a single question ("How long have you been using it?"); the agent derives both from the customer's answer.
+Fields collected:
 
-### FR-4: Conversational Flow
-- First question after language selection: asks about the appliance and the problem simultaneously
-- Collects brand and item next (skipped if already mentioned)
-- Collects usage duration (fills both product_used_since and usage_duration from one answer)
-- Collects warranty status
-- Collects customer name LAST
-- One question at a time
-- Never asks for information the customer has already provided anywhere in the conversation
-- Accepts any device type — no restricted list
-- Smart brand detection: "MacBook" → brand=Apple, item=MacBook Laptop
+| # | Field | Required | Notes |
+|---|-------|----------|-------|
+| 1 | category | Yes | Detected from description: Appliance Repair / Plumbing / Electrical / Carpentry / Cleaning / Vehicle Service / Other |
+| 2 | subcategory | Yes | Specific type within category (e.g. Refrigerator, Pipe Leak, Wiring) |
+| 3 | problem | Yes | Detailed description of the issue |
+| 4 | brand | Conditional | Required for Appliance Repair and Vehicle Service; empty for others |
+| 5 | model | No | Optional — captured if mentioned |
+| 6 | address | Yes | Society name + area/locality for technician |
+| 7 | preferred_time | Yes | When customer wants the technician to visit |
+| 8 | customer_name | Yes | Collected LAST |
+
+### FR-4: Conversational Rules
+- One question at a time — always the next missing field per stage
+- Never ask for information the customer has already provided anywhere in the conversation
+- Accept category/subcategory hints from natural description: "mere fridge mein paani aa raha hai" → category=Appliance Repair, subcategory=Refrigerator
+- Never go silent — if unclear, ask one short clarifying question
+- If customer gives garbled or inaudible response, ask once to repeat
 
 ### FR-5: Data Persistence
-- On completing all 7 fields: call `save_customer_feedback` tool immediately
-- Do NOT say "complaint registered" before the tool call succeeds
+- On completing all required fields, call `save_service_request` tool immediately
+- Do NOT say "request registered" before the tool call succeeds
 - Write one row per call to Google Sheets (Sheet1, appended, never overwrite)
-- Sheet columns: Customer Name | Brand | Item | Product Used Since | Usage Duration | Warranty Status | Complaint | Timestamp | Caller ID
-- Auto-close the call 8 seconds after successful save
+- Sheet columns (A–J): Customer Name | Category | Subcategory | Problem | Brand | Model | Address | Preferred Time | Timestamp | Caller ID
+- `save_executed` flag prevents duplicate Sheet rows per session
 
 ### FR-6: Post-Save Confirmation
-- After save succeeds, speak the confirmation message exactly once in the customer's chosen language
-- English: "[name], your complaint has been registered. Our team will get in touch within 24 hours. Thank you for calling My Doot!"
-- Hindi: "[name] ji, aapki complaint register ho gayi hai. Hamari team 24 ghante ke andar aapse sampark karegi. My Doot ko call karne ke liye shukriya!"
-- After the confirmation, go completely silent — do not repeat, do not add anything
+- Before calling the tool: say exactly "Ek second, register ho raha hai." (Hinglish) or "One moment, registering now." (English)
+- After save succeeds, speak the confirmation message exactly once — first word must be the customer's name:
+  - Hinglish: "[name] ji, aapki request register ho gayi hai. Hamari team 24 ghante ke andar aapse sampark karegi. My Doot ko call karne ke liye shukriya!"
+  - English: "[name], your request has been registered. Our team will get in touch within 24 hours. Thank you for calling My Doot!"
+- After confirmation, go completely silent — do not repeat, do not add anything
 
 ### FR-7: Post-Call Transcript Email
 - After every call (completed or dropped), send email to admin
@@ -108,6 +115,12 @@ Fields 4 and 5 are collected with a single question ("How long have you been usi
 - Empathetic tone throughout
 - Female verb forms for self-reference in Hindi: "kar sakti hoon", "karungi", "bataungi"
 - Gender-neutral forms when addressing the customer: "kar rahe hain" (not "kar rahi hain")
+
+### FR-9: Noise Rejection (VAD)
+- Customer audio is processed through a local Voice Activity Detector (VAD) before STT
+- Only audio above RMS threshold (default: 100) is sent to Sarvam Saaras v3
+- Utterances shorter than 0.3s are discarded (avoids noise blips)
+- This prevents PSTN line noise from triggering hallucinated transcriptions
 
 ---
 
@@ -122,7 +135,7 @@ Fields 4 and 5 are collected with a single question ("How long have you been usi
 | Uptime | 99.5% (Cloud Run managed) |
 | Call max duration | 10 minutes (hard limit) |
 | Audio quality | Clear mu-law 8kHz, no distortion |
-| Duplicate save protection | save_executed flag prevents re-execution per session |
+| Duplicate save protection | save_executed flag per session |
 
 ---
 
@@ -133,19 +146,15 @@ Fields 4 and 5 are collected with a single question ("How long have you been usi
 | Column | Field | Type | Example |
 |--------|-------|------|---------|
 | A | Customer Name | String | Kumud Ranjan |
-| B | Brand | String | HP |
-| C | Item | String | laptop |
-| D | Product Used Since | String | 3 saal pehle |
-| E | Usage Duration | String | 3 saal |
-| F | Warranty Status | Enum | No - Out of Warranty |
-| G | Complaint | String | laptop chal nahi raha hai |
-| H | Timestamp | DateTime | 2026-05-31 00:15:22 |
-| I | Caller ID | String | 917042915552 |
-
-Warranty Status enum values:
-- `Yes - Under Warranty`
-- `No - Out of Warranty`
-- `Customer Does Not Know`
+| B | Category | String | Plumbing |
+| C | Subcategory | String | Pipe Leak |
+| D | Problem | String | Water leaking from bathroom pipe |
+| E | Brand | String | Samsung *(Appliance/Vehicle only)* |
+| F | Model | String | *(optional)* |
+| G | Address | String | Sector 15, Noida |
+| H | Preferred Time | String | kal subah 10 baje |
+| I | Timestamp | DateTime | 2026-06-01 10:15:22 |
+| J | Caller ID | String | 917042915552 |
 
 Sheet ID: `1uW39kklQKc4rhf5REATgKqgwbvSNAhlDVKXyAzOMKCk`
 
@@ -153,14 +162,14 @@ Sheet ID: `1uW39kklQKc4rhf5REATgKqgwbvSNAhlDVKXyAzOMKCk`
 
 ## 7. Technical Constraints
 
-- **Language model**: Google Gemini 2.5 Flash Native Audio (BidiGenerateContent API, gemini-2.5-flash-native-audio-latest)
+- **STT**: Sarvam Saaras v3 REST API (`saaras:v3`, hi-IN, 8kHz WAV) — replaces Gemini native audio input to eliminate PSTN noise hallucinations
+- **Language model**: Google Gemini 2.5 Flash Native Audio (BidiGenerateContent, text-in / audio-out)
+- **Conversation orchestration**: LangGraph `StateGraph` via `core/service_graph.py`
 - **Telephony**: Vobiz SIP (+917971542939)
-- **Audio codec**: mu-law 8kHz (Vobiz ↔ server), PCM 16kHz (server → Gemini), PCM 24kHz (Gemini → server)
+- **Audio codec**: mu-law 8kHz (Vobiz ↔ server), PCM 24kHz (Gemini → server)
 - **Infrastructure**: Google Cloud Run (us-central1, project testcnx-169610)
 - **Data storage**: Google Sheets only (no database)
 - **Notification**: Gmail SMTP SSL port 465 (App Password auth)
-- **No VAD config**: removed — caused 1008 policy violations on native audio model
-- **No speechConfig**: removed — caused deferred 1008 errors on native audio model
 
 ---
 
@@ -168,24 +177,25 @@ Sheet ID: `1uW39kklQKc4rhf5REATgKqgwbvSNAhlDVKXyAzOMKCk`
 
 | Metric | Target |
 |--------|--------|
-| Complaint registration completion rate | > 85% of calls where customer speaks |
-| Data completeness | 100% of saved rows have all 7 fields |
+| Service request completion rate | > 85% of calls where customer speaks |
+| Data completeness | 100% of saved rows have all required fields |
 | Average handle time | 2–4 minutes |
 | Call drop rate (before completion) | < 15% |
 | Sheet write latency | < 5 seconds after all fields collected |
 | Transcript email delivery | 100% of completed calls |
+| False STT triggers (noise) | < 5% of total STT calls |
 
 ---
 
-## 9. Out of Scope (v3.0)
+## 9. Out of Scope (v4.0)
 
 - CRM or ticketing system integration (Freshdesk, Zoho, etc.)
 - SMS/WhatsApp confirmation to customer after registration
 - Outbound call-back scheduling
 - Sentiment analysis or complaint severity scoring
 - Regional languages beyond English and Hinglish
-- Real-time dashboard for complaint volume/trends
-- IVR menu (press 1 for AC, press 2 for TV)
+- Real-time dashboard for request volume/trends
+- IVR menu (press 1 for plumbing, press 2 for electrical)
 
 ---
 
@@ -194,22 +204,24 @@ Sheet ID: `1uW39kklQKc4rhf5REATgKqgwbvSNAhlDVKXyAzOMKCk`
 | Priority | Feature |
 |----------|---------|
 | High | WhatsApp confirmation message to customer after registration |
-| High | Complaint category auto-classification (hardware failure, installation, noise, etc.) |
+| High | Technician assignment + estimated arrival time communicated to customer |
 | Medium | CRM integration (Freshdesk / Zoho) — auto-create ticket from Sheet row |
 | Medium | Regional language support (Tamil, Telugu, Marathi, Bengali) |
-| Medium | Weekly summary email to manager (total complaints, brands, devices) |
+| Medium | Weekly summary email to manager (total requests, categories, areas) |
 | Low | Real-time call monitoring dashboard |
 | Low | Repeat caller detection (same phone number within 7 days) |
-| Low | Estimated resolution time based on brand + complaint type |
+| Low | Estimated technician availability based on area + service type |
 
 ---
 
 ## 11. Configuration
 
 All agent behavior is controlled via `app_config.json` — no code changes needed for:
-- System prompt updates (including greeting scripts, language rules, field order)
+- System prompt updates (greeting scripts, language rules, stage instructions)
 - Model selection (`parameters.google.model`)
 - Tool schema modifications
 - Temperature / generation parameters
 
-Active provider is set via `active_provider` in `app_config.json` (currently `"google"` for Gemini Live).
+Active provider is set via `active_provider` in `app_config.json` (currently `"google"` for Gemini Live hybrid pipeline).
+
+LangGraph category taxonomy (services, subcategories, brand requirements) is defined in `core/service_graph.py`.
