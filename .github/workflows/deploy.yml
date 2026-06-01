@@ -75,8 +75,6 @@ jobs:
           # GOOGLE_CREDENTIALS reuses the deployment SA key for Sheets access.
           # If you use a separate Sheets SA, add a GOOGLE_CREDENTIALS secret.
           GOOGLE_CREDENTIALS:    ${{ secrets.GCP_SA_KEY }}
-          GCS_RECORDINGS_BUCKET: ${{ secrets.GCS_RECORDINGS_BUCKET }}
-          GCS_DELETE_LOCAL:      ${{ secrets.GCS_DELETE_LOCAL }}
         run: |
           python3 - <<'PYEOF'
           import os, json
@@ -92,8 +90,6 @@ jobs:
               "DOCTOR_EMAIL",
               "PUBLIC_URL",
               "GOOGLE_CREDENTIALS",
-              "GCS_RECORDINGS_BUCKET",
-              "GCS_DELETE_LOCAL",
           ]
 
           lines = []

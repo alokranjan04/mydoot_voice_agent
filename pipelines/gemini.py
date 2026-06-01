@@ -3,7 +3,7 @@
 Gemini Live Multimodal pipeline for Mydoot Customer Care.
 Uses websockets library + BidiGenerateContent (v1beta) — audio in / audio out.
 """
-import asyncio, audioop, base64, json, os, time, traceback, wave
+import asyncio, audioop, base64, json, os, time, traceback
 from datetime import datetime
 import aiohttp
 import websockets
@@ -11,7 +11,7 @@ from aiohttp import web
 
 from config.settings import APP_CONFIG, GEMINI_API_KEY, GEMINI_WS_URL
 from core.state_engine import ConversationStateEngine
-from mydoot_functions import FUNCTION_MAP, send_call_summary_email, upload_recording_to_gcs, transcribe_with_sarvam
+from mydoot_functions import FUNCTION_MAP, send_call_summary_email
 
 # ── Audio pipeline tuning ────────────────────────────────────────────────────
 # Packets below this RMS are treated as background noise (fan, line hiss, etc.)
@@ -35,11 +35,6 @@ SILENCE_SEND_SECS          = float(os.getenv("SILENCE_SEND_SECS", "5.0"))
 AUDIO_BATCH_FRAMES         = 4
 # Enable per-packet audio RMS debug logging for noise-gate tuning.
 NOISE_GATE_DEBUG           = os.getenv("NOISE_GATE_DEBUG", "0").lower() in ("1", "true", "yes")
-# Set RECORD_CALLS=1 to save each call's inbound PSTN audio as a WAV file.
-# Files are written to RECORDINGS_DIR (default: ./recordings/).
-# Use these WAV files with test_asr_compare.py to benchmark ASR services.
-RECORD_CALLS               = os.getenv("RECORD_CALLS", "0").lower() in ("1", "true", "yes")
-RECORDINGS_DIR             = os.getenv("RECORDINGS_DIR", "recordings")
 
 
 def _ts():
@@ -100,8 +95,6 @@ async def gemini_handler(request):
     caller_id      = request.query.get("caller_id", "Unknown")
     state_engine   = ConversationStateEngine()
     transcript_log = []     # ["Agent: ...", "Customer: ..."]
-    call_ts        = datetime.now().strftime("%Y%m%d_%H%M%S")
-    pcm8_frames    = []     # raw 8kHz PCM16 frames for WAV recording (RECORD_CALLS=1)
 
     def log(msg):
         print(f"[{_ts()}] caller={caller_id} | {msg}", flush=True)
@@ -418,8 +411,6 @@ async def gemini_handler(request):
 
                         raw_mulaw = base64.b64decode(data["media"]["payload"])
                         pcm8  = audioop.ulaw2lin(raw_mulaw, 2)
-                        if RECORD_CALLS:
-                            pcm8_frames.append(pcm8)
                         pcm16, upsample_state = audioop.ratecv(
                             pcm8, 2, 1, 8000, 16000, upsample_state
                         )
@@ -529,31 +520,6 @@ async def gemini_handler(request):
     finally:
         elapsed = time.time() - (call_start_ts if 'call_start_ts' in dir() else time.time())
         log(f"📞 Call ended | duration={elapsed:.1f}s | transcript={len(transcript_log)} lines")
-        if RECORD_CALLS and pcm8_frames:
-            try:
-                os.makedirs(RECORDINGS_DIR, exist_ok=True)
-                wav_path = os.path.join(RECORDINGS_DIR, f"{caller_id}_{call_ts}.wav")
-                with wave.open(wav_path, "wb") as wf:
-                    wf.setnchannels(1)
-                    wf.setsampwidth(2)   # 16-bit PCM
-                    wf.setframerate(8000)
-                    wf.writeframes(b"".join(pcm8_frames))
-                log(f"🎙️  Recording saved → {wav_path} ({len(pcm8_frames)} frames, {elapsed:.0f}s)")
-                gcs_uri = await asyncio.to_thread(upload_recording_to_gcs, wav_path, caller_id)
-                if gcs_uri:
-                    log(f"☁️  Recording uploaded → {gcs_uri}")
-                # Sarvam post-call transcription — more accurate Hindi ASR (~8% WER)
-                log("🗣  Running Sarvam transcription on recording...")
-                sarvam_text = await asyncio.to_thread(transcribe_with_sarvam, wav_path)
-                if sarvam_text:
-                    transcript_log.append(
-                        f"\n─── Sarvam AI Transcription (hi-IN) ───\n{sarvam_text}"
-                    )
-                    log(f"🗣  Sarvam transcript: {sarvam_text[:120]}")
-                else:
-                    log("⚠️  Sarvam transcription returned empty (check SARVAM_API_KEY)")
-            except Exception as rec_err:
-                log(f"⚠️  Recording save failed: {rec_err}")
         log("📋 TRANSCRIPT:\n" + ("\n".join(transcript_log) if transcript_log else "  (empty)"))
         log("📧 Attempting transcript email ...")
         await asyncio.to_thread(send_call_summary_email, caller_id, transcript_log)

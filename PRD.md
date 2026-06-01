@@ -1,9 +1,9 @@
 # PRD: Mydoot Customer Care — AI Voice Agent
 
-**Version:** 3.1
+**Version:** 3.0
 **Owner:** Alok Ranjan
 **Phone Number:** +917971542939
-**Last Updated:** June 2026
+**Last Updated:** May 2026
 
 ---
 
@@ -24,11 +24,10 @@ Home appliance customers have complaints — their TV won't turn on, the AC is n
 
 An always-available AI voice agent that:
 1. Answers every call instantly, 24/7
-2. Greets in Hinglish and auto-detects language from the customer's first response
+2. Asks language preference (English or Hinglish) and adapts immediately
 3. Collects all 7 required fields in a single conversation
-4. Asks short clarifying questions when unclear — never goes silent mid-call
-5. Saves a complete structured record to Google Sheets
-6. Emails the full transcript to the admin after every call
+4. Saves a complete structured record to Google Sheets
+5. Emails the full transcript to the admin after every call
 
 No hold time. No missed fields. No data entry lag.
 
@@ -51,14 +50,13 @@ No hold time. No missed fields. No data entry lag.
 - No call should go unanswered due to concurrency limits (up to 10 simultaneous)
 - Call must work 24/7/365
 
-### FR-2: Hinglish-First Greeting with Auto Language Detection
-- On call connect, agent speaks a Hinglish greeting (one of 3 random options) and immediately asks about the problem
-- No language preference question is asked
-- Language auto-detection (silent, one-time):
-  - If the customer's first complete response is exclusively in English with no Hindi words → entire call in English
-  - In all other cases (Hindi, Hinglish, mixed, unclear, garbled, noisy, silent) → entire call in Hinglish
-- Default is Hinglish — no detection required for the most common case
-- Language is fixed for the rest of the call once detected
+### FR-2: Bilingual Greeting and Language Selection
+- On call connect, the agent speaks a greeting that contains both English and Hindi phrases (one of 3 scripts, chosen randomly)
+- After the greeting, the agent asks the customer which language they prefer
+- If the customer says "English" or responds in clear English: conduct the entire call in English only
+- If the customer says "Hindi", responds in Hindi, or the response is unclear or mixed: conduct the entire call in Hinglish
+- Default when in doubt: Hinglish
+- The language choice is fixed for the rest of the call — no switching
 
 ### FR-3: 7-Field Data Collection
 The agent must collect all 7 fields before saving:
@@ -67,7 +65,7 @@ The agent must collect all 7 fields before saving:
 |---|-------|-----------|
 | 1 | Complaint | Free text description of the problem |
 | 2 | Brand | Any brand (Samsung, Apple, LG, HP, Bajaj, etc.) |
-| 3 | Item | Any appliance or device — TV, laptop, AC, mixer, MacBook, tube light, etc. |
+| 3 | Item | Any appliance or device — TV, laptop, AC, mixer, MacBook, etc. |
 | 4 | Product Used Since | Year or relative period (e.g., "2022", "3 saal pehle") |
 | 5 | Usage Duration | Duration (e.g., "3 saal", "6 mahine") |
 | 6 | Warranty Status | Enum: "Yes - Under Warranty" / "No - Out of Warranty" / "Customer Does Not Know" |
@@ -76,7 +74,7 @@ The agent must collect all 7 fields before saving:
 Fields 4 and 5 are collected with a single question ("How long have you been using it?"); the agent derives both from the customer's answer.
 
 ### FR-4: Conversational Flow
-- First question after greeting: asks about the appliance and the problem simultaneously
+- First question after language selection: asks about the appliance and the problem simultaneously
 - Collects brand and item next (skipped if already mentioned)
 - Collects usage duration (fills both product_used_since and usage_duration from one answer)
 - Collects warranty status
@@ -85,38 +83,26 @@ Fields 4 and 5 are collected with a single question ("How long have you been usi
 - Never asks for information the customer has already provided anywhere in the conversation
 - Accepts any device type — no restricted list
 - Smart brand detection: "MacBook" → brand=Apple, item=MacBook Laptop
-- "tube light" or "bulb" → item=Light/Tube Light (valid appliance type)
 
-### FR-5: Clarifying Questions — Never Go Silent
-- If the customer's response is unclear, garbled, or not understood: agent asks a short (one-sentence) clarifying question
-- If the device type is ambiguous: asks to clarify (e.g., "tube light or LED bulb?")
-- If audio was noisy/inaudible: asks customer to repeat
-- Agent never goes blank or silent mid-conversation waiting for input
-
-### FR-6: Data Persistence
+### FR-5: Data Persistence
 - On completing all 7 fields: call `save_customer_feedback` tool immediately
 - Do NOT say "complaint registered" before the tool call succeeds
 - Write one row per call to Google Sheets (Sheet1, appended, never overwrite)
 - Sheet columns: Customer Name | Brand | Item | Product Used Since | Usage Duration | Warranty Status | Complaint | Timestamp | Caller ID
 - Auto-close the call 8 seconds after successful save
 
-### FR-7: Post-Save Confirmation
-- After save succeeds, speak the confirmation message exactly once in the customer's detected language
-- Hinglish: "[name] ji, aapki complaint register ho gayi hai. Hamari team 24 ghante ke andar aapse sampark karegi. My Doot ko call karne ke liye shukriya!"
+### FR-6: Post-Save Confirmation
+- After save succeeds, speak the confirmation message exactly once in the customer's chosen language
 - English: "[name], your complaint has been registered. Our team will get in touch within 24 hours. Thank you for calling My Doot!"
+- Hindi: "[name] ji, aapki complaint register ho gayi hai. Hamari team 24 ghante ke andar aapse sampark karegi. My Doot ko call karne ke liye shukriya!"
 - After the confirmation, go completely silent — do not repeat, do not add anything
 
-### FR-8: Post-Call Transcript Email
+### FR-7: Post-Call Transcript Email
 - After every call (completed or dropped), send email to admin
 - Email contains: Caller ID, timestamp, full Agent+Customer transcript
 - Send even if transcript is empty (confirms call happened)
 
-### FR-9: Call Recording for QA
-- When `RECORD_CALLS=1` env var is set, save each call's inbound PSTN audio as an 8kHz PCM16 WAV file in `./recordings/`
-- File naming: `{caller_id}_{YYYYMMDD_HHMMSS}.wav`
-- Used with `test_asr_compare.py` for offline ASR benchmarking
-
-### FR-10: Voice Quality
+### FR-8: Voice Quality
 - Soft, warm, clear female voice (Aoede via Gemini Live)
 - Slow, deliberate pace with natural pauses
 - Empathetic tone throughout
@@ -137,7 +123,6 @@ Fields 4 and 5 are collected with a single question ("How long have you been usi
 | Call max duration | 10 minutes (hard limit) |
 | Audio quality | Clear mu-law 8kHz, no distortion |
 | Duplicate save protection | save_executed flag prevents re-execution per session |
-| Inactivity timeout | 20 seconds after agent's last turn with no customer speech |
 
 ---
 
@@ -176,7 +161,6 @@ Sheet ID: `1uW39kklQKc4rhf5REATgKqgwbvSNAhlDVKXyAzOMKCk`
 - **Notification**: Gmail SMTP SSL port 465 (App Password auth)
 - **No VAD config**: removed — caused 1008 policy violations on native audio model
 - **No speechConfig**: removed — caused deferred 1008 errors on native audio model
-- **PSTN codec limitation**: 8kHz mu-law makes phonetically similar words (e.g., "Hindi"/"Hello") indistinguishable to ASR — handled by defaulting to Hinglish without requiring language confirmation
 
 ---
 
@@ -193,7 +177,7 @@ Sheet ID: `1uW39kklQKc4rhf5REATgKqgwbvSNAhlDVKXyAzOMKCk`
 
 ---
 
-## 9. Out of Scope (v3.1)
+## 9. Out of Scope (v3.0)
 
 - CRM or ticketing system integration (Freshdesk, Zoho, etc.)
 - SMS/WhatsApp confirmation to customer after registration
@@ -202,7 +186,6 @@ Sheet ID: `1uW39kklQKc4rhf5REATgKqgwbvSNAhlDVKXyAzOMKCk`
 - Regional languages beyond English and Hinglish
 - Real-time dashboard for complaint volume/trends
 - IVR menu (press 1 for AC, press 2 for TV)
-- Separate STT pipeline (Sarvam/Deepgram) replacing Gemini native audio
 
 ---
 
@@ -212,7 +195,6 @@ Sheet ID: `1uW39kklQKc4rhf5REATgKqgwbvSNAhlDVKXyAzOMKCk`
 |----------|---------|
 | High | WhatsApp confirmation message to customer after registration |
 | High | Complaint category auto-classification (hardware failure, installation, noise, etc.) |
-| High | Switch to Sarvam Saaras V3 as separate STT for Hindi accuracy (~8% WER vs ~22%) |
 | Medium | CRM integration (Freshdesk / Zoho) — auto-create ticket from Sheet row |
 | Medium | Regional language support (Tamil, Telugu, Marathi, Bengali) |
 | Medium | Weekly summary email to manager (total complaints, brands, devices) |
@@ -231,5 +213,3 @@ All agent behavior is controlled via `app_config.json` — no code changes neede
 - Temperature / generation parameters
 
 Active provider is set via `active_provider` in `app_config.json` (currently `"google"` for Gemini Live).
-
-Audio pipeline tuning is controlled via environment variables (NOISE_GATE_RMS, SPEECH_TAIL_SECS, SILENCE_SEND_SECS, etc.) — no code changes needed for threshold adjustments.
