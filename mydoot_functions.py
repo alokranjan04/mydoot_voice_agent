@@ -352,20 +352,21 @@ def upload_recording_to_gcs(local_path: str, caller_id: str) -> str:
         return ""
 
 
-def save_service_request(customer_name, category, subcategory, problem,
+def save_service_request(customer_name, category, subcategory, issue_type,
                           address, preferred_time,
                           brand="", model="",
+                          severity="", error_code="", warranty_status="",
                           caller_id=""):
     """
     Save a structured service request to Google Sheets (LangGraph pipeline).
 
-    Sheet columns (A–J):
-      A: Customer Name | B: Category | C: Subcategory | D: Problem
-      E: Brand | F: Model | G: Address | H: Preferred Time
-      I: Timestamp | J: Caller ID
+    Sheet columns (A–K):
+      A: Customer Name | B: Category   | C: Subcategory | D: Issue Type
+      E: Brand         | F: Model      | G: Severity    | H: Address
+      I: Preferred Time | J: Timestamp | K: Caller ID
     """
     print(f"[SERVICE REQUEST]: Saving — Customer={customer_name}, "
-          f"Category={category}, Sub={subcategory}")
+          f"Category={category}, Sub={subcategory}, Issue={issue_type}")
     print(f"[SERVICE REQUEST]: SpreadsheetID={SPREADSHEET_ID!r}")
     try:
         service, spreadsheet_id = _get_sheets_service()
@@ -373,20 +374,20 @@ def save_service_request(customer_name, category, subcategory, problem,
             print("[SERVICE REQUEST ERROR]: No Sheets service — check GOOGLE_CREDENTIALS")
             return {"success": False, "message": "Google Sheets credentials not found."}
 
-        # Write new header row if sheet is empty
+        # Write header row if sheet is empty
         try:
             result = service.spreadsheets().values().get(
-                spreadsheetId=spreadsheet_id, range="Sheet1!A1:J1"
+                spreadsheetId=spreadsheet_id, range="Sheet1!A1:K1"
             ).execute()
             if not result.get("values"):
                 headers = [[
-                    "Customer Name", "Category", "Subcategory", "Problem",
-                    "Brand", "Model", "Address", "Preferred Time",
+                    "Customer Name", "Category", "Subcategory", "Issue Type",
+                    "Brand", "Model", "Severity", "Address", "Preferred Time",
                     "Timestamp", "Caller ID",
                 ]]
                 service.spreadsheets().values().update(
                     spreadsheetId=spreadsheet_id,
-                    range="Sheet1!A1:J1",
+                    range="Sheet1!A1:K1",
                     valueInputOption="RAW",
                     body={"values": headers},
                 ).execute()
@@ -399,9 +400,10 @@ def save_service_request(customer_name, category, subcategory, problem,
             customer_name,
             category,
             subcategory,
-            problem,
+            issue_type,
             brand or "",
             model or "",
+            severity or "",
             address,
             preferred_time,
             timestamp,

@@ -84,11 +84,11 @@
                                 },
                                 "subcategory": {
                                     "type": "STRING",
-                                    "description": "Specific type within category, e.g. Refrigerator, AC, Pipe Leak, Wiring, Door Repair, Car Service"
+                                    "description": "Specific type within category, e.g. Refrigerator, AC / Air Conditioner, Washing Machine, TV / Television, Pipe Leak, Tap / Faucet, Wiring, MCB / Fuse / DB, Door / Window Repair, Car Service / Repair"
                                 },
-                                "problem": {
+                                "issue_type": {
                                     "type": "STRING",
-                                    "description": "Detailed description of the customer's problem or what work is needed"
+                                    "description": "Specific fault identified during diagnosis, e.g. Power Failure, Cooling Failure, Drum Not Spinning, MCB Tripping, Water Leakage Indoor, Hinge Issue, Won't Start. Use the exact issue type name from the diagnostic flow."
                                 },
                                 "brand": {
                                     "type": "STRING",
@@ -96,18 +96,26 @@
                                 },
                                 "model": {
                                     "type": "STRING",
-                                    "description": "Model name or number, optional (e.g. Galaxy S21, Activa 6G)"
+                                    "description": "Model name or number, optional (e.g. Galaxy S21, Activa 6G, 1.5 Ton 5 Star)"
+                                },
+                                "severity": {
+                                    "type": "STRING",
+                                    "description": "Issue severity: High (appliance fully non-functional, safety risk, water damage), Medium (partially working, leakage), Low (cosmetic, intermittent)"
+                                },
+                                "error_code": {
+                                    "type": "STRING",
+                                    "description": "Error code shown on appliance display panel, if any (e.g. E3, F1, H6). Leave empty if none."
                                 },
                                 "address": {
                                     "type": "STRING",
-                                    "description": "Customer's address: society name and area/locality where the technician needs to visit"
+                                    "description": "Customer's address: society/building name and area or locality where the technician needs to visit"
                                 },
                                 "preferred_time": {
                                     "type": "STRING",
-                                    "description": "When the customer wants the technician to visit, e.g. 'kal subah 10 baje', 'aaj shaam 5 baje', 'tomorrow morning 10 AM'"
+                                    "description": "When the customer wants the technician to visit, e.g. 'kal subah 10 baje', 'aaj shaam 5 baje', 'tomorrow morning 10 AM', 'Sunday anytime'"
                                 }
                             },
-                            "required": ["customer_name", "category", "subcategory", "problem", "address", "preferred_time"]
+                            "required": ["customer_name", "category", "subcategory", "issue_type", "address", "preferred_time"]
                         }
                     }
                 ]
