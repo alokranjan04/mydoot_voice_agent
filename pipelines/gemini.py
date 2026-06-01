@@ -3,7 +3,7 @@
 Gemini Live Multimodal pipeline for Mydoot Customer Care.
 Uses websockets library + BidiGenerateContent (v1beta) — audio in / audio out.
 """
-import asyncio, audioop, base64, io, json, os, time, traceback, wave
+import asyncio, audioop, base64, io, json, os, re, time, traceback, wave
 from datetime import datetime
 import aiohttp
 import websockets
@@ -25,7 +25,7 @@ VAD_SPEECH_THRESHOLD  = int(os.getenv("VAD_SPEECH_THRESHOLD",  "100"))
 # Raise to 0.7 via env if callers are frequently getting cut off.
 VAD_END_SECS          = float(os.getenv("VAD_END_SECS",          "0.5"))
 # Minimum utterance duration to bother sending to STT (avoids noise blips).
-VAD_MIN_SPEECH_SECS   = float(os.getenv("VAD_MIN_SPEECH_SECS",  "0.3"))
+VAD_MIN_SPEECH_SECS   = float(os.getenv("VAD_MIN_SPEECH_SECS",  "0.5"))
 # Hard ceiling — force-flush utterance if customer speaks this long non-stop.
 VAD_MAX_SPEECH_SECS   = float(os.getenv("VAD_MAX_SPEECH_SECS",  "30.0"))
 
@@ -149,6 +149,95 @@ async def _sarvam_stt(pcm8_bytes: bytes,
     return ""
 
 
+# ── Quick keyword extraction for stage advancement ────────────────────────────
+# Pattern tables: detect category/subcategory from raw STT transcript so we can
+# advance the ServiceGraph BEFORE building [STAGE CONTEXT] for Gemini.
+# Gemini's NLU handles edge cases; these patterns handle the common case where
+# the customer states category + subcategory in a single opening message.
+
+_CAT_PATTERNS: list[tuple[str, list[str]]] = [
+    ("Vehicle Service", [
+        r"\bvehicle\b", r"व्हीकल", r"\bcar\b", r"कार\b",
+        r"\bbike\b", r"बाइक", r"\bscooter\b", r"स्कूटर",
+        r"two.?wheel", r"टू.?व्हीलर", r"\bgaadi\b", r"गाड़ी",
+    ]),
+    ("Appliance Repair", [
+        r"\bfridge\b", r"refrigerator", r"फ्रिज",
+        r"\bac\b", r"air.?condit", r"एसी",
+        r"washing.?machine", r"वाशिंग.?मशीन",
+        r"\btv\b", r"\btelevision\b", r"टीवी",
+        r"\bgeyser\b", r"गीज़र",
+        r"\blaptop\b", r"लैपटॉप",
+        r"water.?purifier", r"\bmicrowave\b", r"\binverter\b",
+    ]),
+    ("Plumbing", [
+        r"\bpipe\b", r"पाइप", r"\bleak\b", r"लीक",
+        r"\btap\b", r"नल\b", r"\btoilet\b", r"टॉयलेट",
+        r"water.?tank", r"\bseelan\b", r"\bseepage\b", r"waterproof",
+    ]),
+    ("Electrical", [
+        r"\belectric", r"बिजली", r"\bwiring\b", r"वायरिंग",
+        r"\bmcb\b", r"\bfuse\b", r"short.?circuit",
+    ]),
+    ("Carpentry", [
+        r"\bcarpent", r"\bdoor\b", r"\bfurniture\b",
+        r"\bwardrobe\b", r"\bcabinet\b",
+    ]),
+    ("Cleaning", [
+        r"pest.?control", r"deep.?clean", r"home.?clean",
+    ]),
+]
+
+_SUBCAT_PATTERNS: dict[str, list[tuple[str, list[str]]]] = {
+    "Vehicle Service": [
+        ("Bike / Scooter Service", [
+            r"two.?wheel", r"टू.?व्हीलर",
+            r"\bbike\b", r"बाइक",
+            r"\bscooter\b", r"स्कूटर",
+            r"\bmotorcycle\b",
+        ]),
+        ("Car Service / Repair", [r"\bcar\b", r"कार\b"]),
+    ],
+    "Appliance Repair": [
+        ("Refrigerator",         [r"\bfridge\b", r"refrigerator", r"फ्रिज"]),
+        ("AC / Air Conditioner",  [r"\bac\b", r"air.?condit", r"एसी"]),
+        ("Washing Machine",      [r"washing.?machine", r"वाशिंग.?मशीन"]),
+        ("TV / Television",      [r"\btv\b", r"\btelevision\b", r"टीवी"]),
+        ("Geyser",               [r"\bgeyser\b", r"गीज़र"]),
+        ("Laptop / Computer",    [r"\blaptop\b", r"लैपटॉप"]),
+        ("Water Purifier",       [r"water.?purifier"]),
+    ],
+    "Plumbing": [
+        ("Tap / Faucet", [r"\btap\b", r"नल\b", r"\bfaucet\b"]),
+        ("Toilet / WC",  [r"\btoilet\b", r"टॉयलेट"]),
+        ("Pipe Leak",    [r"pipe.?leak", r"पाइप.?लीक"]),
+    ],
+}
+
+
+def _update_stage_from_customer(transcript: str, sg: ServiceGraph) -> None:
+    """
+    Best-effort keyword extraction from the STT transcript to advance the
+    ServiceGraph stage BEFORE building the [STAGE CONTEXT] block for Gemini.
+    If the customer mentions both category and subcategory in one message,
+    both are recorded so Gemini sees the correct stage for this turn.
+    """
+    t = transcript.lower()
+
+    if sg.current_stage() == "category":
+        for cat, patterns in _CAT_PATTERNS:
+            if any(re.search(p, t) for p in patterns):
+                sg.on_field_collected("category", cat)
+                break  # one category only
+
+    if sg.current_stage() == "subcategory":
+        cat = sg.state.get("category", "")
+        for subcat, patterns in _SUBCAT_PATTERNS.get(cat, []):
+            if any(re.search(p, t) for p in patterns):
+                sg.on_field_collected("subcategory", subcat)
+                break
+
+
 async def gemini_handler(request):
     ws = web.WebSocketResponse(protocols=["audio.drachtio.org"])
     await ws.prepare(request)
@@ -233,13 +322,15 @@ async def gemini_handler(request):
             save_executed           = False  # prevent duplicate save calls per session
             confirmation_done       = False  # True once confirmation audio is blocked
             confirmation_audio_secs = 0.0   # seconds of audio forwarded after save_done_ts set
+            waiting_for_gemini = False  # True while Gemini is processing; blocks stacked noise utterances
             agent_buf          = ""    # accumulate agent speech chunks per turn
             customer_buf       = ""    # accumulate customer speech chunks per utterance
 
             async def g_receiver():
                 nonlocal downsample_state, last_ai_audio_ts, gemini_turn_end_ts
                 nonlocal greeting_started, greeting_done, save_done_ts, save_executed
-                nonlocal confirmation_done, confirmation_audio_secs, agent_buf, customer_buf
+                nonlocal confirmation_done, confirmation_audio_secs, waiting_for_gemini
+                nonlocal agent_buf, customer_buf
                 try:
                     async for raw_msg in g_ws:
                         data = json.loads(raw_msg)
@@ -315,6 +406,7 @@ async def gemini_handler(request):
                         # ── turnComplete: agent finished speaking ────────────
                         if server_content.get("turnComplete"):
                             gemini_turn_end_ts = time.time()
+                            waiting_for_gemini = False  # customer may speak again
                             ai_dur = gemini_turn_end_ts - last_ai_audio_ts if last_ai_audio_ts else 0
                             # Flush agent buffer as one clean line
                             if agent_buf.strip():
@@ -462,7 +554,7 @@ async def gemini_handler(request):
 
             async def _stt_and_send(pcm8_bytes: bytes):
                 """Transcribe utterance and send text turn to Gemini Live."""
-                nonlocal last_customer_ts
+                nonlocal last_customer_ts, waiting_for_gemini
                 t0 = time.time()
                 transcript = await _sarvam_stt(pcm8_bytes, session=sarvam_session)
                 stt_ms = int((time.time() - t0) * 1000)
@@ -474,6 +566,10 @@ async def gemini_handler(request):
                 transcript_log.append(line)
                 log(f"🗣  {line}")
                 last_customer_ts = time.time()
+                # Keyword-extract category/subcategory so [STAGE CONTEXT] is
+                # accurate for this turn (e.g. customer said "टू व्हीलर" in
+                # their first message → advance past subcategory stage now).
+                _update_stage_from_customer(transcript, service_graph)
                 stage_ctx = service_graph.get_context()
                 full_text = f"{stage_ctx}\n\nCustomer: {transcript}"
                 log(f"📋 Stage: {service_graph.current_stage()}")
@@ -484,6 +580,7 @@ async def gemini_handler(request):
                             "turnComplete": True,
                         }
                     }))
+                    waiting_for_gemini = True  # block new utterances until Gemini responds
                     log(f"📤 Gemini send OK (+{int((time.time()-t0)*1000)}ms total)")
                 except Exception as send_err:
                     log(f"❌ Gemini WS send failed after STT: {send_err}")
@@ -563,7 +660,10 @@ async def gemini_handler(request):
                                 duration  = now - speech_start_ts
                                 log(f"🔇 Speech end — {duration:.2f}s")
                                 if duration >= VAD_MIN_SPEECH_SECS:
-                                    asyncio.create_task(_stt_and_send(combined))
+                                    if waiting_for_gemini:
+                                        log(f"⏭ Gemini busy — utterance dropped ({duration:.2f}s)")
+                                    else:
+                                        asyncio.create_task(_stt_and_send(combined))
                                 else:
                                     log(f"⏭ Too short ({duration:.2f}s) — ignoring")
 
