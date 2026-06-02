@@ -124,12 +124,18 @@ async def _sarvam_stt(pcm8_bytes: bytes,
             gain = min(24000 / peak, 8.0)   # cap at 8× to avoid noise blowup
             pcm8_bytes = audioop.mul(pcm8_bytes, 2, gain)
 
+        # Upsample 8 kHz → 16 kHz before encoding.
+        # Sarvam Saaras is trained on 16 kHz telephony audio; providing a
+        # 16 kHz WAV avoids the model's internal re-sampling artefacts and
+        # improves recognition of proper nouns and Hindi phonemes on PSTN.
+        pcm16k, _ = audioop.ratecv(pcm8_bytes, 2, 1, 8000, 16000, None)
+
         buf = io.BytesIO()
         with wave.open(buf, "wb") as wf:
             wf.setnchannels(1)
             wf.setsampwidth(2)
-            wf.setframerate(8000)
-            wf.writeframes(pcm8_bytes)
+            wf.setframerate(16000)
+            wf.writeframes(pcm16k)
         wav_bytes = buf.getvalue()
 
         form = aiohttp.FormData()
@@ -288,13 +294,66 @@ def _is_confirmation(text: str) -> bool:
     words = t.split()
     if len(words) > 5:
         return False
-    has_affirm = any(w in _CONFIRM_WORDS for w in words) or t in _CONFIRM_WORDS
+    # Strip commas from each word so "हाँ, ..." still registers as affirmative
+    clean_words = [w.strip(",") for w in words]
+    has_affirm = any(w in _CONFIRM_WORDS for w in clean_words) or t in _CONFIRM_WORDS
     has_denial = any(re.search(p, t) for p in [
         r"\bnahi\b", r"\bnahin\b", r"\bno\b", r"\bnot\b",
         r"galat", r"गलत", r"नहीं", r"correction", r"different",
         r"change", r"wrong", r"actually", r"instead",
     ])
     return has_affirm and not has_denial
+
+
+# Patterns that indicate address/location content — should NOT be stored as name
+_ADDRESS_IN_NAME_RE = re.compile(
+    r'\b(sector|सेक्टर|plot|flat|floor|building|block|गली|नगर|मार्ग|road|'
+    r'street|phase|ward|area|locality|society|apartment|में\s+है|रहता\s+है|'
+    r'रहती\s+है|में\s+रहत|address|पता)\b|\d{3,}',
+    re.IGNORECASE
+)
+
+
+def _looks_like_name(text: str) -> bool:
+    """Basic guard: reject address-like or very long strings as candidate names."""
+    if _ADDRESS_IN_NAME_RE.search(text):
+        return False
+    words = text.strip().split()
+    return 1 <= len(words) <= 6
+
+
+def _extract_name(text: str) -> str:
+    """
+    Strip common introductory phrases so 'मेरा नाम आलोक रंजन है।' → 'आलोक रंजन'.
+    Falls back to the original text if no pattern matches.
+    """
+    t = text.strip().rstrip("।.!? ")
+    # "मेरा नाम X है" / "my name is X"
+    m = re.search(
+        r'(?:मेरा|mera|my)\s+(?:नाम|naam|name)\s*(?:है\s+|hai\s+|he\s+|is\s+)?(.+?)(?:\s+(?:है|hai|he|hain|is))?$',
+        t, re.IGNORECASE
+    )
+    if m:
+        return m.group(1).strip().rstrip("।.!? ")
+    # "naam X hai" / "naam hai X"
+    m = re.search(
+        r'(?:नाम|naam|name)\s+(?:है\s+|hai\s+)?(.+?)(?:\s+(?:है|hai|he|hain))?$',
+        t, re.IGNORECASE
+    )
+    if m:
+        extracted = m.group(1).strip().rstrip("।.!? ")
+        if 1 <= len(extracted.split()) <= 4:
+            return extracted
+    # "main X hoon" / "I am X"
+    m = re.search(
+        r'(?:मैं|main|i\s+am|i\'m)\s+(.+?)(?:\s+(?:हूँ|हूं|hoon|hun|am))?$',
+        t, re.IGNORECASE
+    )
+    if m:
+        extracted = m.group(1).strip().rstrip("।.!? ")
+        if 1 <= len(extracted.split()) <= 3:
+            return extracted
+    return t
 
 
 # Short affirmative words/phrases that must NOT be treated as the customer's name.
@@ -801,12 +860,16 @@ async def gemini_handler(request):
                             # Customer gave a different/corrected name — re-capture
                             service_graph.clear_pending()
                             log(f"🔄 Name correction: {transcript!r} — re-capturing")
-                            if _clean_t not in _NAME_AFFIRMATIONS:
-                                service_graph.set_pending("customer_name", transcript.strip())
+                            _raw_name = _extract_name(transcript.strip())
+                            if _clean_t not in _NAME_AFFIRMATIONS and _looks_like_name(_raw_name):
+                                service_graph.set_pending("customer_name", _raw_name)
+                                log(f"📝 Name candidate (correction): {_raw_name!r}")
                     else:
-                        # First time hearing the name — store as pending for confirmation
-                        if _clean_t not in _NAME_AFFIRMATIONS:
-                            service_graph.set_pending("customer_name", transcript.strip())
+                        # First time hearing the name — extract and store as pending
+                        _raw_name = _extract_name(transcript.strip())
+                        if _clean_t not in _NAME_AFFIRMATIONS and _looks_like_name(_raw_name):
+                            service_graph.set_pending("customer_name", _raw_name)
+                            log(f"📝 Name candidate: {_raw_name!r}")
                 stage_ctx = service_graph.get_context()
                 full_text = f"{stage_ctx}\n\nCustomer: {transcript}"
                 log(f"📋 Stage: {service_graph.current_stage()}")
