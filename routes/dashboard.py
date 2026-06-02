@@ -215,6 +215,7 @@ _HOME_TEMPLATE = """\
     </h2>
     <div class="links">
       <a href="/metrics" class="btn btn-primary">Metrics Dashboard</a>
+      <a href="/calls" class="btn btn-primary">Call Logs</a>
       <a href="/metrics/data" class="btn btn-outline">Raw JSON</a>
     </div>
   </div>

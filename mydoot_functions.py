@@ -469,3 +469,135 @@ FUNCTION_MAP = {
     "save_customer_feedback": save_customer_feedback,
     "save_service_request":   save_service_request,
 }
+
+
+# ── Call log (observability) ───────────────────────────────────────────────────
+# Writes one row per call to a "Call_Logs" sheet in the same spreadsheet.
+# Used by the /calls observability dashboard.
+
+_CALL_LOGS_CACHE: dict = {"sheet_ensured": False}
+
+_CALL_LOGS_HEADERS = [
+    "Timestamp (IST)", "Caller ID", "Duration (s)", "Stage Reached", "Saved",
+    "Category", "Subcategory", "Issue Type", "Customer Name", "Address",
+    "Preferred Time", "STT Count", "STT Avg (ms)", "STT Drops",
+    "Barge-Ins", "Reconnects", "Audio GCS", "Transcript",
+]
+
+
+def _ensure_call_logs_sheet(service, spreadsheet_id: str) -> bool:
+    """Create the Call_Logs sheet and write headers if it doesn't exist yet."""
+    if _CALL_LOGS_CACHE.get("sheet_ensured"):
+        return True
+    try:
+        meta = service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+        existing = {s["properties"]["title"] for s in meta.get("sheets", [])}
+        if "Call_Logs" not in existing:
+            service.spreadsheets().batchUpdate(
+                spreadsheetId=spreadsheet_id,
+                body={"requests": [{"addSheet": {"properties": {"title": "Call_Logs"}}}]},
+            ).execute()
+            print("[CALL LOG] Created 'Call_Logs' sheet.")
+        # Write headers if row 1 is empty
+        result = service.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id, range="Call_Logs!A1:R1"
+        ).execute()
+        if not result.get("values"):
+            service.spreadsheets().values().update(
+                spreadsheetId=spreadsheet_id,
+                range="Call_Logs!A1:R1",
+                valueInputOption="RAW",
+                body={"values": [_CALL_LOGS_HEADERS]},
+            ).execute()
+            print("[CALL LOG] Header row written.")
+        _CALL_LOGS_CACHE["sheet_ensured"] = True
+        return True
+    except Exception as e:
+        print(f"[CALL LOG WARNING] _ensure_call_logs_sheet: {e}")
+        return False
+
+
+def save_call_log(
+    caller_id: str,
+    duration_secs: float,
+    stage_reached: str,
+    saved: bool,
+    category: str,
+    subcategory: str,
+    issue_type: str,
+    customer_name: str,
+    address: str,
+    preferred_time: str,
+    stt_count: int,
+    stt_avg_ms: float,
+    stt_drops: int,
+    barge_ins: int,
+    reconnects: int,
+    audio_gcs: str,
+    transcript: list,
+) -> dict:
+    """Append one row to the Call_Logs sheet. Called at end of every call."""
+    try:
+        service, spreadsheet_id = _get_sheets_service()
+        if not service:
+            return {"success": False}
+        _ensure_call_logs_sheet(service, spreadsheet_id)
+        timestamp = datetime.now(_IST).strftime("%Y-%m-%d %H:%M:%S IST")
+        transcript_str = json.dumps(transcript, ensure_ascii=False)[:3000]
+        values = [[
+            timestamp,
+            caller_id,
+            round(duration_secs, 1),
+            stage_reached,
+            "YES" if saved else "NO",
+            category or "",
+            subcategory or "",
+            issue_type or "",
+            customer_name or "",
+            address or "",
+            preferred_time or "",
+            stt_count,
+            round(stt_avg_ms) if stt_avg_ms else "",
+            stt_drops,
+            barge_ins,
+            reconnects,
+            audio_gcs or "",
+            transcript_str,
+        ]]
+        service.spreadsheets().values().append(
+            spreadsheetId=spreadsheet_id,
+            range="Call_Logs!A2",
+            valueInputOption="RAW",
+            insertDataOption="INSERT_ROWS",
+            body={"values": values},
+        ).execute()
+        print(f"[CALL LOG] Saved — caller={caller_id} stage={stage_reached} saved={saved}")
+        return {"success": True}
+    except Exception as e:
+        print(f"[CALL LOG ERROR] {e}")
+        return {"success": False}
+
+
+def get_call_logs(n: int = 200) -> list:
+    """Return the last n rows from Call_Logs sheet as list of dicts."""
+    try:
+        service, spreadsheet_id = _get_sheets_service()
+        if not service:
+            return []
+        result = service.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id,
+            range="Call_Logs!A1:R",
+        ).execute()
+        rows = result.get("values", [])
+        if not rows or len(rows) < 2:
+            return []
+        headers = rows[0]
+        records = []
+        for row in rows[1:][-n:]:
+            padded = row + [""] * (len(headers) - len(row))
+            records.append(dict(zip(headers, padded)))
+        records.reverse()   # newest first
+        return records
+    except Exception as e:
+        print(f"[CALL LOG ERROR] get_call_logs: {e}")
+        return []

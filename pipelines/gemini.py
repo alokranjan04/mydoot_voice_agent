@@ -12,7 +12,7 @@ from aiohttp import web
 from config.settings import APP_CONFIG, GEMINI_API_KEY, GEMINI_WS_URL, SARVAM_API_KEY
 from core.state_engine import ConversationStateEngine
 from core.service_graph import ServiceGraph, ServiceState
-from mydoot_functions import FUNCTION_MAP, send_call_summary_email, upload_recording_to_gcs
+from mydoot_functions import FUNCTION_MAP, send_call_summary_email, upload_recording_to_gcs, save_call_log
 
 # ── Sarvam Saaras v3 STT ─────────────────────────────────────────────────────
 SARVAM_STT_URL = "https://api.sarvam.ai/speech-to-text"
@@ -421,6 +421,17 @@ async def gemini_handler(request):
 
     g_ws = None    # defined at function level so g_receiver can reassign via nonlocal on reconnect
     setup: dict = {}  # populated after connect; accessible to g_receiver for reconnect
+
+    # Lightweight per-call observability tracker.
+    # Mutated in-place (no nonlocal needed) from nested functions.
+    _call_track: dict = {
+        "stt_latencies_ms": [],   # ms per successful STT call
+        "stt_dropped": 0,         # utterances dropped (Gemini busy or too short)
+        "barge_ins": 0,           # confirmed barge-in events
+        "reconnects": 0,          # Gemini WS reconnect attempts
+        "gcs_uri": "",            # recording GCS URI (set at end if RECORD_CALLS=1)
+    }
+
     try:
         async with websockets.connect(
             GEMINI_WS_URL,
@@ -737,6 +748,7 @@ async def gemini_handler(request):
                 except websockets.exceptions.ConnectionClosedError as ex:
                     if _g_reconnects < 1 and not save_executed and not ws.closed:
                         _g_reconnects += 1
+                        _call_track["reconnects"] += 1
                         log(f"🔄 Gemini WS dropped — reconnecting (1/1): {type(ex).__name__}: {ex}")
                         waiting_for_gemini = True
                         try:
@@ -837,12 +849,14 @@ async def gemini_handler(request):
                     log(f"📝 STT: empty ({stt_ms}ms) — ignoring")
                     return
                 log(f"📝 STT ({stt_ms}ms) → {transcript!r}")
+                _call_track["stt_latencies_ms"].append(stt_ms)
                 # Re-check after STT: a concurrent task (started before
                 # waiting_for_gemini was set) may have already sent a turn.
                 # Sending two clientContent turns before Gemini responds
                 # triggers 1008 "operation not supported".
                 if waiting_for_gemini:
                     log(f"📝 STT concurrent-drop (Gemini busy): {transcript!r}")
+                    _call_track["stt_dropped"] += 1
                     return
                 line = f"[{_ts()}] Customer: {transcript}"
                 transcript_log.append(line)
@@ -975,6 +989,7 @@ async def gemini_handler(request):
                                 barge_in_buf.append(pcm8)
                                 if now - barge_in_start_ts >= BARGE_IN_SUSTAIN_SECS:
                                     barge_in_active = True
+                                    _call_track["barge_ins"] += 1
                                     log(f"⚡ Barge-in (rms={rms}, "
                                         f"sustained={now - barge_in_start_ts:.2f}s) — stopping agent audio")
                                     barge_in_start_ts = 0.0
@@ -1021,6 +1036,7 @@ async def gemini_handler(request):
                                 if duration >= VAD_MIN_SPEECH_SECS:
                                     if waiting_for_gemini:
                                         log(f"⏭ Gemini busy — utterance dropped ({duration:.2f}s)")
+                                        _call_track["stt_dropped"] += 1
                                     else:
                                         asyncio.create_task(_stt_and_send(combined))
                                 else:
@@ -1061,12 +1077,39 @@ async def gemini_handler(request):
                 log(f"🎙️  Recording saved → {wav_path} ({len(pcm8_frames)} frames, {elapsed:.0f}s)")
                 gcs_uri = await asyncio.to_thread(upload_recording_to_gcs, wav_path, caller_id)
                 if gcs_uri:
+                    _call_track["gcs_uri"] = gcs_uri
                     log(f"☁️  Recording uploaded → {gcs_uri}")
             except Exception as rec_err:
                 log(f"⚠️  Recording save failed: {rec_err}")
         log("📋 TRANSCRIPT:\n" + ("\n".join(transcript_log) if transcript_log else "  (empty)"))
         log("📧 Attempting transcript email ...")
         await asyncio.to_thread(send_call_summary_email, caller_id, transcript_log)
+        # ── Write observability call log (non-blocking) ───────────────────────
+        try:
+            _stt_lats = _call_track["stt_latencies_ms"]
+            _stt_avg  = sum(_stt_lats) / len(_stt_lats) if _stt_lats else 0
+            asyncio.create_task(asyncio.to_thread(
+                save_call_log,
+                caller_id    = caller_id,
+                duration_secs= elapsed,
+                stage_reached= service_graph.current_stage(),
+                saved        = save_executed,
+                category     = service_graph.state.get("category", "") or "",
+                subcategory  = service_graph.state.get("subcategory", "") or "",
+                issue_type   = service_graph.state.get("issue_type", "") or "",
+                customer_name= service_graph.state.get("customer_name", "") or "",
+                address      = service_graph.state.get("address", "") or "",
+                preferred_time= service_graph.state.get("preferred_time", "") or "",
+                stt_count    = len(_stt_lats),
+                stt_avg_ms   = _stt_avg,
+                stt_drops    = _call_track["stt_dropped"],
+                barge_ins    = _call_track["barge_ins"],
+                reconnects   = _call_track["reconnects"],
+                audio_gcs    = _call_track["gcs_uri"],
+                transcript   = transcript_log,
+            ))
+        except Exception as _log_err:
+            log(f"⚠️  Call log write failed: {_log_err}")
         if not ws.closed:
             await ws.close()
 
