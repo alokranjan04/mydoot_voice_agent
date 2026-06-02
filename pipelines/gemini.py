@@ -46,7 +46,11 @@ RECORDINGS_DIR             = os.getenv("RECORDINGS_DIR", "recordings")
 # Hard time ceiling on audio forwarding after save. The confirmation is ~6s.
 # 8s gives enough room for the message to complete and cuts off any Gemini
 # repetition (the model occasionally repeats the closing line twice).
-MAX_CONFIRMATION_AUDIO_SECS = 8.0
+MAX_CONFIRMATION_AUDIO_SECS = 4.0
+# Audio-duration cutoff (not wall-clock): Gemini streams audio faster than
+# real-time, so a wall-clock check fires too late.  By counting PCM bytes
+# forwarded, we cut the stream right after one confirmation message (~3.2s)
+# before the second repetition reaches Vobiz.
 # Minimum post-save audio that must have played before a turnComplete is
 # allowed to close the call. The wait message ("Ek second...") is ~2s.
 # Requiring 2.5s ensures the wait-message's own turnComplete is NOT treated
@@ -525,16 +529,26 @@ async def gemini_handler(request):
                                     continue  # hard-block any audio after confirmation
                                 if barge_in_active:
                                     continue  # customer interrupted — drop remaining agent audio
-                                # Time-based cutoff: block audio > MAX_CONFIRMATION_AUDIO_SECS
-                                # after save. Prevents double-confirmation when Gemini
-                                # generates both repetitions as one continuous audio stream.
-                                # Sends {"event": "clear"} to flush Vobiz's playback buffer
-                                # so any already-forwarded second-play audio stops immediately.
+                                # Decode first so we can count audio duration before forwarding.
+                                pcm24 = base64.b64decode(part["inlineData"]["data"])
+                                # Accumulate post-save audio seconds. Requires
+                                # CONFIRMATION_MIN_AUDIO_SECS before any turnComplete
+                                # can close the call — prevents the wait-message's own
+                                # turnComplete from triggering a close when the Sheets
+                                # API returns in <80ms (faster than the audio arrives).
+                                if save_done_ts > 0:
+                                    confirmation_audio_secs += len(pcm24) / 48000
+                                # Audio-duration cutoff: Gemini streams audio faster than
+                                # real-time so a wall-clock check is too slow. We count
+                                # PCM bytes forwarded and stop after MAX_CONFIRMATION_AUDIO_SECS
+                                # (one confirmation message) so the second repetition never
+                                # reaches Vobiz. Also sends {"event":"clear"} to flush any
+                                # already-buffered audio.
                                 if (save_done_ts > 0 and
-                                        time.time() - save_done_ts > MAX_CONFIRMATION_AUDIO_SECS):
+                                        confirmation_audio_secs > MAX_CONFIRMATION_AUDIO_SECS):
                                     if not confirmation_done:
                                         confirmation_done = True
-                                        log(f"🔇 Post-save cutoff ({MAX_CONFIRMATION_AUDIO_SECS}s) — clearing + blocking")
+                                        log(f"🔇 Post-save audio cutoff ({confirmation_audio_secs:.1f}s) — clearing + blocking")
                                         try:
                                             if not ws.closed:
                                                 await ws.send_str(json.dumps({"event": "clear"}))
@@ -542,14 +556,6 @@ async def gemini_handler(request):
                                             pass
                                         asyncio.create_task(_close_after(ws, g_ws, 0.0, log))
                                     continue
-                                # Accumulate post-save audio seconds. Requires
-                                # CONFIRMATION_MIN_AUDIO_SECS before any turnComplete
-                                # can close the call — prevents the wait-message's own
-                                # turnComplete from triggering a close when the Sheets
-                                # API returns in <80ms (faster than the audio arrives).
-                                pcm24 = base64.b64decode(part["inlineData"]["data"])
-                                if save_done_ts > 0:
-                                    confirmation_audio_secs += len(pcm24) / 48000
                                 if not greeting_started:
                                     greeting_started = True
                                     log("🔊 Greeting audio started streaming to caller")
