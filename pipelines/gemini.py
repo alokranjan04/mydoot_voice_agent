@@ -526,13 +526,20 @@ async def gemini_handler(request):
                                 if barge_in_active:
                                     continue  # customer interrupted — drop remaining agent audio
                                 # Time-based cutoff: block audio > MAX_CONFIRMATION_AUDIO_SECS
-                                # after save. Prevents double-confirmation even when both
-                                # utterances arrive before a single turnComplete fires.
+                                # after save. Prevents double-confirmation when Gemini
+                                # generates both repetitions as one continuous audio stream.
+                                # Sends {"event": "clear"} to flush Vobiz's playback buffer
+                                # so any already-forwarded second-play audio stops immediately.
                                 if (save_done_ts > 0 and
                                         time.time() - save_done_ts > MAX_CONFIRMATION_AUDIO_SECS):
                                     if not confirmation_done:
                                         confirmation_done = True
-                                        log(f"🔇 Post-save audio cutoff ({MAX_CONFIRMATION_AUDIO_SECS}s) — blocking")
+                                        log(f"🔇 Post-save cutoff ({MAX_CONFIRMATION_AUDIO_SECS}s) — clearing + blocking")
+                                        try:
+                                            if not ws.closed:
+                                                await ws.send_str(json.dumps({"event": "clear"}))
+                                        except Exception:
+                                            pass
                                         asyncio.create_task(_close_after(ws, g_ws, 0.0, log))
                                     continue
                                 # Accumulate post-save audio seconds. Requires
@@ -603,8 +610,17 @@ async def gemini_handler(request):
                             elif save_done_ts > 0:
                                 if confirmation_audio_secs >= CONFIRMATION_MIN_AUDIO_SECS and not confirmation_done:
                                     # Enough confirmation audio has played — close now.
+                                    # Also clear Vobiz's audio buffer: if Gemini generated
+                                    # two turns (or a second repetition starts before this
+                                    # turnComplete), the duplicate audio is already in
+                                    # Vobiz's buffer — "clear" stops it playing.
                                     confirmation_done = True
-                                    log(f"✅ Confirmation turnComplete (audio={confirmation_audio_secs:.1f}s) — closing")
+                                    log(f"✅ Confirmation turnComplete (audio={confirmation_audio_secs:.1f}s) — clearing + closing")
+                                    try:
+                                        if not ws.closed:
+                                            await ws.send_str(json.dumps({"event": "clear"}))
+                                    except Exception:
+                                        pass
                                     asyncio.create_task(_close_after(ws, g_ws, 0.0, log))
                                 elif confirmation_done:
                                     log("⚠️  Extra turnComplete after confirmation — ignoring")
