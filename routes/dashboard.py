@@ -17,7 +17,7 @@ _HOME_TEMPLATE = """\
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Priya — Voice Agent</title>
+<title>My Doot — Voice Agent Dashboard</title>
 <style>
   :root {{
     --primary: #6366f1;
@@ -123,7 +123,7 @@ _HOME_TEMPLATE = """\
 <body>
 <div class="container">
   <header>
-    <h1>Priya — Voice Agent</h1>
+    <h1>My Doot Voice Agent Dashboard</h1>
     <p class="sub">Neha Child Care · AI Receptionist · Port {port}</p>
   </header>
 
