@@ -95,6 +95,14 @@ Customer audio is never sent raw to Gemini. Only clean text transcripts are sent
 │    finally block → send_call_summary_email()                        │
 │    Gmail SMTP SSL → transcript email to admin                       │
 └─────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│ 7. Observability log written (non-blocking, asyncio.to_thread)      │
+│    save_call_log() → appends one row to Call_Logs sheet tab         │
+│    18 columns: timestamp, caller, duration, stage, saved,           │
+│    category, subcategory, issue_type, customer_name, address,       │
+│    preferred_time, stt_count, stt_avg_ms, stt_drops,               │
+│    barge_ins, reconnects, audio_gcs, transcript                     │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -395,9 +403,9 @@ if res.get("success"):
 
 After tool success, Gemini speaks the confirmation (Hinglish):
 
-> *"[name] ji, aapki request register ho gayi hai. Hamari team jald se jald, ek ghante ke andar aapse sampark karegi. My Doot ko call karne ke liye shukriya!"*
+> *"[name] ji, aapki request register ho gayi hai. Hamari team jald se jald aapse sampark karegi. My Doot ko call karne ke liye shukriya!"*
 
-Response time is **"within one hour"** — not 24 hours — reflecting the urgency of home service calls (power cuts, short circuits, water leaks cannot wait a day).
+Response time is left intentionally open ("jald se jald" — as soon as possible) in the voice message; the actual SLA is communicated separately by the dispatcher.
 
 ### Google Sheets Write
 
@@ -555,15 +563,63 @@ git push main → GitHub Actions (deploy.yml)
 
 ---
 
-## 13. Key Files Reference
+## 13. Observability Dashboard
+
+Every call writes one row to the **Call_Logs** tab of the same Google Sheet via `save_call_log()` in `mydoot_functions.py`. The write is non-blocking (`asyncio.to_thread`) and fires in the `finally` block of `gemini_handler`.
+
+### _call_track dict (per call)
+
+`pipelines/gemini.py` maintains a mutable `_call_track` dict at `gemini_handler` scope:
+
+```python
+_call_track: dict = {
+    "stt_latencies_ms": [],   # ms per successful Sarvam STT call
+    "stt_dropped":      0,    # utterances rejected (concurrent or VAD drop)
+    "barge_ins":        0,    # confirmed customer interruptions
+    "reconnects":       0,    # Gemini WS reconnect events
+    "gcs_uri":          "",   # gs:// URI after recording upload
+}
+```
+
+Instrumentation hooks are placed at:
+- After each successful STT call → `stt_latencies_ms.append(stt_ms)`
+- After each STT concurrent-drop or VAD utterance drop → `stt_dropped += 1`
+- After each confirmed barge-in → `barge_ins += 1`
+- After each Gemini WS reconnect → `reconnects += 1`
+- After GCS upload → `gcs_uri = gcs_uri`
+
+### Dashboard Routes
+
+| Route | Handler | Description |
+|-------|---------|-------------|
+| `GET /calls` | `routes/calls.py:calls_page` | HTML dashboard — stats, call table, expandable detail panels |
+| `GET /calls/data` | `routes/calls.py:calls_data` | JSON — last 200 rows from Call_Logs sheet |
+| `GET /calls/audio` | `routes/calls.py:audio_proxy` | Streams WAV from GCS to browser (query: `?uri=gs://...`) |
+
+The dashboard renders each call's transcript as timestamped chat bubbles (Agent = purple/left, Customer = green/right). The audio player streams directly from GCS via the `/calls/audio` proxy.
+
+### Call_Logs Sheet Schema
+
+18 columns (A–R):
+
+```
+Timestamp (IST) | Caller ID | Duration (s) | Stage Reached | Saved |
+Category | Subcategory | Issue Type | Customer Name | Address | Preferred Time |
+STT Count | STT Avg (ms) | STT Drops | Barge-Ins | Reconnects | Audio GCS | Transcript
+```
+
+---
+
+## 14. Key Files Reference
 
 | File | Purpose |
 |------|---------|
 | `app.py` | Entry point — registers routes, reconstructs google-credentials.json at startup |
 | `app_config.json` | System prompt, greeting scripts, tool schema (save_service_request), model config |
-| `mydoot_functions.py` | `save_service_request()`, `save_customer_feedback()`, `send_call_summary_email()`, Sheets client |
+| `mydoot_functions.py` | `save_service_request()`, `save_call_log()`, `get_call_logs()`, `send_call_summary_email()`, `upload_recording_to_gcs()`, Sheets client |
 | `pipelines/gemini.py` | Hybrid pipeline — VAD, Sarvam STT, ServiceGraph context injection, Gemini Live, tool dispatch |
 | `routes/webhook.py` | Vobiz inbound call handler — returns Stream XML with wss:// URL |
+| `routes/calls.py` | `GET /calls` HTML dashboard, `/calls/data` JSON API, `/calls/audio` GCS audio proxy |
 | `core/service_graph.py` | LangGraph ServiceGraph — category taxonomy, stage state, [STAGE CONTEXT] injection |
 | `core/state_engine.py` | Legacy 7-field state tracker (used by save_customer_feedback path) |
 | `config/settings.py` | API keys (Gemini, Sarvam) and WebSocket URLs from environment variables |

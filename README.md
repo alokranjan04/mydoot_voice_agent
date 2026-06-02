@@ -96,7 +96,7 @@ Each of steps 5–7 uses a two-step confirmation cycle:
       ↓
 Customer confirms name → save_service_request() tool call IMMEDIATELY
       ↓
-Agent: "[name] ji, aapki request register ho gayi hai. Hamari team jald se jald, ek ghante ke andar aapse sampark karegi."
+Agent: "[name] ji, aapki request register ho gayi hai. Hamari team jald se jald aapse sampark karegi."
       ↓
 Agent goes silent
       ↓
@@ -157,7 +157,7 @@ Sheet: [mydoot_Customer_Care](https://docs.google.com/spreadsheets/d/1uW39kklQKc
 mydoot-voice-agent/
 ├── app.py                  # Entry point — registers routes, starts server
 ├── app_config.json         # Agent persona, system prompt, tool schemas, greetings
-├── mydoot_functions.py     # save_service_request() + save_customer_feedback() + Gmail email
+├── mydoot_functions.py     # save_service_request(), save_call_log(), get_call_logs(), send_call_summary_email(), upload_recording_to_gcs(), Sheets client
 ├── requirements.txt
 ├── Dockerfile
 │
@@ -173,7 +173,12 @@ mydoot-voice-agent/
 │   └── sarvam.py           # Sarvam pipeline (backup)
 │
 ├── routes/
-│   └── webhook.py          # POST /answer — Vobiz inbound call handler
+│   ├── webhook.py          # POST /answer — Vobiz inbound call handler
+│   ├── dashboard.py        # GET / — pipeline selector + model config dashboard
+│   ├── calls.py            # GET /calls — observability dashboard; /calls/data JSON; /calls/audio GCS proxy
+│   ├── metrics.py          # GET /metrics — legacy metrics dashboard
+│   ├── voice_lab.py        # GET /voice-lab — test interface
+│   └── uploads.py          # POST /api/upload, GET /api/files, POST /api/delete-file
 │
 └── .github/workflows/
     └── deploy.yml          # GitHub Actions → Cloud Run CI/CD
@@ -219,6 +224,7 @@ Server starts on `http://localhost:5050`
 | `PORT` | No | Server port (default: 5050) |
 | `RECORD_CALLS` | No | Set to `1` to save inbound audio as WAV files |
 | `GCS_RECORDINGS_BUCKET` | No | GCS bucket for WAV upload |
+| `GCS_DELETE_LOCAL` | No | Set to 1 to delete local WAV after GCS upload |
 
 ---
 
@@ -270,6 +276,28 @@ After every call (including dropped/incomplete calls), an email is sent to `GMAI
 - Caller ID (phone number)
 - Call timestamp
 - Full conversation transcript (Agent + Customer turns)
+
+---
+
+## Observability Dashboard
+
+Every call is logged to a **Call_Logs** tab in the same Google Sheet with 18 columns:
+
+| Column | Field |
+|--------|-------|
+| Timestamp (IST) | Call start time |
+| Caller ID | Phone number |
+| Duration (s) | Call length in seconds |
+| Stage Reached | Last conversation stage completed |
+| Saved | Whether save_service_request succeeded |
+| Category / Subcategory / Issue Type | Structured service request data |
+| Customer Name / Address / Preferred Time | Collected fields |
+| STT Count / STT Avg (ms) | Sarvam STT call count and average latency |
+| STT Drops / Barge-Ins / Reconnects | Audio quality signals |
+| Audio GCS | `gs://` URI of the call recording (if RECORD_CALLS=1) |
+| Transcript | Full timestamped Agent + Customer conversation |
+
+The dashboard is available at `<your-url>/calls` — shows summary stats, a per-call table with expandable rows, timestamped chat-bubble transcript, and an in-browser audio player that streams the recording directly from GCS.
 
 ---
 

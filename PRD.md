@@ -1,6 +1,6 @@
 # PRD: Mydoot Customer Care — AI Voice Agent
 
-**Version:** 4.1
+**Version:** 4.2
 **Owner:** Alok Ranjan
 **Phone Number:** +917971542939
 **Last Updated:** June 2026
@@ -105,8 +105,8 @@ Fields collected:
 ### FR-6: Post-Save Confirmation
 - Call `save_service_request` tool IMMEDIATELY when all fields are confirmed — do NOT say anything to the customer before the tool call
 - After save succeeds, speak the confirmation message exactly once — first word must be the customer's name:
-  - Hinglish: "[name] ji, aapki request register ho gayi hai. Hamari team jald se jald, ek ghante ke andar aapse sampark karegi. My Doot ko call karne ke liye shukriya!"
-  - English: "[name], your request has been registered. Our team will contact you as soon as possible, within an hour. Thank you for calling My Doot!"
+  - Hinglish: "[name] ji, aapki request register ho gayi hai. Hamari team jald se jald aapse sampark karegi. My Doot ko call karne ke liye shukriya!"
+  - English: "[name], your request has been registered. Our team will contact you as soon as possible. Thank you for calling My Doot!"
 - After confirmation, go completely silent — do not repeat, do not add anything
 
 ### FR-7: Post-Call Transcript Email
@@ -127,6 +127,13 @@ Fields collected:
 - Utterances shorter than 0.3 s are discarded (avoids noise blips); silence gap of 0.3 s ends utterance
 - This prevents PSTN line noise from triggering hallucinated transcriptions
 - **Barge-in**: when the customer speaks while the agent is talking, a sustained RMS ≥ 350 for ≥ 0.3 s stops the agent's audio immediately (Vobiz `{"event": "clear"}`) and processes the customer's interruption. The high threshold (3.5× VAD) ensures fan noise and background sounds do NOT trigger barge-in.
+
+### FR-10: Call Observability Dashboard
+- Every call must write one row to the **Call_Logs** tab of the Google Sheet with 18 fields (see Data Model section)
+- Dashboard available at `/calls` showing: total calls, completion rate, avg duration, avg STT latency, avg STT drops, avg barge-ins
+- Each call row expandable to show full timestamped transcript (chat bubbles: Agent=purple, Customer=green) and in-browser audio player
+- Audio playback streams GCS recordings via `/calls/audio` proxy — no direct GCS URL exposure
+- Data API at `/calls/data` returns last 200 calls as JSON
 
 ---
 
@@ -164,6 +171,31 @@ Fields collected:
 | K | Caller ID | String | 917042915552 |
 
 Sheet ID: `1uW39kklQKc4rhf5REATgKqgwbvSNAhlDVKXyAzOMKCk`
+
+### Call_Logs Tab (Observability)
+
+18 columns per call (appended after every call, including incomplete/dropped):
+
+| Column | Field | Description |
+|--------|-------|-------------|
+| A | Timestamp (IST) | Call start time |
+| B | Caller ID | Phone number |
+| C | Duration (s) | Call length in seconds |
+| D | Stage Reached | Last stage completed (category/subcategory/diagnosis/brand/address/preferred_time/customer_name/done) |
+| E | Saved | TRUE if save_service_request succeeded |
+| F | Category | Service category |
+| G | Subcategory | Service subcategory |
+| H | Issue Type | Structured fault label from DIAGNOSTIC_FLOWS |
+| I | Customer Name | Collected name (empty if call dropped early) |
+| J | Address | Collected address |
+| K | Preferred Time | Collected visit time |
+| L | STT Count | Number of successful Sarvam STT calls |
+| M | STT Avg (ms) | Average STT latency in milliseconds |
+| N | STT Drops | Utterances rejected (concurrent guard or VAD drop) |
+| O | Barge-Ins | Confirmed customer interruptions |
+| P | Reconnects | Gemini WebSocket reconnect events |
+| Q | Audio GCS | gs:// URI of call recording (if RECORD_CALLS=1 and GCS_RECORDINGS_BUCKET set) |
+| R | Transcript | Full timestamped Agent + Customer conversation |
 
 ---
 
@@ -203,7 +235,6 @@ Sheet ID: `1uW39kklQKc4rhf5REATgKqgwbvSNAhlDVKXyAzOMKCk`
 - Outbound call-back scheduling
 - Sentiment analysis
 - Regional languages beyond English and Hinglish
-- Real-time dashboard for request volume/trends
 - IVR menu (press 1 for plumbing, press 2 for electrical)
 
 ---
@@ -217,7 +248,7 @@ Sheet ID: `1uW39kklQKc4rhf5REATgKqgwbvSNAhlDVKXyAzOMKCk`
 | Medium | CRM integration (Freshdesk / Zoho) — auto-create ticket from Sheet row |
 | Medium | Regional language support (Tamil, Telugu, Marathi, Bengali) |
 | Medium | Weekly summary email to manager (total requests, categories, areas) |
-| Low | Real-time call monitoring dashboard |
+| Done | Per-call observability dashboard (/calls) — transcript, audio playback, STT metrics |
 | Low | Repeat caller detection (same phone number within 7 days) |
 | Low | Estimated technician availability based on area + service type |
 

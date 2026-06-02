@@ -15,6 +15,7 @@ Everything starts here. `app.py` starts an `aiohttp` async web server on port `5
 - Registers the `/answer` webhook that Vobiz calls when a customer dials +917971542939.
 - Registers the `/gemini-stream` WebSocket endpoint for the active hybrid pipeline.
 - Serves the dashboard at `/` and the Voice Lab at `/voice-lab`.
+- Registers /calls, /calls/data, and /calls/audio for the per-call observability dashboard.
 
 **To switch the active pipeline**, change `active_provider` in `app_config.json` to `"sarvam"` or `"google"`.
 
@@ -248,6 +249,31 @@ Customer Name | Category | Subcategory | Issue Type | Brand | Model | Severity |
 
 Called in the `finally` block of `gemini_handler` — runs **after every call** whether it completed, dropped, or errored. Sends the full `Agent: ...` / `Customer: ...` transcript to `GMAIL_USER` via Gmail SMTP SSL (port 465).
 
+Sent to GMAIL_USER (admin email).
+
+### `save_call_log()`
+
+Called in the `finally` block of `gemini_handler` — runs **after every call** (completed or dropped). Writes one row to the **Call_Logs** sheet tab with 18 columns:
+
+```python
+asyncio.create_task(asyncio.to_thread(
+    save_call_log,
+    caller_id, duration_secs, stage_reached, saved,
+    category, subcategory, issue_type, customer_name,
+    address, preferred_time,
+    stt_count, stt_avg_ms, stt_drops, barge_ins, reconnects,
+    audio_gcs, transcript,
+))
+```
+
+The call is **non-blocking** (`asyncio.to_thread` + `create_task`) — the `finally` block does not wait for the Sheet write to complete before returning.
+
+`_ensure_call_logs_sheet()` runs once per process to create the Call_Logs tab and write headers if missing.
+
+### `get_call_logs(n)`
+
+Returns the last `n` rows from Call_Logs as a list of dicts (newest first). Called by `routes/calls.py:calls_data()` for the JSON API.
+
 ---
 
 ## 6. Call Flow: End to End
@@ -301,7 +327,7 @@ Gemini asks ONE diagnosis question: "Kya cooling bhi band ho gayi hai?"
 Gemini calls save_service_request() IMMEDIATELY — no wait message before tool call
         │
         ▼ Google Sheets: new row appended (11 columns)
-Gemini: "[name] ji, aapki request register ho gayi hai. Hamari team jald se jald, ek ghante ke andar aapse sampark karegi. My Doot ko call karne ke liye shukriya!"
+Gemini: "[name] ji, aapki request register ho gayi hai. Hamari team jald se jald aapse sampark karegi. My Doot ko call karne ke liye shukriya!"
         │
         ▼ Call auto-closes after confirmation audio completes
         │
@@ -325,3 +351,49 @@ No code changes needed for most customizations — edit `app_config.json`:
 
 To add a new service category or subcategory, update `CATEGORIES` in `core/service_graph.py`.
 To add a new diagnostic flow, add an entry to `DIAGNOSTIC_FLOWS` in the same file.
+
+---
+
+## 8. Observability Dashboard
+
+The `/calls` dashboard shows per-call quality data from the Call_Logs Google Sheet.
+
+### How data flows in
+
+`pipelines/gemini.py` maintains a `_call_track` dict per call:
+
+```python
+_call_track = {
+    "stt_latencies_ms": [],  # ms per Sarvam STT call
+    "stt_dropped":      0,   # utterances rejected
+    "barge_ins":        0,   # customer interruptions
+    "reconnects":       0,   # Gemini WS drops+reconnects
+    "gcs_uri":          "",  # gs:// URI of recording
+}
+```
+
+Five instrumentation hooks write to this dict during the call. At call end (`finally` block), `save_call_log()` is called with the accumulated data.
+
+### Routes
+
+| URL | What it shows |
+|-----|---------------|
+| `/calls` | HTML dashboard — 6 summary stat cards + sortable call table |
+| `/calls/data` | JSON — last 200 rows from Call_Logs sheet |
+| `/calls/audio?uri=gs://...` | Streams WAV from GCS to the browser audio player |
+
+### Expanded row layout
+
+Clicking any row expands a two-column detail panel:
+- **Left**: audio player (loads the WAV from GCS via `/calls/audio` proxy)
+- **Right**: timestamped transcript as chat bubbles
+  - Agent turns: purple, left-aligned
+  - Customer turns: green, right-aligned
+  - Each bubble shows `[HH:MM:SS.mmm] · Role` above the text
+
+The audio player is always visible when a recording exists — no extra click required. Audio pauses automatically when the row is collapsed.
+
+### Navigation
+
+- From the main dashboard (`/`): click **Call Logs** in the Monitoring section
+- From the Call Logs page: click **← Dashboard** button (top-right) to return
