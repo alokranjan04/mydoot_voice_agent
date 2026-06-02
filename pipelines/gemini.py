@@ -949,8 +949,9 @@ async def gemini_handler(request):
         print(f"[{_ts()}] ❌ Gemini Live Error: {e}", flush=True)
         traceback.print_exc()
     finally:
-        # Close reconnected Gemini WS (the async with block only closes the initial one)
-        if g_ws and not g_ws.closed:
+        # Close reconnected Gemini WS (the async with block only closes the initial one).
+        # Do NOT check .closed — ClientConnection (websockets v13+) has no such attribute.
+        if g_ws:
             try:
                 await g_ws.close()
             except Exception:
