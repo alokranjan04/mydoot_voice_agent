@@ -364,24 +364,49 @@ DIAGNOSTIC_FLOWS = {
     # ── Electrical ───────────────────────────────────────────────────────────
     "Wiring": {
         "issue_types": [
-            "Socket Failure", "MCB Tripping", "Short Circuit",
+            "Socket / Light Point Failure", "MCB Tripping", "Short Circuit",
             "New Point / Extension", "Wiring Damage", "Other Electrical Issue",
         ],
         "questions": [
-            "Are other nearby sockets in the same room working normally?",
-            "Does the MCB trip when a specific appliance is plugged in?",
-            "Is there any burning smell, sparks, or visible damage to wires or sockets?",
+            "Kya sirf ek light ya socket kaam nahi kar rahi, ya poore kamre mein power nahi hai? (e.g. ek bulb band, ya pura room dark ho gaya)",
+            "Kya distribution board (DB/switch board) mein koi switch neeche gir gaya hai — MCB trip hua hai?",
+            "Kya koi jalne ki smell aa rahi hai, ya wire/socket mein koi daag ya damage dikh raha hai?",
         ],
         "hints": (
-            "Socket Failure: if other sockets work, isolated socket fault. "
-            "MCB Tripping: overload or short circuit — identify which appliance triggers it. "
-            "Short Circuit: burn marks or sparks — do not use until inspected."
+            "Socket/Light Point Failure: if other points in the room work, isolated point fault — likely loose connection or blown fuse point. "
+            "MCB Tripping: MCB switch in DB board fell down — overload or short in that circuit. "
+            "Short Circuit: burn marks, sparks, or burning smell — safety risk."
         ),
         "severity_map": {
-            "Socket Failure": "Medium",
+            "Socket / Light Point Failure": "Medium",
             "MCB Tripping": "High",
             "Short Circuit": "High",
             "New Point / Extension": "Low",
+            "Wiring Damage": "High",
+        },
+    },
+    "Light / Tube Light Fitting": {
+        "issue_types": [
+            "Light Not Working", "Flickering Light", "Fitting Replacement",
+            "New Light Installation", "Starter / Choke Issue", "Other Light Issue",
+        ],
+        "questions": [
+            "Kya sirf ek light band hai, ya us room ki saari lights nahi chal rahi? (e.g. ek bulb fused, ya pura kamra dark)",
+            "Kya switch press karne par light bilkul nahi aati, ya flicker karti hai / kam roshan hai?",
+            "Kya aapne bulb/tube already badal ke dekha, ya abhi tak nahi badla?",
+        ],
+        "hints": (
+            "Light Not Working: single bulb fused or holder loose — simple fix. "
+            "Multiple lights out: check MCB in DB board — may have tripped. "
+            "Flickering Light: loose wire in switch or holder, or starter/choke issue in tube light. "
+            "Fitting Replacement: holder or batten damaged — needs new fitting."
+        ),
+        "severity_map": {
+            "Light Not Working": "Medium",
+            "Flickering Light": "Low",
+            "Fitting Replacement": "Low",
+            "New Light Installation": "Low",
+            "Starter / Choke Issue": "Low",
         },
     },
     "MCB / Fuse / DB": {
@@ -739,10 +764,13 @@ def get_stage_context(state: ServiceState) -> str:
             opts = ", ".join(subcats[:7])
             instruction = (
                 f"Category confirmed: '{cat}'. "
-                f"ASK: Which specific type? Options include: {opts}."
+                f"ASK: Which specific type? Give a brief example to help the customer understand. "
+                f"Options: {opts}. "
+                f"Frame as a natural Hinglish question with 2-3 examples, e.g. "
+                f"'Kaunsa kaam chahiye — wiring, MCB/fuse, light fitting, ya switch-socket?'"
             )
         else:
-            instruction = f"Category confirmed: '{cat}'. ASK: Describe the specific problem."
+            instruction = f"Category confirmed: '{cat}'. ASK: Describe the specific problem with an example."
 
     elif stage == "diagnosis":
         what = subcat or cat or "this"
@@ -751,9 +779,15 @@ def get_stage_context(state: ServiceState) -> str:
         q_list     = " | ".join(flow["questions"][:3])
         hints      = flow.get("hints", "")
         instruction = (
-            f"Subcategory: '{what}'. Now run DIAGNOSTIC to identify the issue type. "
+            f"Subcategory: '{what}'. Run DIAGNOSTIC to identify the issue type. "
             f"Possible issue types: {issue_opts}. "
-            f"Ask these diagnostic questions (one at a time, skip if already answered): {q_list}. "
+            f"Ask these diagnostic questions ONE AT A TIME in simple Hinglish. "
+            f"IMPORTANT: Each question must include 2-3 concrete examples in brackets so the customer "
+            f"understands — do NOT ask abstract questions like 'kya specific dikkat hai' or "
+            f"'diagnosis batao'. Ask specific yes/no or choice questions with examples: {q_list}. "
+            f"If customer says 'pata nahi', 'electrician dekhega', or cannot answer → "
+            f"pick the most likely issue type from routing hints and say "
+            f"'Main sabse common problem select kar rahi hoon — [issue type].' then move on. "
             f"Routing hints: {hints} "
             f"If error code mentioned (e.g. E3, F1), record it. "
             f"Once issue type is clear, record issue_type (and severity if obvious) then proceed."
@@ -790,9 +824,8 @@ def get_stage_context(state: ServiceState) -> str:
             "Call save_service_request tool IMMEDIATELY — do NOT say anything to the customer "
             "before calling the tool. After tool success, speak the confirmation — "
             "first word must be the customer's name: "
-            "'[name] ji, aapki request register ho gayi hai. Hamari team jald se jald, "
-            "ek ghante ke andar aapse sampark karegi. My Doot ko call karne ke liye shukriya!' "
-            "Then go COMPLETELY SILENT."
+            "'[name] ji, aapki request register ho gayi hai. Hamari team jald se jald aapse sampark karegi. My Doot ko call karne ke liye shukriya!' "
+            "Say it ONCE only. Then go COMPLETELY SILENT. Do not repeat."
         )
 
     else:
