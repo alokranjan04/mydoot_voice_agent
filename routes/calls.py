@@ -21,23 +21,25 @@ _CALLS_HTML = """\
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Call Logs — Mydoot</title>
+<title>Call Logs — My Doot</title>
 <style>
   :root {
     --primary: #6366f1; --primary-hover: #4f46e5;
     --bg: #f8fafc; --card: #ffffff;
     --text: #0f172a; --text-muted: #64748b;
     --border: #e2e8f0;
-    --green: #10b981; --red: #ef4444; --yellow: #f59e0b;
+    --agent-bg: #ede9fe; --agent-text: #3730a3;
+    --cust-bg: #dcfce7;  --cust-text: #14532d;
   }
   *,*::before,*::after { box-sizing: border-box; }
   body { font-family: 'Inter', -apple-system, sans-serif; background: var(--bg); margin: 0; padding: 32px; color: var(--text); }
-  .container { max-width: 1300px; margin: 0 auto; }
+  .container { max-width: 1380px; margin: 0 auto; }
   header { margin-bottom: 32px; display: flex; align-items: center; justify-content: space-between; }
   h1 { margin: 0; font-size: 2rem; font-weight: 800; background: linear-gradient(to right, #6366f1, #a855f7); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
   .sub { color: var(--text-muted); font-size: 0.9rem; margin-top: 4px; }
-  .back { color: var(--primary); text-decoration: none; font-size: 0.85rem; font-weight: 600; }
-  .back:hover { text-decoration: underline; }
+  .nav-links { display: flex; gap: 16px; align-items: center; }
+  .back { color: var(--primary); text-decoration: none; font-size: 0.85rem; font-weight: 600; padding: 7px 16px; border: 2px solid var(--primary); border-radius: 8px; }
+  .back:hover { background: var(--primary); color: white; }
 
   /* Stats */
   .stats { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 16px; margin-bottom: 28px; }
@@ -57,8 +59,9 @@ _CALLS_HTML = """\
   th { padding: 11px 14px; text-align: left; font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-muted); background: #f8fafc; border-bottom: 1px solid var(--border); white-space: nowrap; }
   td { padding: 11px 14px; border-bottom: 1px solid #f1f5f9; vertical-align: middle; }
   tr:last-child td { border-bottom: none; }
-  tr.data-row { cursor: pointer; }
-  tr.data-row:hover td { background: #f8f9ff; }
+  tr.data-row { cursor: pointer; transition: background 0.1s; }
+  tr.data-row:hover td { background: #f5f3ff; }
+  tr.data-row.expanded td { background: #ede9fe; }
 
   /* Badges */
   .badge { display: inline-block; padding: 2px 9px; border-radius: 99px; font-size: 0.7rem; font-weight: 700; }
@@ -66,12 +69,33 @@ _CALLS_HTML = """\
   .badge-red   { background: #fee2e2; color: #991b1b; }
   .badge-gray  { background: #f1f5f9; color: var(--text-muted); }
 
-  /* Expandable transcript */
-  tr.transcript-row td { padding: 0; }
-  .transcript-panel { display: none; padding: 16px 24px; background: #fafbff; border-top: 1px solid var(--border); }
-  .transcript-panel.open { display: block; }
-  .transcript-text { white-space: pre-wrap; font-size: 0.8rem; color: #334155; line-height: 1.6; font-family: monospace; max-height: 260px; overflow-y: auto; }
-  audio { margin-top: 12px; width: 100%; max-width: 480px; height: 36px; }
+  /* Expand toggle arrow */
+  .toggle-arrow { display: inline-block; transition: transform 0.2s; font-size: 0.7rem; color: var(--text-muted); margin-right: 4px; }
+  tr.data-row.expanded .toggle-arrow { transform: rotate(90deg); }
+
+  /* Detail panel */
+  tr.detail-row td { padding: 0; border-bottom: 2px solid var(--border); }
+  .detail-panel { display: none; padding: 20px 28px 24px; background: #fafbff; }
+  .detail-panel.open { display: block; }
+  .detail-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+
+  /* Audio section */
+  .audio-section { margin-bottom: 0; }
+  .section-label { font-size: 0.7rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.07em; color: var(--text-muted); margin-bottom: 10px; }
+  .audio-player { width: 100%; height: 40px; border-radius: 8px; }
+  .no-audio { font-size: 0.82rem; color: var(--text-muted); font-style: italic; padding: 10px 0; }
+
+  /* Transcript chat bubbles */
+  .transcript-section { max-height: 340px; overflow-y: auto; padding-right: 4px; }
+  .chat-line { display: flex; flex-direction: column; margin-bottom: 8px; }
+  .chat-line.agent { align-items: flex-start; }
+  .chat-line.customer { align-items: flex-end; }
+  .chat-ts { font-size: 0.65rem; color: var(--text-muted); margin-bottom: 2px; font-family: monospace; }
+  .chat-bubble { max-width: 85%; padding: 7px 12px; border-radius: 12px; font-size: 0.82rem; line-height: 1.5; word-break: break-word; }
+  .chat-line.agent .chat-bubble { background: var(--agent-bg); color: var(--agent-text); border-top-left-radius: 3px; }
+  .chat-line.customer .chat-bubble { background: var(--cust-bg); color: var(--cust-text); border-top-right-radius: 3px; }
+  .chat-role { font-size: 0.65rem; font-weight: 700; margin-bottom: 3px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em; }
+  .no-transcript { font-size: 0.82rem; color: var(--text-muted); font-style: italic; }
 
   .loading { padding: 48px; text-align: center; color: var(--text-muted); font-size: 0.9rem; }
   .empty { padding: 48px; text-align: center; color: var(--text-muted); }
@@ -84,7 +108,9 @@ _CALLS_HTML = """\
       <h1>Call Logs</h1>
       <div class="sub">Per-call quality and observability — last 200 calls</div>
     </div>
-    <a class="back" href="/">&#8592; Dashboard</a>
+    <div class="nav-links">
+      <a class="back" href="/">&#8592; Dashboard</a>
+    </div>
   </header>
 
   <div class="stats" id="stats-row">
@@ -136,7 +162,6 @@ function renderStats(rows) {
   const sttAvg = avg(rows.map(r => r['STT Avg (ms)']));
   const dropAvg = avg(rows.map(r => r['STT Drops']));
   const bargeAvg = avg(rows.map(r => r['Barge-Ins']));
-
   document.getElementById('s-total').textContent = total;
   document.getElementById('s-saved').textContent = saved;
   document.getElementById('s-saved-pct').textContent = pct + '% completion';
@@ -150,17 +175,41 @@ function esc(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
+// Parse "[HH:MM:SS.mmm] Role: text" lines into chat bubbles HTML
+function buildTranscriptHTML(raw) {
+  if (!raw || !raw.trim()) return '<div class="no-transcript">No transcript recorded.</div>';
+  const lines = raw.split('\\n').filter(l => l.trim());
+  if (!lines.length) return '<div class="no-transcript">No transcript recorded.</div>';
+  let html = '';
+  const lineRe = /^\\[([^\\]]+)\\]\\s*(Agent|Customer):\\s*(.*)$/i;
+  lines.forEach(line => {
+    const m = line.match(lineRe);
+    if (!m) {
+      // Unrecognised line — show as plain text
+      html += `<div class="chat-line agent"><div class="chat-bubble" style="background:#f1f5f9;color:#475569">${esc(line)}</div></div>`;
+      return;
+    }
+    const [, ts, role, text] = m;
+    const cls = role.toLowerCase() === 'agent' ? 'agent' : 'customer';
+    html += `<div class="chat-line ${cls}">
+      <div class="chat-ts">${esc(ts)} · ${esc(role)}</div>
+      <div class="chat-bubble">${esc(text)}</div>
+    </div>`;
+  });
+  return html || '<div class="no-transcript">No transcript recorded.</div>';
+}
+
 function renderTable(rows) {
   if (!rows.length) {
     document.getElementById('table-wrap').innerHTML = '<div class="empty">No call logs yet.</div>';
     return;
   }
   let html = '<table><thead><tr>'
+    + '<th></th>'
     + '<th>Time (IST)</th><th>Caller</th><th>Dur (s)</th>'
     + '<th>Category</th><th>Subcategory</th><th>Issue Type</th>'
     + '<th>Stage</th><th>Saved</th>'
-    + '<th>STT Avg</th><th>STT Drops</th><th>Barge-Ins</th><th>Reconnects</th>'
-    + '<th>Audio</th>'
+    + '<th>STT Avg</th><th>Drops</th><th>Barge-Ins</th><th>Reconnects</th>'
     + '</tr></thead><tbody>';
 
   rows.forEach((r, i) => {
@@ -170,11 +219,20 @@ function renderTable(rows) {
       : '<span class="badge badge-red">No</span>';
     const stage = r['Stage Reached'] || '—';
     const audio = r['Audio GCS'] || '';
-    const audioBtn = audio
-      ? `<button onclick="event.stopPropagation();playAudio('${esc(audio)}',this)" style="background:none;border:1px solid var(--border);border-radius:6px;padding:3px 9px;font-size:0.75rem;cursor:pointer;">&#9654;</button>`
-      : '<span style="color:var(--text-muted);font-size:0.75rem">—</span>';
+    const transcriptHTML = buildTranscriptHTML(r['Transcript'] || '');
 
-    html += `<tr class="data-row" onclick="toggleTranscript(${i})">
+    const audioSection = audio
+      ? `<div class="audio-section">
+          <div class="section-label">&#9654; Recording</div>
+          <audio class="audio-player" controls src="/calls/audio?uri=${encodeURIComponent(audio)}"></audio>
+         </div>`
+      : `<div class="audio-section">
+          <div class="section-label">&#9654; Recording</div>
+          <div class="no-audio">No recording for this call.</div>
+         </div>`;
+
+    html += `<tr class="data-row" id="row-${i}" onclick="toggleDetail(${i})">
+      <td style="width:28px;text-align:center"><span class="toggle-arrow">&#9654;</span></td>
       <td style="white-space:nowrap;font-size:0.78rem">${esc(r['Timestamp (IST)'] || '—')}</td>
       <td style="font-family:monospace;font-size:0.78rem">${esc(r['Caller ID'] || '—')}</td>
       <td>${esc(r['Duration (s)'] || '—')}</td>
@@ -187,14 +245,17 @@ function renderTable(rows) {
       <td>${esc(r['STT Drops'] || '0')}</td>
       <td>${esc(r['Barge-Ins'] || '0')}</td>
       <td>${esc(r['Reconnects'] || '0')}</td>
-      <td>${audioBtn}</td>
     </tr>
-    <tr class="transcript-row" id="tr-${i}">
+    <tr class="detail-row" id="dr-${i}">
       <td colspan="13">
-        <div class="transcript-panel" id="tp-${i}">
-          <div style="font-size:0.72rem;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;color:var(--text-muted);margin-bottom:8px">Transcript</div>
-          <div class="transcript-text">${esc(r['Transcript'] || 'No transcript.')}</div>
-          ${audio ? `<audio id="aud-${i}" controls src="" style="display:none"></audio>` : ''}
+        <div class="detail-panel" id="dp-${i}">
+          <div class="detail-grid">
+            ${audioSection}
+            <div>
+              <div class="section-label">&#128172; Transcript</div>
+              <div class="transcript-section">${transcriptHTML}</div>
+            </div>
+          </div>
         </div>
       </td>
     </tr>`;
@@ -204,24 +265,17 @@ function renderTable(rows) {
   document.getElementById('table-wrap').innerHTML = html;
 }
 
-function toggleTranscript(i) {
-  const panel = document.getElementById('tp-' + i);
-  if (!panel) return;
-  panel.classList.toggle('open');
-}
-
-function playAudio(gcsUri, btn) {
-  const row = btn.closest('tr');
-  const next = row.nextElementSibling;
-  if (!next) return;
-  const panel = next.querySelector('.transcript-panel');
-  if (panel) panel.classList.add('open');
-  const aud = next.querySelector('audio');
-  if (!aud) return;
-  const proxied = '/calls/audio?uri=' + encodeURIComponent(gcsUri);
-  aud.src = proxied;
-  aud.style.display = 'block';
-  aud.play();
+function toggleDetail(i) {
+  const panel = document.getElementById('dp-' + i);
+  const row   = document.getElementById('row-' + i);
+  if (!panel || !row) return;
+  const isOpen = panel.classList.toggle('open');
+  row.classList.toggle('expanded', isOpen);
+  // Pause audio when collapsing
+  if (!isOpen) {
+    const aud = panel.querySelector('audio');
+    if (aud) aud.pause();
+  }
 }
 
 load();
