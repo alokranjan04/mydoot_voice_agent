@@ -46,11 +46,13 @@ RECORDINGS_DIR             = os.getenv("RECORDINGS_DIR", "recordings")
 # Hard time ceiling on audio forwarding after save. The confirmation is ~6s.
 # 8s gives enough room for the message to complete and cuts off any Gemini
 # repetition (the model occasionally repeats the closing line twice).
-MAX_CONFIRMATION_AUDIO_SECS = 4.0
+MAX_CONFIRMATION_AUDIO_SECS = 8.0
 # Audio-duration cutoff (not wall-clock): Gemini streams audio faster than
 # real-time, so a wall-clock check fires too late.  By counting PCM bytes
-# forwarded, we cut the stream right after one confirmation message (~3.2s)
-# before the second repetition reaches Vobiz.
+# forwarded, we cut the stream after one full confirmation message (~6-7s)
+# before any second repetition can fully play. Set high enough that the
+# first message always completes; the secondary repetition (if Gemini
+# generates one) gets cut ~2s in.
 # Minimum post-save audio that must have played before a turnComplete is
 # allowed to close the call. The wait message ("Ek second...") is ~2s.
 # Requiring 2.5s ensures the wait-message's own turnComplete is NOT treated
