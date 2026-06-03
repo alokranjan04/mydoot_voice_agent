@@ -403,7 +403,7 @@ if res.get("success"):
 
 After tool success, Gemini speaks the confirmation (Hinglish):
 
-> *"[name] ji, aapki request register ho gayi hai. Hamari team jald se jald aapse sampark karegi. My Doot ko call karne ke liye shukriya!"*
+> *"[name] ji, aapki request register ho gayi hai. Hamari team jald se jald aapse sampark karegi. MyDoot ko call karne ke liye shukriya!"*
 
 Response time is left intentionally open ("jald se jald" — as soon as possible) in the voice message; the actual SLA is communicated separately by the dispatcher.
 

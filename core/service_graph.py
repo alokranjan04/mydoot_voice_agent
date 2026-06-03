@@ -824,7 +824,7 @@ def get_stage_context(state: ServiceState) -> str:
             "Call save_service_request tool IMMEDIATELY — do NOT say anything to the customer "
             "before calling the tool. After tool success, speak the confirmation — "
             "first word must be the customer's name: "
-            "'[name] ji, aapki request register ho gayi hai. Hamari team jald se jald aapse sampark karegi. My Doot ko call karne ke liye shukriya!' "
+            "'[name] ji, aapki request register ho gayi hai. Hamari team jald se jald aapse sampark karegi. MyDoot ko call karne ke liye shukriya!' "
             "Say it ONCE only. Then go COMPLETELY SILENT. Do not repeat."
         )
 

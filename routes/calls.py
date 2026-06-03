@@ -21,7 +21,7 @@ _CALLS_HTML = """\
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Call Logs — My Doot</title>
+<title>Call Logs — MyDoot</title>
 <style>
   :root {
     --primary: #6366f1; --primary-hover: #4f46e5;
@@ -105,7 +105,7 @@ _CALLS_HTML = """\
 <div class="container">
   <header>
     <div>
-      <h1>Call Logs</h1>
+      <h1>MyDoot Call Logs</h1>
       <div class="sub">Per-call quality and observability — last 200 calls</div>
     </div>
     <div class="nav-links">

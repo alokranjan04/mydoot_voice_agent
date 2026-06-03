@@ -327,7 +327,7 @@ Gemini asks ONE diagnosis question: "Kya cooling bhi band ho gayi hai?"
 Gemini calls save_service_request() IMMEDIATELY — no wait message before tool call
         │
         ▼ Google Sheets: new row appended (11 columns)
-Gemini: "[name] ji, aapki request register ho gayi hai. Hamari team jald se jald aapse sampark karegi. My Doot ko call karne ke liye shukriya!"
+Gemini: "[name] ji, aapki request register ho gayi hai. Hamari team jald se jald aapse sampark karegi. MyDoot ko call karne ke liye shukriya!"
         │
         ▼ Call auto-closes after confirmation audio completes
         │

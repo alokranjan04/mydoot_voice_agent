@@ -105,8 +105,8 @@ Fields collected:
 ### FR-6: Post-Save Confirmation
 - Call `save_service_request` tool IMMEDIATELY when all fields are confirmed — do NOT say anything to the customer before the tool call
 - After save succeeds, speak the confirmation message exactly once — first word must be the customer's name:
-  - Hinglish: "[name] ji, aapki request register ho gayi hai. Hamari team jald se jald aapse sampark karegi. My Doot ko call karne ke liye shukriya!"
-  - English: "[name], your request has been registered. Our team will contact you as soon as possible. Thank you for calling My Doot!"
+  - Hinglish: "[name] ji, aapki request register ho gayi hai. Hamari team jald se jald aapse sampark karegi. MyDoot ko call karne ke liye shukriya!"
+  - English: "[name], your request has been registered. Our team will contact you as soon as possible. Thank you for calling MyDoot!"
 - After confirmation, go completely silent — do not repeat, do not add anything
 
 ### FR-7: Post-Call Transcript Email
