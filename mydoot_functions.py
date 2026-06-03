@@ -543,13 +543,13 @@ def save_call_log(
             return {"success": False}
         _ensure_call_logs_sheet(service, spreadsheet_id)
         timestamp = datetime.now(_IST).strftime("%Y-%m-%d %H:%M:%S IST")
-        transcript_str = json.dumps(transcript, ensure_ascii=False)[:3000]
+        transcript_str = "\n".join(transcript)[:3000]
         values = [[
             timestamp,
             caller_id,
             round(duration_secs, 1),
             stage_reached,
-            "YES" if saved else "NO",
+            "TRUE" if saved else "FALSE",
             category or "",
             subcategory or "",
             issue_type or "",

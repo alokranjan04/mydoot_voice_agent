@@ -156,7 +156,7 @@ function avg(arr) {
 
 function renderStats(rows) {
   const total = rows.length;
-  const saved = rows.filter(r => r['Saved'] === 'TRUE' || r['Saved'] === true || r['Saved'] === '1').length;
+  const saved = rows.filter(r => r['Saved'] === 'TRUE' || r['Saved'] === true || r['Saved'] === '1' || r['Saved'] === 'YES').length;
   const pct = total ? Math.round(100 * saved / total) : 0;
   const durAvg = avg(rows.map(r => r['Duration (s)']));
   const sttAvg = avg(rows.map(r => r['STT Avg (ms)']));
@@ -213,7 +213,7 @@ function renderTable(rows) {
     + '</tr></thead><tbody>';
 
   rows.forEach((r, i) => {
-    const saved = r['Saved'] === 'TRUE' || r['Saved'] === true || r['Saved'] === '1';
+    const saved = r['Saved'] === 'TRUE' || r['Saved'] === true || r['Saved'] === '1' || r['Saved'] === 'YES';
     const badgeSaved = saved
       ? '<span class="badge badge-green">Saved</span>'
       : '<span class="badge badge-red">No</span>';
