@@ -46,13 +46,11 @@ RECORDINGS_DIR             = os.getenv("RECORDINGS_DIR", "recordings")
 # Hard time ceiling on audio forwarding after save. The confirmation is ~6s.
 # 8s gives enough room for the message to complete and cuts off any Gemini
 # repetition (the model occasionally repeats the closing line twice).
-MAX_CONFIRMATION_AUDIO_SECS = 8.0
-# Audio-duration cutoff (not wall-clock): Gemini streams audio faster than
-# real-time, so a wall-clock check fires too late.  By counting PCM bytes
-# forwarded, we cut the stream after one full confirmation message (~6-7s)
-# before any second repetition can fully play. Set high enough that the
-# first message always completes; the secondary repetition (if Gemini
-# generates one) gets cut ~2s in.
+MAX_CONFIRMATION_AUDIO_SECS = 12.0
+# Safety-net only: end-marker transcript detection (below) is the primary
+# mechanism to stop Gemini repetitions. This byte cap (12 s ≈ 3 messages)
+# only fires if the transcript-based detection somehow misses, preventing
+# the call from staying open indefinitely.
 # Minimum post-save audio that must have played before a turnComplete is
 # allowed to close the call. The wait message ("Ek second...") is ~2s.
 # Requiring 2.5s ensures the wait-message's own turnComplete is NOT treated
@@ -532,18 +530,31 @@ async def gemini_handler(request):
                                 log(f"🗣  {line}")
                                 customer_buf = ""
                             agent_buf += out_t["text"]
-                            # ── Detect repeated confirmation in transcript ────────
-                            # Transcription arrives before the matching audio packet,
-                            # so setting confirmation_done here blocks the audio that
-                            # follows in the same (or next) packet — preventing the
-                            # second repetition from reaching Vobiz entirely.
+                            # ── Detect repeated confirmation via end-marker ───────
+                            # Look for the confirmation end-marker ("shukriya" /
+                            # "thank you for calling") in the agent buffer. Once
+                            # found, any text that follows means Gemini has started
+                            # repeating — set confirmation_done to block the audio
+                            # for that repetition before it reaches Vobiz.
+                            # (Customer-name counting was unreliable: the name can
+                            # appear earlier in the same turn, firing too early.)
                             if save_done_ts > 0 and not confirmation_done:
-                                _cname = service_graph.state.get("customer_name", "")
-                                if _cname and agent_buf.lower().count(_cname.lower()) >= 2:
+                                _buf_l = agent_buf.lower()
+                                _end_pos = -1
+                                for _marker, _mlen in [
+                                    ("shukriya", 8),
+                                    ("thank you for calling", 20),
+                                ]:
+                                    _p = _buf_l.find(_marker)
+                                    if _p != -1:
+                                        _end_pos = _p + _mlen
+                                        break
+                                if _end_pos != -1 and _buf_l[_end_pos:].strip():
                                     confirmation_done = True
-                                    log(f"🔇 Repeated confirmation ('{_cname}' ×2) "
-                                        f"— audio blocked, closing in 3s")
-                                    asyncio.create_task(_close_after(ws, g_ws, 3.0, log))
+                                    log("🔇 Repetition after end-marker — "
+                                        "blocking audio, closing in 2s")
+                                    asyncio.create_task(
+                                        _close_after(ws, g_ws, 2.0, log))
 
                         server_content = data.get("serverContent", {})
 
