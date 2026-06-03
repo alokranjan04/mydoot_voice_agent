@@ -532,6 +532,18 @@ async def gemini_handler(request):
                                 log(f"🗣  {line}")
                                 customer_buf = ""
                             agent_buf += out_t["text"]
+                            # ── Detect repeated confirmation in transcript ────────
+                            # Transcription arrives before the matching audio packet,
+                            # so setting confirmation_done here blocks the audio that
+                            # follows in the same (or next) packet — preventing the
+                            # second repetition from reaching Vobiz entirely.
+                            if save_done_ts > 0 and not confirmation_done:
+                                _cname = service_graph.state.get("customer_name", "")
+                                if _cname and agent_buf.lower().count(_cname.lower()) >= 2:
+                                    confirmation_done = True
+                                    log(f"🔇 Repeated confirmation ('{_cname}' ×2) "
+                                        f"— audio blocked, closing in 3s")
+                                    asyncio.create_task(_close_after(ws, g_ws, 3.0, log))
 
                         server_content = data.get("serverContent", {})
 
@@ -707,10 +719,10 @@ async def gemini_handler(request):
                                     if is_save_fn and res.get("success"):
                                         save_executed = True
                                         save_done_ts = time.time()
-                                        log("🔒 Post-save guard active — blocking audio for 15s")
-                                        # Fallback close: if confirmation turnComplete never fires
-                                        # (e.g. Gemini silent after save), close after 15s.
-                                        asyncio.create_task(_close_after(ws, g_ws, 15.0, log))
+                                        log("🔒 Post-save guard active — blocking audio for 8s")
+                                        # Fallback close: if no transcript-detection or
+                                        # turnComplete fires, close after 8s.
+                                        asyncio.create_task(_close_after(ws, g_ws, 8.0, log))
                                         tool_result = res
                                     elif is_save_fn and not res.get("success"):
                                         # Save failed — send explicit error so Gemini knows
