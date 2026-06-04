@@ -23,6 +23,7 @@ from routes.metrics   import metrics_page, metrics_data
 from routes.uploads   import upload_file, list_files, delete_file
 from routes.calls     import calls_page, calls_data, audio_proxy
 from mydoot_functions import get_google_creds_health, get_gmail_health, SPREADSHEET_ID
+from config.database import init_db
 
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
@@ -51,6 +52,9 @@ async def main():
                 json.dump(json_data, f, indent=2)
         except Exception:
             pass
+
+    # ── Bootstrap PostgreSQL (no-op if POSTGRES_URL unset) ────────────────────
+    init_db()
 
     app = web.Application()
 

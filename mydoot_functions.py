@@ -21,6 +21,9 @@ _IST = timezone(timedelta(hours=5, minutes=30))
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
+from config.database import get_conn, put_conn
+from config.settings import INSTANCE_ID
+
 SPREADSHEET_ID = os.getenv("GOOGLE_SPREADSHEET_ID", "")
 
 # Cached Sheets service — rebuilt when TTL expires or on stale-connection error.
@@ -392,6 +395,48 @@ def save_service_request(customer_name, category, subcategory, issue_type,
     print(f"[SERVICE REQUEST]: SpreadsheetID={SPREADSHEET_ID!r}")
 
     timestamp = datetime.now(_IST).strftime("%Y-%m-%d %H:%M:%S")
+
+    # ── 1. PostgreSQL (primary, soft-fail) ────────────────────────────────────
+    pg_ok = False
+    conn = get_conn()
+    if conn is not None:
+        try:
+            raw = {
+                "customer_name": customer_name, "category": category,
+                "subcategory": subcategory, "issue_type": issue_type,
+                "brand": brand, "model": model, "severity": severity,
+                "address": address, "preferred_time": preferred_time,
+                "caller_id": caller_id, "error_code": error_code,
+                "warranty_status": warranty_status,
+            }
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO service_requests
+                        (instance_id, caller_id, customer_name, category,
+                         subcategory, issue_type, brand, model, severity,
+                         address, preferred_time, raw_json)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    """,
+                    (
+                        INSTANCE_ID, caller_id or "", customer_name,
+                        category, subcategory, issue_type,
+                        brand or "", model or "", severity or "",
+                        address, preferred_time,
+                        json.dumps(raw, ensure_ascii=False),
+                    ),
+                )
+            conn.commit()
+            put_conn(conn)
+            pg_ok = True
+            print(f"[SERVICE REQUEST][PG]: Saved — instance={INSTANCE_ID}")
+        except Exception as pg_err:
+            print(f"[SERVICE REQUEST][PG ERROR]: {pg_err}")
+            put_conn(conn, discard=True)
+    else:
+        print("[SERVICE REQUEST][PG]: No pool — Sheets only")
+
+    # ── 2. Google Sheets (secondary) ─────────────────────────────────────────
     values = [[
         customer_name, category, subcategory, issue_type,
         brand or "", model or "", severity or "",
@@ -462,7 +507,7 @@ def save_service_request(customer_name, category, subcategory, issue_type,
                 print(f"[SERVICE REQUEST ERROR] (retry): {retry_e}")
         print(f"[SERVICE REQUEST ERROR]: {e}")
         _tb.print_exc()
-        return {"success": False, "message": str(e)}
+        return {"success": pg_ok, "message": str(e)}
 
 
 FUNCTION_MAP = {
@@ -536,33 +581,61 @@ def save_call_log(
     audio_gcs: str,
     transcript: list,
 ) -> dict:
-    """Append one row to the Call_Logs sheet. Called at end of every call."""
+    """Append one row to call_logs. Writes PostgreSQL first, then Google Sheets."""
+    transcript_str = "\n".join(transcript)[:3000]
+
+    # ── 1. PostgreSQL (primary, soft-fail) ────────────────────────────────────
+    pg_ok = False
+    conn = get_conn()
+    if conn is not None:
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO call_logs
+                        (instance_id, caller_id, duration_secs, stage_reached,
+                         saved, category, subcategory, issue_type,
+                         customer_name, address, preferred_time,
+                         stt_count, stt_avg_ms, stt_drops,
+                         barge_ins, reconnects, audio_gcs, transcript)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    """,
+                    (
+                        INSTANCE_ID, caller_id, round(duration_secs, 1),
+                        stage_reached, saved,
+                        category or "", subcategory or "", issue_type or "",
+                        customer_name or "", address or "", preferred_time or "",
+                        stt_count,
+                        round(stt_avg_ms) if stt_avg_ms else None,
+                        stt_drops, barge_ins, reconnects,
+                        audio_gcs or "", transcript_str,
+                    ),
+                )
+            conn.commit()
+            put_conn(conn)
+            pg_ok = True
+            print(f"[CALL LOG][PG]: Saved — caller={caller_id} instance={INSTANCE_ID}")
+        except Exception as pg_err:
+            print(f"[CALL LOG][PG ERROR]: {pg_err}")
+            put_conn(conn, discard=True)
+    else:
+        print("[CALL LOG][PG]: No pool — Sheets only")
+
+    # ── 2. Google Sheets (secondary) ─────────────────────────────────────────
     try:
         service, spreadsheet_id = _get_sheets_service()
         if not service:
-            return {"success": False}
+            return {"success": pg_ok}
         _ensure_call_logs_sheet(service, spreadsheet_id)
         timestamp = datetime.now(_IST).strftime("%Y-%m-%d %H:%M:%S IST")
-        transcript_str = "\n".join(transcript)[:3000]
         values = [[
-            timestamp,
-            caller_id,
-            round(duration_secs, 1),
-            stage_reached,
-            "TRUE" if saved else "FALSE",
-            category or "",
-            subcategory or "",
-            issue_type or "",
-            customer_name or "",
-            address or "",
-            preferred_time or "",
-            stt_count,
-            round(stt_avg_ms) if stt_avg_ms else "",
-            stt_drops,
-            barge_ins,
-            reconnects,
-            audio_gcs or "",
-            transcript_str,
+            timestamp, caller_id, round(duration_secs, 1),
+            stage_reached, "TRUE" if saved else "FALSE",
+            category or "", subcategory or "", issue_type or "",
+            customer_name or "", address or "", preferred_time or "",
+            stt_count, round(stt_avg_ms) if stt_avg_ms else "",
+            stt_drops, barge_ins, reconnects,
+            audio_gcs or "", transcript_str,
         ]]
         service.spreadsheets().values().append(
             spreadsheetId=spreadsheet_id,
@@ -575,7 +648,7 @@ def save_call_log(
         return {"success": True}
     except Exception as e:
         print(f"[CALL LOG ERROR] {e}")
-        return {"success": False}
+        return {"success": pg_ok}
 
 
 def get_call_logs(n: int = 200) -> list:

@@ -9,6 +9,14 @@ DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY",  "").strip()
 GEMINI_API_KEY   = os.getenv("GEMINI_API_KEY",    "").strip()
 PORT             = int(os.getenv("PORT", "5050"))
 
+# ── PostgreSQL + multi-instance ───────────────────────────────────────────────
+# POSTGRES_URL format: postgresql://user:password@34.122.77.178:5432/mydoot
+# Leave unset to run without PostgreSQL (Sheets-only mode).
+POSTGRES_URL = os.getenv("POSTGRES_URL", "").strip()
+# INSTANCE_ID identifies which client/tenant this Cloud Run service belongs to.
+# Set a unique value per service deployment (e.g. "mydoot", "client_abc").
+INSTANCE_ID  = os.getenv("INSTANCE_ID", "default").strip()
+
 SARVAM_CHAT_URL = "https://api.sarvam.ai/v1/chat/completions"
 SARVAM_TTS_URL  = "https://api.sarvam.ai/text-to-speech"
 
