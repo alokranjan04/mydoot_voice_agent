@@ -72,11 +72,13 @@ async def _close_after(vobiz_ws, gemini_ws, delay: float, log_fn):
     """Close both WebSockets after `delay` seconds — ends the call gracefully."""
     await asyncio.sleep(delay)
     log_fn(f"📴 Closing call after {delay}s post-confirmation delay")
+    log_fn(f"EVT ws_close_gemini delay={delay}s")
     try:
         await gemini_ws.close()
     except Exception:
         pass
     await asyncio.sleep(0.1)  # let g_receiver clean up before dropping Vobiz
+    log_fn(f"EVT ws_close_vobiz")
     try:
         if not vobiz_ws.closed:
             await vobiz_ws.close()
@@ -442,6 +444,19 @@ async def gemini_handler(request):
     # reference it, even when Gemini fails during connect (e.g. credits depleted).
     save_executed = False
 
+    # ── Structured event log — proves duplicate confirmation sequence ────────────
+    # Each entry: {"t_ms": <ms since call start>, "evt": str, ...}
+    # Filter Cloud Run logs with: grep EVT | python -c "import sys,json;[print(json.dumps(json.loads(l.split('EVT ',1)[1]))) for l in sys.stdin if 'EVT ' in l]"
+    _evt_t0  = time.perf_counter()
+    _evt_log: list[dict] = []
+
+    def evt(name: str, **kw):
+        _ms = round((time.perf_counter() - _evt_t0) * 1000)
+        _evt_log.append({"t_ms": _ms, "evt": name, **kw})
+        log("EVT t={}ms {}{}".format(
+            _ms, name,
+            " " + " ".join(f"{k}={v}" for k, v in kw.items()) if kw else ""))
+
     try:
         async with websockets.connect(
             GEMINI_WS_URL,
@@ -513,6 +528,9 @@ async def gemini_handler(request):
                 _g_reconnects  = 0
                 _reconnected   = False
                 _lt_first_audio = True   # reset each turn to capture first audio packet
+                _tc_seq             = 0     # turnComplete sequence number (call-level)
+                _post_save_burst    = 0     # counts audio bursts received after save
+                _post_save_in_burst = False # True while audio packets are flowing post-save
                 try:
                     async for raw_msg in g_ws:
                         data = json.loads(raw_msg)
@@ -569,6 +587,9 @@ async def gemini_handler(request):
                                     # (Audio leads text by ~200-500ms, so by the time
                                     # this text arrives the first message has already
                                     # played; clear only removes the repeat audio.)
+                                    evt("confirmation_done", reason="end_marker",
+                                        tc_seq=_tc_seq, burst=_post_save_burst,
+                                        audio_secs=round(confirmation_audio_secs, 2))
                                     confirmation_done = True
                                     log("🔇 End-marker reached — "
                                         "clearing Vobiz buffer + closing in 0.5s")
@@ -601,6 +622,16 @@ async def gemini_handler(request):
                                 # API returns in <80ms (faster than the audio arrives).
                                 if save_done_ts > 0:
                                     confirmation_audio_secs += len(pcm24) / 48000
+                                    # Log the start of each audio burst after save.
+                                    # burst=1 → first confirmation message
+                                    # burst=2 → second confirmation (the duplicate bug)
+                                    if not _post_save_in_burst:
+                                        _post_save_burst    += 1
+                                        _post_save_in_burst  = True
+                                        evt("response_start",
+                                            burst=_post_save_burst,
+                                            after_tc_seq=_tc_seq,
+                                            audio_so_far_secs=round(confirmation_audio_secs, 3))
                                 # Audio-duration cutoff: Gemini streams audio faster than
                                 # real-time so a wall-clock check is too slow. We count
                                 # PCM bytes forwarded and stop after MAX_CONFIRMATION_AUDIO_SECS
@@ -610,6 +641,9 @@ async def gemini_handler(request):
                                 if (save_done_ts > 0 and
                                         confirmation_audio_secs > MAX_CONFIRMATION_AUDIO_SECS):
                                     if not confirmation_done:
+                                        evt("confirmation_done", reason="byte_cap",
+                                            tc_seq=_tc_seq, burst=_post_save_burst,
+                                            audio_secs=round(confirmation_audio_secs, 2))
                                         confirmation_done = True
                                         log(f"🔇 Post-save audio cutoff ({confirmation_audio_secs:.1f}s) — clearing + blocking")
                                         try:
@@ -644,6 +678,18 @@ async def gemini_handler(request):
                             _lt_first_audio = True  # reset for next turn
                             gemini_turn_end_ts = time.time()
                             waiting_for_gemini = False  # customer may speak again
+                            _tc_seq += 1
+                            evt("turn_complete",
+                                tc_seq=_tc_seq,
+                                save_done=(save_done_ts > 0),
+                                confirmation_done=confirmation_done,
+                                audio_secs=round(confirmation_audio_secs, 2))
+                            if save_done_ts > 0:
+                                evt("response_complete",
+                                    tc_seq=_tc_seq,
+                                    burst=_post_save_burst,
+                                    audio_secs=round(confirmation_audio_secs, 2))
+                            _post_save_in_burst = False  # next audio packet = new burst
                             ai_dur = gemini_turn_end_ts - last_ai_audio_ts if last_ai_audio_ts else 0
                             # Flush agent buffer as one clean line
                             _flushed = agent_buf.strip()
@@ -686,6 +732,9 @@ async def gemini_handler(request):
                                     # two turns (or a second repetition starts before this
                                     # turnComplete), the duplicate audio is already in
                                     # Vobiz's buffer — "clear" stops it playing.
+                                    evt("confirmation_done", reason="turn_complete",
+                                        tc_seq=_tc_seq, burst=_post_save_burst,
+                                        audio_secs=round(confirmation_audio_secs, 2))
                                     confirmation_done = True
                                     log(f"✅ Confirmation turnComplete (audio={confirmation_audio_secs:.1f}s) — clearing + closing")
                                     try:
@@ -716,6 +765,8 @@ async def gemini_handler(request):
                                 args = fc.get("args", {})
                                 cid  = fc.get("id", "")
                                 log(f"🔧 Tool call: {fn} | args={json.dumps(args)}")
+                                evt("tool_call_start", fn=fn, call_id=cid,
+                                    save_already=save_executed, tc_seq=_tc_seq)
 
                                 if fn == "save_customer_feedback":
                                     # Normalize warranty_status — customers often say "1","2","3"
@@ -755,7 +806,10 @@ async def gemini_handler(request):
                                         }
                                     }))
                                 elif fn in FUNCTION_MAP:
+                                    _t_tc_start = time.time()
                                     res = await asyncio.to_thread(FUNCTION_MAP[fn], **args)
+                                    evt("tool_call_complete", fn=fn, success=res.get("success"),
+                                        took_ms=round((time.time() - _t_tc_start) * 1000))
                                     log(f"🔧 Tool result: {res}")
                                     if is_save_fn and res.get("success"):
                                         save_executed = True
@@ -801,6 +855,8 @@ async def gemini_handler(request):
                                             }]
                                         }
                                     }))
+                                    evt("tool_result_sent", fn=fn, save_done=(save_done_ts > 0),
+                                        tc_seq=_tc_seq)
                                 else:
                                     log(f"⚠️  Unknown tool: {fn}")
 
@@ -903,9 +959,15 @@ async def gemini_handler(request):
             # per utterance.
             sarvam_session = aiohttp.ClientSession()
 
-            async def _stt_and_send(pcm8_bytes: bytes, _vad_start_perf: float = 0.0):
+            async def _stt_and_send(pcm8_bytes: bytes, _vad_start_perf: float = 0.0,
+                                    _task_queued_perf: float = 0.0):
                 """Transcribe utterance and send text turn to Gemini Live."""
                 nonlocal last_customer_ts, waiting_for_gemini, barge_in_active
+                # Queue latency: time from asyncio.create_task() to this coroutine
+                # actually starting. Reveals event-loop scheduling backpressure.
+                if _task_queued_perf:
+                    _q_ms = round((time.perf_counter() - _task_queued_perf) * 1000)
+                    log(f"EVT queue_latency_ms={_q_ms}")
                 _span = lt.new_turn()
                 if _vad_start_perf:
                     _span.vad_start = _vad_start_perf
@@ -1123,7 +1185,8 @@ async def gemini_handler(request):
                                 speech_buf.clear()
                                 in_speech  = False
                                 log(f"🔁 Utterance max duration — flushing to STT")
-                                asyncio.create_task(_stt_and_send(combined, speech_start_perf))
+                                asyncio.create_task(_stt_and_send(
+                                    combined, speech_start_perf, time.perf_counter()))
 
                         elif in_speech:
                             speech_buf.append(pcm8)  # keep silence tail for natural phrase end
@@ -1138,7 +1201,8 @@ async def gemini_handler(request):
                                         log(f"⏭ Gemini busy — utterance dropped ({duration:.2f}s)")
                                         _call_track["stt_dropped"] += 1
                                     else:
-                                        asyncio.create_task(_stt_and_send(combined, speech_start_perf))
+                                        asyncio.create_task(_stt_and_send(
+                                            combined, speech_start_perf, time.perf_counter()))
                                 else:
                                     log(f"⏭ Too short ({duration:.2f}s) — ignoring")
 
@@ -1182,6 +1246,8 @@ async def gemini_handler(request):
             except Exception as rec_err:
                 log(f"⚠️  Recording save failed: {rec_err}")
         log("📋 TRANSCRIPT:\n" + ("\n".join(transcript_log) if transcript_log else "  (empty)"))
+        # Dump full event sequence — paste into any JSON viewer or filter with grep EVT_SUMMARY
+        log(f"EVT_SUMMARY {json.dumps(_evt_log, default=str)}")
         log("📧 Attempting transcript email ...")
         await asyncio.to_thread(send_call_summary_email, caller_id, transcript_log)
         # ── Write observability call log (non-blocking) ───────────────────────
