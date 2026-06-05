@@ -12,6 +12,10 @@ from aiohttp import web
 from config.settings import APP_CONFIG, GEMINI_API_KEY, GEMINI_WS_URL, SARVAM_API_KEY
 from core.state_engine import ConversationStateEngine
 from core.service_graph import ServiceGraph, ServiceState
+from core.field_validators import (
+    validate_customer_name, validate_address, validate_preferred_time, ValidationResult,
+)
+import core.local_tts as local_tts
 from mydoot_functions import FUNCTION_MAP, send_call_summary_email, upload_recording_to_gcs, save_call_log, save_turn_latency
 from core.latency_tracker import LatencyTracker
 
@@ -61,6 +65,12 @@ MAX_CONFIRMATION_AUDIO_SECS = 7.0
 # Requiring 2.5s ensures the wait-message's own turnComplete is NOT treated
 # as the confirmation-done signal, even when the tool call arrives early.
 CONFIRMATION_MIN_AUDIO_SECS = 2.5
+
+# ── Stages handled entirely by local code (no Gemini invocation) ──────────────
+# For these stages: Sarvam TTS plays the fixed prompt, field_validators validates
+# the customer's response, and echo/confirmation are handled in-process.
+# Gemini is bypassed completely — zero LLM latency for these turns.
+_LOCAL_PROMPT_STAGES: frozenset = frozenset({"address", "preferred_time", "customer_name"})
 
 
 def _ts():
@@ -317,65 +327,8 @@ def _is_confirmation(text: str) -> bool:
     return has_affirm and not has_denial
 
 
-# Patterns that indicate address/location content — should NOT be stored as name
-_ADDRESS_IN_NAME_RE = re.compile(
-    r'\b(sector|सेक्टर|plot|flat|floor|building|block|गली|नगर|मार्ग|road|'
-    r'street|phase|ward|area|locality|society|apartment|में\s+है|रहता\s+है|'
-    r'रहती\s+है|में\s+रहत|address|पता)\b|\d{3,}',
-    re.IGNORECASE
-)
-
-
-def _looks_like_name(text: str) -> bool:
-    """Basic guard: reject address-like or very long strings as candidate names."""
-    if _ADDRESS_IN_NAME_RE.search(text):
-        return False
-    words = text.strip().split()
-    return 1 <= len(words) <= 6
-
-
-def _extract_name(text: str) -> str:
-    """
-    Strip common introductory phrases so 'मेरा नाम आलोक रंजन है।' → 'आलोक रंजन'.
-    Falls back to the original text if no pattern matches.
-    """
-    t = text.strip().rstrip("।.!? ")
-    # "मेरा नाम X है" / "my name is X"
-    m = re.search(
-        r'(?:मेरा|mera|my)\s+(?:नाम|naam|name)\s*(?:है\s+|hai\s+|he\s+|is\s+)?(.+?)(?:\s+(?:है|hai|he|hain|is))?$',
-        t, re.IGNORECASE
-    )
-    if m:
-        return m.group(1).strip().rstrip("।.!? ")
-    # "naam X hai" / "naam hai X"
-    m = re.search(
-        r'(?:नाम|naam|name)\s+(?:है\s+|hai\s+)?(.+?)(?:\s+(?:है|hai|he|hain))?$',
-        t, re.IGNORECASE
-    )
-    if m:
-        extracted = m.group(1).strip().rstrip("।.!? ")
-        if 1 <= len(extracted.split()) <= 4:
-            return extracted
-    # "main X hoon" / "I am X"
-    m = re.search(
-        r'(?:मैं|main|i\s+am|i\'m)\s+(.+?)(?:\s+(?:हूँ|हूं|hoon|hun|am))?$',
-        t, re.IGNORECASE
-    )
-    if m:
-        extracted = m.group(1).strip().rstrip("।.!? ")
-        if 1 <= len(extracted.split()) <= 3:
-            return extracted
-    return t
-
-
-# Short affirmative words/phrases that must NOT be treated as the customer's name.
-# When customer says "जी हाँ" at the customer_name stage they are agreeing to give
-# their name — not stating it. Filtering these prevents wrong name capture.
-_NAME_AFFIRMATIONS: frozenset = frozenset({
-    "हाँ", "हां", "ha", "haan", "yes", "okay", "ok", "sure",
-    "ji", "bilkul", "theek hai", "theek", "sahi",
-    "जी हाँ", "जी हां", "हाँ जी", "हां जी", "ji haan", "ji ha", "ji han",
-})
+# NOTE: _looks_like_name / _extract_name / _NAME_AFFIRMATIONS removed.
+# Name validation is now handled by core.field_validators.validate_customer_name.
 
 
 def _update_stage_from_customer(transcript: str, sg: ServiceGraph) -> None:
@@ -811,22 +764,15 @@ async def gemini_handler(request):
                                     evt("tool_call_complete", fn=fn, success=res.get("success"),
                                         took_ms=round((time.time() - _t_tc_start) * 1000))
                                     log(f"🔧 Tool result: {res}")
+                                    _trigger_local_conf = False
                                     if is_save_fn and res.get("success"):
-                                        save_executed = True
-                                        save_done_ts = time.time()
-                                        log("🔒 Post-save guard active — blocking audio for 8s")
-                                        # Fallback close: if no transcript-detection or
-                                        # turnComplete fires, close after 8s.
-                                        asyncio.create_task(_close_after(ws, g_ws, 8.0, log))
-                                        tool_result = {
-                                            **res,
-                                            "instruction": (
-                                                "Request saved successfully. "
-                                                "Speak the confirmation ONCE (start with customer name). "
-                                                "After 'shukriya!' / 'Thank you for calling MyDoot!' — "
-                                                "STOP. Generate complete silence. Do NOT repeat."
-                                            ),
-                                        }
+                                        save_executed     = True
+                                        save_done_ts      = time.time()
+                                        confirmation_done = True  # block any Gemini audio
+                                        # Minimal ack to Gemini — local TTS handles confirmation
+                                        tool_result         = {"success": True}
+                                        _trigger_local_conf = True
+                                        log("🔒 Save OK — local TTS confirmation queued, Gemini closing")
                                     elif is_save_fn and not res.get("success"):
                                         # Save failed — send explicit error so Gemini knows
                                         # not to say "request registered" and instead apologises.
@@ -857,6 +803,17 @@ async def gemini_handler(request):
                                     }))
                                     evt("tool_result_sent", fn=fn, save_done=(save_done_ts > 0),
                                         tc_seq=_tc_seq)
+                                    if _trigger_local_conf:
+                                        # Close Gemini now — local code owns the confirmation audio.
+                                        # Any audio Gemini generates before the WS closes is blocked
+                                        # by confirmation_done=True (set above).
+                                        evt("ws_close_gemini",
+                                            reason="local_confirmation", delay=0)
+                                        try:
+                                            await g_ws.close()
+                                        except Exception:
+                                            pass
+                                        asyncio.create_task(_local_final_confirmation())
                                 else:
                                     log(f"⚠️  Unknown tool: {fn}")
 
@@ -1009,59 +966,21 @@ async def gemini_handler(request):
                 #      → confirm_pending() → stage advances
                 # If customer corrects instead of confirming, we store the new
                 # value as the next pending and confirm that one instead.
-                _cur    = service_graph.current_stage()
-                _words  = transcript.strip().split()
+                _cur     = service_graph.current_stage()
                 _clean_t = transcript.strip().rstrip("।.?! ").lower()
 
-                # ── Address: capture immediately (no confirmation loop) ──────
-                # Require ≥2 words and reject simple affirmatives so noise
-                # like "haan ji" isn't stored as an address.
-                if _cur == "address" and len(_words) >= 2 and not _is_confirmation(_clean_t):
-                    service_graph.on_field_collected("address", transcript.strip())
+                # ── Local-prompt stages: address / preferred_time / customer_name ──────
+                # The workflow engine owns validation, echo, and confirmation for these
+                # stages.  Gemini is NOT invoked — Sarvam TTS handles all audio.
+                # Falls back to Gemini only when Sarvam TTS is unavailable.
+                if _cur in _LOCAL_PROMPT_STAGES and save_done_ts == 0:
+                    _handled = await _handle_local_stage_response(transcript, _cur, _clean_t)
+                    if _handled:
+                        lt.discard_turn()
+                        return
+                    # TTS unavailable — fall through to Gemini with current pending state
+                    log(f"⚠️ Local TTS unavailable for stage={_cur} — falling back to Gemini")
 
-                # ── preferred_time: confirmation loop (same as customer_name) ─
-                # Mirrors the customer_name loop so that a brief VAD/noise trigger
-                # between the agent's time-question and the customer's actual answer
-                # cannot prematurely advance the stage to customer_name.
-                # Stage only advances after customer explicitly confirms the value.
-                elif _cur == "preferred_time" and len(_words) >= 1:
-                    if service_graph.pending is not None:
-                        _pv = service_graph.pending["value"]
-                        if _is_confirmation(_clean_t):
-                            service_graph.confirm_pending()
-                            log(f"✅ Time confirmed: {_pv!r} → stage=customer_name")
-                        else:
-                            # Customer corrected — store the new value as pending
-                            service_graph.clear_pending()
-                            if not _is_confirmation(_clean_t):
-                                service_graph.set_pending("preferred_time", transcript.strip())
-                                log(f"📝 Time correction: {transcript.strip()!r}")
-                    elif not _is_confirmation(_clean_t):
-                        # First response — store as pending, wait for confirmation
-                        service_graph.set_pending("preferred_time", transcript.strip())
-                        log(f"📝 Time candidate: {transcript.strip()!r}")
-
-                elif _cur == "customer_name" and len(_words) >= 1:
-                    if service_graph.pending is not None:
-                        # Waiting to confirm the captured name
-                        _pv = service_graph.pending["value"]
-                        if _is_confirmation(_clean_t):
-                            service_graph.confirm_pending()
-                            log(f"✅ Name confirmed: {_pv!r} → stage=done")
-                        else:
-                            # Customer gave a different/corrected name — re-capture
-                            service_graph.clear_pending()
-                            log(f"🔄 Name correction: {transcript!r} — re-capturing")
-                            _raw_name = _extract_name(transcript.strip())
-                            if _clean_t not in _NAME_AFFIRMATIONS and _looks_like_name(_raw_name):
-                                service_graph.set_pending("customer_name", _raw_name)
-                                log(f"📝 Name candidate (correction): {_raw_name!r}")
-                    else:
-                        # First time hearing the name — extract and store as pending
-                        _raw_name = _extract_name(transcript.strip())
-                        if _clean_t not in _NAME_AFFIRMATIONS and _looks_like_name(_raw_name):
-                            service_graph.set_pending("customer_name", _raw_name)
-                            log(f"📝 Name candidate: {_raw_name!r}")
                 lt.mark("langgraph_start")
                 stage_ctx = service_graph.get_context()
                 lt.mark("langgraph_end")
@@ -1081,6 +1000,216 @@ async def gemini_handler(request):
                 except Exception as send_err:
                     log(f"❌ Gemini WS send failed after STT: {send_err}")
                     lt.discard_turn()
+
+            # ── Local-stage helpers (closures; no Gemini involved) ──────────────────
+            # These run for address / preferred_time / customer_name stages.
+            # Sarvam TTS synthesizes audio, field_validators validates the response.
+            # Gemini is not invoked — latency for these turns = STT + TTS only.
+
+            async def _play_local_audio(mulaw_bytes: bytes) -> None:
+                """Stream μ-law 8 kHz audio to Vobiz in 100 ms chunks."""
+                nonlocal waiting_for_gemini, last_ai_audio_ts
+                if not mulaw_bytes:
+                    return
+                waiting_for_gemini = True
+                CHUNK = 800  # 100 ms at 8 kHz μ-law
+                for i in range(0, len(mulaw_bytes), CHUNK):
+                    if ws.closed:
+                        break
+                    chunk = mulaw_bytes[i:i + CHUNK]
+                    await ws.send_str(json.dumps({
+                        "event": "playAudio",
+                        "media": {
+                            "contentType": "audio/x-mulaw",
+                            "sampleRate":  8000,
+                            "payload":     base64.b64encode(chunk).decode(),
+                        },
+                    }))
+                    last_ai_audio_ts = time.time()
+                    await asyncio.sleep(0.08)  # pace sends; keeps Vobiz buffer comfortable
+                waiting_for_gemini = False
+
+            def _validate_field(stage: str, transcript: str) -> ValidationResult:
+                """Dispatch to the appropriate field validator."""
+                if stage == "customer_name":
+                    return validate_customer_name(transcript)
+                if stage == "address":
+                    return validate_address(transcript)
+                if stage == "preferred_time":
+                    return validate_preferred_time(transcript)
+                from core.field_validators import ValidationResult as VR
+                return VR(True, 1.0, transcript, "unvalidated", stage, transcript)
+
+            def _log_field_confidence(vr: ValidationResult) -> None:
+                """Emit structured JSON confidence log for analytics."""
+                log(json.dumps({
+                    "field":      vr.field,
+                    "value":      vr.extracted[:80],
+                    "confidence": round(vr.confidence, 2),
+                    "accepted":   vr.accepted,
+                    "reason":     vr.reason,
+                    "raw":        vr.raw[:80],
+                }, ensure_ascii=False))
+
+            async def _local_final_confirmation() -> None:
+                """
+                Synthesize and play the final confirmation, then close both WebSockets.
+                Called after save_service_request succeeds — replaces Gemini-generated
+                confirmation entirely, eliminating the duplicate-audio bug.
+                """
+                confirm_text = local_tts.build_confirmation_text(service_graph.state)
+                log(f"EVT final_confirmation_started text_len={len(confirm_text)}")
+                log(f"💬 Confirmation: {confirm_text!r}")
+                mulaw = await local_tts.synthesize(confirm_text, SARVAM_API_KEY, sarvam_session)
+                if mulaw:
+                    await _play_local_audio(mulaw)
+                    log("EVT final_confirmation_completed")
+                else:
+                    log("⚠️ EVT local_tts_failed — confirmation audio skipped")
+                await asyncio.sleep(0.4)  # let audio flush to PSTN before closing
+                log("EVT ws_close_vobiz reason=local_confirmation_complete")
+                if not ws.closed:
+                    try:
+                        await ws.close()
+                    except Exception:
+                        pass
+
+            async def _trigger_local_save() -> None:
+                """
+                Directly invoke save_service_request without Gemini.
+                Called when stage reaches 'done' via local-stage collection path
+                (address + time + name all handled locally).
+                """
+                nonlocal save_executed, save_done_ts, confirmation_done
+                if save_executed:
+                    log("⚠️ LOCAL SAVE: already executed — skipping")
+                    return
+                args = {
+                    "caller_id":      caller_id,
+                    "category":       service_graph.state.get("category")       or "",
+                    "subcategory":    service_graph.state.get("subcategory")    or "",
+                    "issue_type":     service_graph.state.get("issue_type")     or "",
+                    "brand":          service_graph.state.get("brand")          or "",
+                    "model":          service_graph.state.get("model")          or "",
+                    "severity":       service_graph.state.get("severity")       or "",
+                    "error_code":     service_graph.state.get("error_code")     or "",
+                    "address":        service_graph.state.get("address")        or "",
+                    "preferred_time": service_graph.state.get("preferred_time") or "",
+                    "customer_name":  service_graph.state.get("customer_name")  or "",
+                }
+                log(f"🔧 LOCAL SAVE args: {json.dumps(args, ensure_ascii=False)}")
+                evt("tool_call_start", fn="save_service_request", call_id="local", save_already=False)
+                t0 = time.time()
+                res = await asyncio.to_thread(FUNCTION_MAP["save_service_request"], **args)
+                evt("tool_call_complete", fn="save_service_request",
+                    success=res.get("success"),
+                    took_ms=round((time.time() - t0) * 1000))
+                if res.get("success"):
+                    save_executed    = True
+                    save_done_ts     = time.time()
+                    confirmation_done = True
+                    log("✅ LOCAL SAVE OK")
+                    await _local_final_confirmation()
+                else:
+                    err = res.get("message", "unknown error")
+                    log(f"❌ LOCAL SAVE FAILED: {err}")
+                    mulaw = await local_tts.synthesize(
+                        "Maafi chahti hoon, abhi ek technical problem aa rahi hai. "
+                        "Kripya thodi der mein dobara call karein.",
+                        SARVAM_API_KEY, sarvam_session,
+                    )
+                    if mulaw:
+                        await _play_local_audio(mulaw)
+                    await asyncio.sleep(2.0)
+                    if not ws.closed:
+                        await ws.close()
+
+            async def _handle_local_stage_response(
+                transcript: str, stage: str, clean_t: str,
+            ) -> bool:
+                """
+                Handle a customer turn for address / preferred_time / customer_name
+                without invoking Gemini.
+
+                Flow:
+                  No pending → validate → if OK: set_pending + play echo
+                                        → if fail: play retry prompt
+                  Pending     → if confirm: confirm_pending → play next prompt / trigger save
+                              → if correction: clear + re-validate
+
+                Returns True if the turn was handled locally.
+                Returns False if Sarvam TTS is unavailable (fall through to Gemini).
+                """
+                pend = service_graph.pending
+
+                # ── Confirmation turn ─────────────────────────────────────────────
+                if pend is not None and pend["field"] == stage:
+                    pend_value = pend["value"]
+                    if _is_confirmation(clean_t):
+                        service_graph.confirm_pending()
+                        new_stage = service_graph.current_stage()
+                        log(f"✅ LOCAL {stage} confirmed: {pend_value!r} → stage={new_stage}")
+                        evt("local_field_confirmed", field=stage, value=pend_value[:40],
+                            next_stage=new_stage)
+                        if new_stage in _LOCAL_PROMPT_STAGES:
+                            prompt = local_tts.PROMPTS.get(new_stage, "")
+                            if prompt:
+                                mulaw = await local_tts.synthesize(prompt, SARVAM_API_KEY, sarvam_session)
+                                if mulaw is None:
+                                    return False  # TTS down, let Gemini handle
+                                await _play_local_audio(mulaw)
+                        elif new_stage == "done":
+                            asyncio.create_task(_trigger_local_save())
+                    else:
+                        # Customer corrected — treat the new text as a fresh value
+                        service_graph.clear_pending()
+                        log(f"🔄 LOCAL {stage} correction: {transcript!r}")
+                        vr = _validate_field(stage, transcript)
+                        _log_field_confidence(vr)
+                        if vr.accepted:
+                            service_graph.set_pending(stage, vr.extracted)
+                            echo = local_tts.build_echo_text(stage, vr.extracted)
+                            mulaw = await local_tts.synthesize(echo, SARVAM_API_KEY, sarvam_session)
+                            if mulaw is None:
+                                return False
+                            await _play_local_audio(mulaw)
+                        else:
+                            retry = local_tts.PROMPTS.get(f"{stage}_retry",
+                                                          local_tts.PROMPTS.get(stage, ""))
+                            if retry:
+                                mulaw = await local_tts.synthesize(retry, SARVAM_API_KEY, sarvam_session)
+                                if mulaw is None:
+                                    return False
+                                await _play_local_audio(mulaw)
+                    return True
+
+                # ── First collection ──────────────────────────────────────────────
+                vr = _validate_field(stage, transcript)
+                _log_field_confidence(vr)
+                if vr.accepted:
+                    service_graph.set_pending(stage, vr.extracted)
+                    log(f"📝 LOCAL {stage} candidate: {vr.extracted!r} "
+                        f"(conf={vr.confidence:.2f})")
+                    evt("local_field_candidate", field=stage,
+                        value=vr.extracted[:40], confidence=round(vr.confidence, 2))
+                    echo = local_tts.build_echo_text(stage, vr.extracted)
+                    mulaw = await local_tts.synthesize(echo, SARVAM_API_KEY, sarvam_session)
+                    if mulaw is None:
+                        return False
+                    await _play_local_audio(mulaw)
+                else:
+                    log(f"❌ LOCAL {stage} rejected: {transcript!r} "
+                        f"reason={vr.reason} conf={vr.confidence:.2f}")
+                    evt("local_field_rejected", field=stage,
+                        reason=vr.reason, confidence=round(vr.confidence, 2))
+                    retry = local_tts.PROMPTS.get(f"{stage}_retry",
+                                                  local_tts.PROMPTS.get(stage, ""))
+                    if retry:
+                        mulaw = await local_tts.synthesize(retry, SARVAM_API_KEY, sarvam_session)
+                        if mulaw is None:
+                            return False
+                        await _play_local_audio(mulaw)
+                return True
 
             async for msg in ws:
                 if time.time() - call_start_ts > MAX_CALL_SECS:
