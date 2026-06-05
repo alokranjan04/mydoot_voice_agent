@@ -47,11 +47,15 @@ RECORDINGS_DIR             = os.getenv("RECORDINGS_DIR", "recordings")
 # Hard time ceiling on audio forwarding after save. The confirmation is ~6s.
 # 8s gives enough room for the message to complete and cuts off any Gemini
 # repetition (the model occasionally repeats the closing line twice).
-MAX_CONFIRMATION_AUDIO_SECS = 8.0
-# Safety-net only: end-marker transcript detection (below) is the primary
-# mechanism to stop Gemini repetitions — it sends {"event":"clear"} to flush
-# Vobiz's buffer immediately. This byte cap (8 s ≈ 1 message + 2s headroom)
-# only fires if transcript-based detection misses, preventing indefinite hold.
+MAX_CONFIRMATION_AUDIO_SECS = 7.0
+# The byte cap is the primary guard against duplicate audio reaching the
+# customer — it fires based on audio CONTENT bytes forwarded to Vobiz,
+# which tracks closely with playback at ~1:1 generation speed.
+# Confirmation message ≈ 6-7 s; 7 s cap fires right at the end of the first
+# message, blocking the duplicate before it starts forwarding.
+# End-marker transcript detection below acts as a belt-and-suspenders:
+# sends {"event":"clear"} when "shukriya!" text arrives (~200-500 ms after
+# the audio, flushing any small amount of duplicate already in Vobiz's buffer).
 # Minimum post-save audio that must have played before a turnComplete is
 # allowed to close the call. The wait message ("Ek second...") is ~2s.
 # Requiring 2.5s ensures the wait-message's own turnComplete is NOT treated
