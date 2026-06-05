@@ -431,6 +431,9 @@ async def gemini_handler(request):
         "reconnects": 0,          # Gemini WS reconnect attempts
         "gcs_uri": "",            # recording GCS URI (set at end if RECORD_CALLS=1)
     }
+    # Initialized here (not inside async with) so the finally block can always
+    # reference it, even when Gemini fails during connect (e.g. credits depleted).
+    save_executed = False
 
     try:
         async with websockets.connect(
