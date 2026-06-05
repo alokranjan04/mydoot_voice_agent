@@ -14,6 +14,8 @@ from core.state_engine import ConversationStateEngine
 from core.service_graph import ServiceGraph, ServiceState
 from core.field_validators import (
     validate_customer_name, validate_address, validate_preferred_time, ValidationResult,
+    AddressFields, parse_address_fields, format_address_fields,
+    is_address_correction, merge_address_correction,
 )
 import core.local_tts as local_tts
 from mydoot_functions import FUNCTION_MAP, send_call_summary_email, upload_recording_to_gcs, save_call_log, save_turn_latency
@@ -1143,6 +1145,33 @@ async def gemini_handler(request):
                     if not ws.closed:
                         await ws.close()
 
+            def _addr_instrumentation(
+                raw_stt: str,
+                previous: str,
+                parsed: "AddressFields | None",
+                final: str,
+                correction_detected: bool,
+            ) -> None:
+                """Emit structured address instrumentation log."""
+                rec = {
+                    "raw_stt":            raw_stt,
+                    "previous_address":   previous,
+                    "parsed_address": {
+                        "society":  parsed.society  if parsed else "",
+                        "sector":   parsed.sector   if parsed else "",
+                        "city":     parsed.city     if parsed else "",
+                        "landmark": parsed.landmark if parsed else "",
+                    },
+                    "final_address":      final,
+                    "correction_detected": correction_detected,
+                }
+                log(f"ADDR_ENTITY {json.dumps(rec, ensure_ascii=False)}")
+                evt("addr_entity",
+                    correction=correction_detected,
+                    sector=(parsed.sector if parsed else ""),
+                    city=(parsed.city if parsed else ""),
+                    final=final[:60])
+
             async def _handle_local_stage_response(
                 transcript: str, stage: str, clean_t: str,
             ) -> bool:
@@ -1154,7 +1183,9 @@ async def gemini_handler(request):
                   No pending → validate → if OK: set_pending + play echo
                                         → if fail: play retry prompt
                   Pending     → if confirm: confirm_pending → play next prompt / trigger save
-                              → if correction: clear + re-validate
+                              → if correction:
+                                  address stage → field-level merge (ADDRESS_CORRECTION mode)
+                                  other stages  → clear + re-validate
 
                 Returns True if the turn was handled locally.
                 Returns False if Sarvam TTS is unavailable (fall through to Gemini).
@@ -1180,14 +1211,57 @@ async def gemini_handler(request):
                         elif new_stage == "done":
                             asyncio.create_task(_trigger_local_save())
                     else:
-                        # Customer corrected — treat the new text as a fresh value
+                        # ── Correction path ───────────────────────────────────────
                         service_graph.clear_pending()
                         log(f"🔄 LOCAL {stage} correction: {transcript!r}")
+
+                        if stage == "address":
+                            # ADDRESS_CORRECTION mode: attempt field-level merge
+                            # so partial corrections ("nahi, sector 71") preserve
+                            # the rest of the original address.
+                            correction_detected = is_address_correction(clean_t)
+                            merged = merge_address_correction(pend_value, transcript)
+                            if merged:
+                                parsed = parse_address_fields(merged)
+                                _addr_instrumentation(
+                                    raw_stt=transcript,
+                                    previous=pend_value,
+                                    parsed=parsed,
+                                    final=merged,
+                                    correction_detected=correction_detected,
+                                )
+                                service_graph.set_pending(stage, merged)
+                                echo = local_tts.build_echo_text(stage, merged)
+                                mulaw = await local_tts.synthesize(echo, SARVAM_API_KEY, sarvam_session)
+                                if mulaw is None:
+                                    return False
+                                await _play_local_audio(mulaw)
+                                return True
+                            # No specific fields detected in correction — full replacement
+                            log(f"🔄 ADDRESS_CORRECTION: no field match → full replacement")
+
                         vr = _validate_field(stage, transcript)
                         _log_field_confidence(vr)
+
+                        if stage == "address":
+                            parsed = parse_address_fields(vr.extracted if vr.accepted else transcript)
+                            # On first collection, store structured address when parseable
+                            pending_val = format_address_fields(parsed) if (
+                                vr.accepted and (parsed.sector or parsed.city)
+                            ) else (vr.extracted if vr.accepted else "")
+                            _addr_instrumentation(
+                                raw_stt=transcript,
+                                previous=pend_value,
+                                parsed=parsed,
+                                final=pending_val,
+                                correction_detected=is_address_correction(clean_t),
+                            )
+                        else:
+                            pending_val = vr.extracted
+
                         if vr.accepted:
-                            service_graph.set_pending(stage, vr.extracted)
-                            echo = local_tts.build_echo_text(stage, vr.extracted)
+                            service_graph.set_pending(stage, pending_val or vr.extracted)
+                            echo = local_tts.build_echo_text(stage, pending_val or vr.extracted)
                             mulaw = await local_tts.synthesize(echo, SARVAM_API_KEY, sarvam_session)
                             if mulaw is None:
                                 return False
@@ -1205,13 +1279,30 @@ async def gemini_handler(request):
                 # ── First collection ──────────────────────────────────────────────
                 vr = _validate_field(stage, transcript)
                 _log_field_confidence(vr)
+
+                if stage == "address" and vr.accepted:
+                    parsed = parse_address_fields(vr.extracted)
+                    # Store structured address (more merge-friendly) when sector/city detected
+                    structured = format_address_fields(parsed)
+                    pending_val = structured if (parsed.sector or parsed.city) else vr.extracted
+                    _addr_instrumentation(
+                        raw_stt=transcript,
+                        previous="",
+                        parsed=parsed,
+                        final=pending_val,
+                        correction_detected=False,
+                    )
+                else:
+                    parsed      = None
+                    pending_val = vr.extracted
+
                 if vr.accepted:
-                    service_graph.set_pending(stage, vr.extracted)
-                    log(f"📝 LOCAL {stage} candidate: {vr.extracted!r} "
+                    service_graph.set_pending(stage, pending_val)
+                    log(f"📝 LOCAL {stage} candidate: {pending_val!r} "
                         f"(conf={vr.confidence:.2f})")
                     evt("local_field_candidate", field=stage,
-                        value=vr.extracted[:40], confidence=round(vr.confidence, 2))
-                    echo = local_tts.build_echo_text(stage, vr.extracted)
+                        value=pending_val[:40], confidence=round(vr.confidence, 2))
+                    echo = local_tts.build_echo_text(stage, pending_val)
                     mulaw = await local_tts.synthesize(echo, SARVAM_API_KEY, sarvam_session)
                     if mulaw is None:
                         return False
@@ -1221,6 +1312,14 @@ async def gemini_handler(request):
                         f"reason={vr.reason} conf={vr.confidence:.2f}")
                     evt("local_field_rejected", field=stage,
                         reason=vr.reason, confidence=round(vr.confidence, 2))
+                    if stage == "address":
+                        _addr_instrumentation(
+                            raw_stt=transcript,
+                            previous="",
+                            parsed=parse_address_fields(transcript),
+                            final="",
+                            correction_detected=False,
+                        )
                     retry = local_tts.PROMPTS.get(f"{stage}_retry",
                                                   local_tts.PROMPTS.get(stage, ""))
                     if retry:

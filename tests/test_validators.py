@@ -21,6 +21,10 @@ from core.field_validators import (
     validate_customer_name,
     validate_address,
     validate_preferred_time,
+    parse_address_fields,
+    format_address_fields,
+    is_address_correction,
+    merge_address_correction,
 )
 
 
@@ -294,6 +298,118 @@ class TestValidationResult(unittest.TestCase):
                 vr = fn(text)
                 self.assertGreaterEqual(vr.confidence, 0.0, f"{fn.__name__}({text!r})")
                 self.assertLessEqual(vr.confidence, 1.0, f"{fn.__name__}({text!r})")
+
+
+class TestAddressEntityParsing(unittest.TestCase):
+    """parse_address_fields + format_address_fields."""
+
+    def test_full_address_parses_sector_and_city(self):
+        f = parse_address_fields("Aditya Urban Casa, Sector 71, Noida")
+        self.assertEqual(f.sector, "71")
+        self.assertEqual(f.city, "Noida")
+        self.assertIn("Aditya", f.society)
+
+    def test_sector_word_form_seventy_one(self):
+        """'sector seventy one' must parse as sector='71'."""
+        f = parse_address_fields("Green Valley, Sector seventy one, Gurgaon")
+        self.assertEqual(f.sector, "71")
+        self.assertEqual(f.city, "Gurgaon")
+
+    def test_sector_hyphen_form(self):
+        f = parse_address_fields("sector-78 Noida")
+        self.assertEqual(f.sector, "78")
+
+    def test_city_gurugram_canonicalised(self):
+        f = parse_address_fields("DLF Phase 2, Gurugram")
+        self.assertEqual(f.city, "Gurgaon")
+
+    def test_format_roundtrip(self):
+        addr = "Aditya Urban Casa, Sector 71, Noida"
+        f = parse_address_fields(addr)
+        formatted = format_address_fields(f)
+        self.assertIn("71", formatted)
+        self.assertIn("Noida", formatted)
+
+    def test_partial_sector_only(self):
+        f = parse_address_fields("Sector 15")
+        self.assertEqual(f.sector, "15")
+        self.assertEqual(f.city, "")
+
+    def test_no_markers_returns_empty_fields(self):
+        f = parse_address_fields("pata nahi kahan")
+        self.assertEqual(f.sector, "")
+        self.assertEqual(f.city, "")
+
+
+class TestAddressCorrectionDetect(unittest.TestCase):
+    """is_address_correction."""
+
+    def test_nahi_detected(self):
+        self.assertTrue(is_address_correction("nahi, sector 71"))
+
+    def test_galat_detected(self):
+        self.assertTrue(is_address_correction("galat hai, noida nahi gurgaon"))
+
+    def test_actually_detected(self):
+        self.assertTrue(is_address_correction("actually sector 62 hai"))
+
+    def test_devanagari_nahi(self):
+        self.assertTrue(is_address_correction("नहीं, sector 71"))
+
+    def test_positive_not_correction(self):
+        self.assertFalse(is_address_correction("Aditya Urban Casa Sector 71 Noida"))
+
+
+class TestMergeAddressCorrection(unittest.TestCase):
+    """merge_address_correction — the core use-case from the transcript bug."""
+
+    def test_sector_correction(self):
+        """
+        Customer first said Sector 78, then corrected to Sector 71.
+        Society and city must be preserved.
+        """
+        merged = merge_address_correction(
+            "Aditya Urban Casa, Sector 78, Noida",
+            "nahi, Sector 71",
+        )
+        self.assertIsNotNone(merged)
+        self.assertIn("71", merged)
+        self.assertNotIn("78", merged)
+        self.assertIn("Noida", merged)
+
+    def test_city_correction(self):
+        merged = merge_address_correction(
+            "Green Valley, Sector 62, Noida",
+            "nahi Gurgaon",
+        )
+        self.assertIsNotNone(merged)
+        self.assertIn("Gurgaon", merged)
+        self.assertNotIn("Noida", merged)
+
+    def test_same_value_returns_none(self):
+        """No actual change → None (full replacement path)."""
+        merged = merge_address_correction(
+            "Aditya Urban Casa, Sector 71, Noida",
+            "sector 71",
+        )
+        self.assertIsNone(merged)
+
+    def test_unrecognised_correction_returns_none(self):
+        """Freeform correction with no parseable fields → None."""
+        merged = merge_address_correction(
+            "Some Society, Sector 78, Noida",
+            "nahi yaar sahi nahi hai",
+        )
+        self.assertIsNone(merged)
+
+    def test_full_new_address_updates_all_fields(self):
+        merged = merge_address_correction(
+            "Old Society, Sector 78, Noida",
+            "New Society, Sector 62, Gurgaon",
+        )
+        self.assertIsNotNone(merged)
+        self.assertIn("62", merged)
+        self.assertIn("Gurgaon", merged)
 
 
 if __name__ == "__main__":

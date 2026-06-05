@@ -308,3 +308,219 @@ def validate_preferred_time(text: str) -> ValidationResult:
         return ValidationResult(True, 0.50, raw, "digit_multiword", "preferred_time", raw)
 
     return ValidationResult(False, best_conf, raw, best_reason, "preferred_time", raw)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4. ADDRESS ENTITY PARSING & CORRECTION MERGE
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class AddressFields:
+    """Structured address entity extracted from free-form text."""
+    society:  str = ""   # "Aditya Urban Casa", "Green Valley Society"
+    sector:   str = ""   # digit string: "71", "62"
+    city:     str = ""   # "Noida", "Gurgaon"
+    landmark: str = ""   # "near metro station"
+
+
+_KNOWN_CITIES: frozenset = frozenset({
+    "noida", "gurgaon", "gurugram", "delhi", "new delhi",
+    "faridabad", "ghaziabad", "greater noida",
+    "नोएडा", "गुड़गांव", "दिल्ली", "गाजियाबाद", "फरीदाबाद",
+})
+
+# Sector: digit form — "sector 71", "sec-71", "सेक्टर 71"
+_SECTOR_DIGIT_RE = re.compile(
+    r'\b(?:sector|sec|सेक्टर)\s*[–\-]?\s*(\d+)\b',
+    re.IGNORECASE,
+)
+
+# Sector: English word form — "sector seventy one", "sector seventy-one"
+_EN_TENS = {
+    "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50,
+    "sixty": 60, "seventy": 70, "eighty": 80, "ninety": 90,
+}
+_EN_ONES = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+    "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14,
+    "fifteen": 15, "sixteen": 16, "seventeen": 17, "eighteen": 18,
+    "nineteen": 19,
+}
+
+_SECTOR_WORD_RE = re.compile(
+    r'\b(?:sector|sec|सेक्टर)\s+'
+    r'((?:twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety)'
+    r'(?:\s*[\-–]?\s*(?:one|two|three|four|five|six|seven|eight|nine))?'
+    r'|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|'
+    r'thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen)',
+    re.IGNORECASE,
+)
+
+_CITY_CANONICAL: dict = {
+    "gurugram": "Gurgaon", "new delhi": "Delhi",
+    "greater noida": "Greater Noida",
+    "नोएडा": "Noida", "गुड़गांव": "Gurgaon",
+    "दिल्ली": "Delhi", "गाजियाबाद": "Ghaziabad",
+    "फरीदाबाद": "Faridabad",
+}
+
+_ADDR_FILLER_RE = re.compile(
+    r'\b(?:mein|hai|ka|ki|ke|aur|main|technician|ko\s+aana|jahan|se|'
+    r'tak|ko|par|pe|wala|wali|waale|address|pata|poora|apna|'
+    r'bataiye|batao|batayein|rehna|rahna|rehta|rahta|'
+    r'nahi|nahin|sahi|galat|yaar|actually|correction|'
+    r'है|में|का|की|के|और|पर|से|तक|को|पास|वाला|वाली|नहीं|नही|गलत)\b',
+    re.IGNORECASE,
+)
+
+_LANDMARK_RE = re.compile(
+    r'\b(?:near|opp(?:osite)?|behind|adj(?:acent)?|next\s+to|'
+    r'paas\s+(?:mein|wala)|saamne|piche)\b.{3,40}',
+    re.IGNORECASE,
+)
+
+# Unicode-safe word boundaries: negative lookbehind/lookahead for any letter
+# (Latin or Devanagari) so Devanagari words like नहीं are matched correctly.
+_CORRECTION_TRIGGER_RE = re.compile(
+    r'(?<![a-zA-Z\u0900-\u097F])'
+    r'(?:nahi|nahin|no|galat|wrong|actually|correction|change|नहीं|नही|गलत)'
+    r'(?![a-zA-Z\u0900-\u097F])',
+    re.IGNORECASE,
+)
+
+
+def _word_to_sector_int(s: str) -> Optional[int]:
+    """Convert English number word(s) like 'seventy one' to int."""
+    s = s.lower().replace("-", " ").strip()
+    parts = s.split()
+    if len(parts) == 1:
+        return _EN_TENS.get(parts[0]) or _EN_ONES.get(parts[0])
+    if len(parts) == 2:
+        t = _EN_TENS.get(parts[0])
+        o = _EN_ONES.get(parts[1])
+        if t and o:
+            return t + o
+    return None
+
+
+def _extract_sector(text: str) -> str:
+    """Return sector number as digit string, or '' if not found."""
+    m = _SECTOR_DIGIT_RE.search(text)
+    if m:
+        return m.group(1)
+    m2 = _SECTOR_WORD_RE.search(text)
+    if m2:
+        n = _word_to_sector_int(m2.group(1))
+        if n is not None:
+            return str(n)
+    return ""
+
+
+def _extract_city(text: str) -> str:
+    """Return canonical city name, or '' if not found."""
+    t = text.lower()
+    for city in sorted(_KNOWN_CITIES, key=len, reverse=True):
+        if re.search(r'\b' + re.escape(city) + r'\b', t):
+            return _CITY_CANONICAL.get(city, city.title())
+    return ""
+
+
+def _extract_society(text: str, sector: str, city: str) -> str:
+    """Extract society/building name: meaningful text before sector/city."""
+    t = text.strip()
+    if city:
+        t = re.sub(r'\b' + re.escape(city) + r'\b', "", t, flags=re.IGNORECASE)
+    if sector:
+        t = re.sub(
+            r'\b(?:sector|sec|सेक्टर)\s*[–\-]?\s*' + re.escape(sector) + r'\b',
+            "", t, flags=re.IGNORECASE,
+        )
+    t = _SECTOR_WORD_RE.sub("", t)
+    t = _ADDR_FILLER_RE.sub("", t).strip(" ,।")
+    # Take first comma-separated part with ≥ 2 words that starts like a proper noun
+    # (first char uppercase, or contains a society/building keyword)
+    _SOC_KW_RE = re.compile(
+        r'\b(?:society|villa|casa|enclave|heights|towers?|residency|'
+        r'apartments?|complex|park|garden|nagar|vihar|puram|colony)\b',
+        re.IGNORECASE,
+    )
+    for part in re.split(r'[,،]', t):
+        part = part.strip(" ,।")
+        words = part.split()
+        if len(words) < 2:
+            continue
+        # Accept if starts with uppercase (proper noun) or contains society keyword
+        if words[0][:1].isupper() or _SOC_KW_RE.search(part):
+            return part
+    return ""
+
+
+def parse_address_fields(text: str) -> AddressFields:
+    """Parse free-form address into structured fields. Best-effort."""
+    sector   = _extract_sector(text)
+    city     = _extract_city(text)
+    landmark = ""
+    m = _LANDMARK_RE.search(text)
+    if m:
+        landmark = m.group(0).strip()
+    society  = _extract_society(text, sector, city)
+    return AddressFields(society=society, sector=sector, city=city, landmark=landmark)
+
+
+def format_address_fields(f: AddressFields) -> str:
+    """Render AddressFields to a human-readable address string."""
+    parts = []
+    if f.society:  parts.append(f.society)
+    if f.sector:   parts.append(f"Sector {f.sector}")
+    if f.city:     parts.append(f.city)
+    if f.landmark: parts.append(f.landmark)
+    return ", ".join(parts)
+
+
+def is_address_correction(text: str) -> bool:
+    """True if text contains a correction trigger word (nahi, galat, actually…)."""
+    return bool(_CORRECTION_TRIGGER_RE.search(text))
+
+
+def merge_address_correction(
+    original_text: str,
+    correction_text: str,
+) -> Optional[str]:
+    """
+    Field-level merge of `correction_text` into `original_text`.
+
+    - Parse both texts into AddressFields.
+    - Replace fields that the correction explicitly provides.
+    - Preserve all other original fields.
+    - Return merged address string, or None if no specific fields were updated
+      (caller should treat correction as a full address replacement).
+    """
+    orig = parse_address_fields(original_text)
+    corr = parse_address_fields(correction_text)
+
+    merged  = AddressFields(
+        society  = orig.society,
+        sector   = orig.sector,
+        city     = orig.city,
+        landmark = orig.landmark,
+    )
+    updated = False
+
+    if corr.sector and corr.sector != orig.sector:
+        merged.sector  = corr.sector
+        updated = True
+    if corr.city and corr.city.lower() != orig.city.lower():
+        merged.city    = corr.city
+        updated = True
+    if corr.society and corr.society.lower() != orig.society.lower():
+        merged.society = corr.society
+        updated = True
+    if corr.landmark and corr.landmark != orig.landmark:
+        merged.landmark = corr.landmark
+        updated = True
+
+    if not updated:
+        return None
+    result = format_address_fields(merged)
+    return result or None

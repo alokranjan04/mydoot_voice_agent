@@ -57,7 +57,7 @@ PROMPTS: dict[str, str] = {
 
 # Echo templates: "Value, sahi hai?" confirmation prompt
 _ECHO_TEMPLATES: dict[str, str] = {
-    "address":        "{value}, sahi hai?",
+    "address":        "Maine {value} suna hai. Kya sahi hai?",
     "preferred_time": "{value}, theek hai?",
     "customer_name":  "{value} ji, sahi hai?",
 }
