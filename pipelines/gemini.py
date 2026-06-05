@@ -72,6 +72,19 @@ CONFIRMATION_MIN_AUDIO_SECS = 2.5
 # Gemini is bypassed completely — zero LLM latency for these turns.
 _LOCAL_PROMPT_STAGES: frozenset = frozenset({"address", "preferred_time", "customer_name"})
 
+# ── STT hint phrases injected per-stage to reduce misrecognition ─────────────
+# "brand" stage: common appliance / vehicle brands that Saaras v3 often mishears
+# when embedded in Hindi speech ("Hitachi" → "पिताची" / "Zetac", etc.)
+_BRAND_HINT_PHRASES: list[str] = [
+    "Hitachi", "LG", "Samsung", "Daikin", "Voltas", "Blue Star", "Carrier",
+    "Haier", "Godrej", "Panasonic", "Whirlpool", "Bosch", "IFB", "Lloyd",
+    "Onida", "Videocon", "Bajaj", "Havells", "Orient", "Usha", "Crompton",
+    "Toshiba", "Mitsubishi", "Fujitsu", "Gree", "Midea",
+    "Honda", "Yamaha", "Suzuki", "Bajaj", "TVS", "Hero", "Royal Enfield",
+    "Maruti", "Hyundai", "Toyota", "Tata", "Mahindra", "Ford", "Kia",
+    "हिताची", "एलजी", "सैमसंग", "डाइकिन", "वोल्टास",
+]
+
 
 def _ts():
     """Short HH:MM:SS.mmm timestamp for log lines."""
@@ -128,11 +141,13 @@ def _clean_transcript(text: str) -> str:
 
 
 async def _sarvam_stt(pcm8_bytes: bytes,
-                      session: "aiohttp.ClientSession | None" = None) -> str:
+                      session: "aiohttp.ClientSession | None" = None,
+                      hint_phrases: "list[str] | None" = None) -> str:
     """
     Transcribe 8 kHz 16-bit mono PCM via Sarvam Saaras v3.
     Pass a persistent `session` (created once per call) to avoid
     TCP + TLS handshake overhead on every utterance (~200-300ms saved).
+    Optional `hint_phrases` biases recognition toward specific words (e.g. brand names).
     Returns the transcript string, or "" on failure / empty result.
     """
     if not pcm8_bytes or not SARVAM_API_KEY:
@@ -165,6 +180,8 @@ async def _sarvam_stt(pcm8_bytes: bytes,
                        filename="audio.wav", content_type="audio/wav")
         form.add_field("model", "saaras:v3")
         form.add_field("language_code", "hi-IN")
+        if hint_phrases:
+            form.add_field("hints", json.dumps(hint_phrases))
 
         timeout = aiohttp.ClientTimeout(total=10)
 
@@ -931,7 +948,9 @@ async def gemini_handler(request):
                 lt.mark("vad_end")
                 lt.mark("stt_start")
                 t0 = time.time()
-                transcript = await _sarvam_stt(pcm8_bytes, session=sarvam_session)
+                _hints = _BRAND_HINT_PHRASES if service_graph.current_stage() == "brand" else None
+                transcript = await _sarvam_stt(pcm8_bytes, session=sarvam_session,
+                                               hint_phrases=_hints)
                 lt.mark("stt_end")
                 stt_ms = int((time.time() - t0) * 1000)
                 if not transcript:
