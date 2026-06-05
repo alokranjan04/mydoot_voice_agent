@@ -555,9 +555,17 @@ async def gemini_handler(request):
                                     if _p != -1:
                                         _end_pos = _p + _mlen
                                         break
-                                if _end_pos != -1 and _buf_l[_end_pos:].strip():
+                                if _end_pos != -1:
+                                    # End-marker reached ("shukriya" / "thank you for
+                                    # calling") — the confirmation message is complete.
+                                    # Fire clear + close immediately so any duplicate
+                                    # audio Gemini queued AFTER this marker is flushed
+                                    # from Vobiz's buffer before it plays.
+                                    # (Audio leads text by ~200-500ms, so by the time
+                                    # this text arrives the first message has already
+                                    # played; clear only removes the repeat audio.)
                                     confirmation_done = True
-                                    log("🔇 Repetition after end-marker — "
+                                    log("🔇 End-marker reached — "
                                         "clearing Vobiz buffer + closing in 1s")
                                     try:
                                         if not ws.closed:
@@ -751,7 +759,15 @@ async def gemini_handler(request):
                                         # Fallback close: if no transcript-detection or
                                         # turnComplete fires, close after 8s.
                                         asyncio.create_task(_close_after(ws, g_ws, 8.0, log))
-                                        tool_result = res
+                                        tool_result = {
+                                            **res,
+                                            "instruction": (
+                                                "Request saved successfully. "
+                                                "Speak the confirmation ONCE (start with customer name). "
+                                                "After 'shukriya!' / 'Thank you for calling MyDoot!' — "
+                                                "STOP. Generate complete silence. Do NOT repeat."
+                                            ),
+                                        }
                                     elif is_save_fn and not res.get("success"):
                                         # Save failed — send explicit error so Gemini knows
                                         # not to say "request registered" and instead apologises.
