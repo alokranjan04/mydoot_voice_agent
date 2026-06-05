@@ -3,7 +3,7 @@
 **Agent Name:** Mydoot Customer Care Representative
 **Active Pipeline:** Hybrid — Sarvam Saaras v3 STT + Gemini Live LLM+TTS
 **Orchestration:** LangGraph ServiceGraph
-**Stack:** Gemini 2.5 Flash Native Audio, Sarvam Saaras v3, LangGraph, Vobiz SIP, Google Sheets, Gmail SMTP, Google Cloud Run
+**Stack:** Gemini 2.5 Flash Native Audio, Sarvam Saaras v3, LangGraph, Vobiz SIP, PostgreSQL, Google Sheets, Gmail SMTP, Google Cloud Run
 
 ---
 
@@ -82,7 +82,8 @@ Customer audio is never sent raw to Gemini. Only clean text transcripts are sent
 │    Triggered when Gemini has all required fields                    │
 │    service_graph.on_tool_call(args) → state = done                 │
 │    Handler: mydoot_functions.py                                     │
-│    - Appends row to Google Sheets (11 columns, A–K)                 │
+│    - Writes to PostgreSQL service_requests table (primary)         │
+│    - Appends row to Google Sheets Sheet1 (secondary, soft-fail)    │
 │    - Returns success to Gemini                                      │
 │    - Gemini speaks confirmation once, then goes silent              │
 │    - Call closes after confirmation audio ≥ 2.5s completes         │
@@ -97,7 +98,8 @@ Customer audio is never sent raw to Gemini. Only clean text transcripts are sent
 └─────────────────────────────────────────────────────────────────────┘
 ┌─────────────────────────────────────────────────────────────────────┐
 │ 7. Observability log written (non-blocking, asyncio.to_thread)      │
-│    save_call_log() → appends one row to Call_Logs sheet tab         │
+│    save_call_log() → writes to PostgreSQL call_logs (primary)       │
+│                    → appends to Call_Logs sheet tab (secondary)     │
 │    18 columns: timestamp, caller, duration, stage, saved,           │
 │    category, subcategory, issue_type, customer_name, address,       │
 │    preferred_time, stt_count, stt_avg_ms, stt_drops,               │
@@ -511,10 +513,25 @@ GitHub Secret: GCP_SA_KEY (full service account JSON)
                 │
                 ▼
         Google Sheets API (sheets v4)
+
+GitHub Secret: POSTGRES_URL
+        │
+        └── deploy.yml sets POSTGRES_URL env var on Cloud Run
+                │
+                ▼
+        app.py startup: init_db() called before routes register
+                │
+                ▼
+        config/database.py — ThreadedConnectionPool (min=1, max=10)
+        DDL: creates instances, service_requests, call_logs tables
+        Upserts instance row: (INSTANCE_ID, display_name)
 ```
 
 Service account: `mydoot-voice@testcnx-169610.iam.gserviceaccount.com`
 Required permission: Editor on sheet `1uW39kklQKc4rhf5REATgKqgwbvSNAhlDVKXyAzOMKCk`
+
+PostgreSQL: self-hosted on GCE VM at `34.122.77.178:5432`, database `mydoot`, user `mydoot_user`.
+If `POSTGRES_URL` is unset, `init_db()` returns False and the app runs in Sheets-only mode.
 
 The Sheets service is cached with a 3000 s TTL in `_SHEETS_CACHE` and reused for all calls on the same instance. On stale-connection errors the cache is invalidated and the service is force-rebuilt.
 
@@ -551,6 +568,17 @@ CMD ["python", "app.py"]
 | Timeout | 3600s |
 | Concurrency | 80 |
 
+### PostgreSQL Infrastructure
+
+| Property | Value |
+|----------|-------|
+| Host | GCE VM — 34.122.77.178 |
+| Port | 5432 |
+| Database | mydoot |
+| User | mydoot_user |
+| Tables | instances, service_requests, call_logs |
+| Multi-tenancy | INSTANCE_ID column on all data tables |
+
 ### CI/CD
 
 ```
@@ -558,6 +586,9 @@ git push main → GitHub Actions (deploy.yml)
     ├── Auth to GCP (GCP_SA_KEY)
     ├── Docker build + push to Artifact Registry
     ├── Write /tmp/env.yaml from GitHub secrets (mydoot_env environment)
+    │   Secrets passed: SARVAM_API_KEY, DEEPGRAM_API_KEY, GEMINI_API_KEY,
+    │   GOOGLE_SPREADSHEET_ID, GMAIL_USER, GMAIL_APP_PASSWORD,
+    │   GOOGLE_CREDENTIALS, POSTGRES_URL, INSTANCE_ID
     └── gcloud run deploy --env-vars-file=/tmp/env.yaml
 ```
 
@@ -622,6 +653,7 @@ STT Count | STT Avg (ms) | STT Drops | Barge-Ins | Reconnects | Audio GCS | Tran
 | `routes/calls.py` | `GET /calls` HTML dashboard, `/calls/data` JSON API, `/calls/audio` GCS audio proxy |
 | `core/service_graph.py` | LangGraph ServiceGraph — category taxonomy, stage state, [STAGE CONTEXT] injection |
 | `core/state_engine.py` | Legacy 7-field state tracker (used by save_customer_feedback path) |
-| `config/settings.py` | API keys (Gemini, Sarvam) and WebSocket URLs from environment variables |
+| `config/settings.py` | API keys (Gemini, Sarvam), POSTGRES_URL, INSTANCE_ID from environment |
+| `config/database.py` | PostgreSQL ThreadedConnectionPool — `init_db()`, `get_conn()`, `put_conn()` |
 | `Dockerfile` | Multi-stage build — builder + minimal runtime image |
 | `.github/workflows/deploy.yml` | GitHub Actions → Cloud Run CI/CD pipeline |

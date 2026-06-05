@@ -1,6 +1,6 @@
 # PRD: Mydoot Customer Care — AI Voice Agent
 
-**Version:** 4.2
+**Version:** 4.3
 **Owner:** Alok Ranjan
 **Phone Number:** +917971542939
 **Last Updated:** June 2026
@@ -98,9 +98,10 @@ Fields collected:
 ### FR-5: Data Persistence
 - On completing all required fields, call `save_service_request` tool immediately
 - Do NOT say "request registered" before the tool call succeeds
-- Write one row per call to Google Sheets (Sheet1, appended, never overwrite)
-- Sheet columns (A–K): Customer Name | Category | Subcategory | Issue Type | Brand | Model | Severity | Address | Preferred Time | Timestamp | Caller ID
-- `save_executed` flag prevents duplicate Sheet rows per session
+- **Primary store**: PostgreSQL `service_requests` table on GCE VM (34.122.77.178) — rows tagged with `INSTANCE_ID` for multi-tenancy
+- **Secondary store**: Google Sheets Sheet1 (11 columns, A–K) — soft-fail: if PG write succeeds, Sheets failure is non-fatal
+- If `POSTGRES_URL` is unset, app runs in Sheets-only mode automatically
+- `save_executed` flag prevents duplicate saves per session
 
 ### FR-6: Post-Save Confirmation
 - Call `save_service_request` tool IMMEDIATELY when all fields are confirmed — do NOT say anything to the customer before the tool call
@@ -172,6 +173,31 @@ Fields collected:
 
 Sheet ID: `1uW39kklQKc4rhf5REATgKqgwbvSNAhlDVKXyAzOMKCk`
 
+### PostgreSQL Schema
+
+Three tables created automatically by `init_db()` at startup:
+
+**`instances`** — one row per deployed Cloud Run service
+```sql
+id SERIAL PRIMARY KEY, instance_id TEXT UNIQUE, display_name TEXT, created_at TIMESTAMPTZ
+```
+
+**`service_requests`** — one row per completed service booking
+```sql
+id BIGSERIAL, instance_id TEXT, caller_id TEXT, customer_name TEXT,
+category TEXT, subcategory TEXT, issue_type TEXT, brand TEXT, model TEXT,
+severity TEXT, address TEXT, preferred_time TEXT, raw_json JSONB, created_at TIMESTAMPTZ
+```
+
+**`call_logs`** — one row per call (including dropped/incomplete)
+```sql
+id BIGSERIAL, instance_id TEXT, caller_id TEXT, duration_secs NUMERIC,
+stage_reached TEXT, saved BOOLEAN, category TEXT, subcategory TEXT,
+issue_type TEXT, customer_name TEXT, address TEXT, preferred_time TEXT,
+stt_count INTEGER, stt_avg_ms NUMERIC, stt_drops INTEGER,
+barge_ins INTEGER, reconnects INTEGER, audio_gcs TEXT, transcript TEXT, created_at TIMESTAMPTZ
+```
+
 ### Call_Logs Tab (Observability)
 
 18 columns per call (appended after every call, including incomplete/dropped):
@@ -209,7 +235,9 @@ Sheet ID: `1uW39kklQKc4rhf5REATgKqgwbvSNAhlDVKXyAzOMKCk`
 - **Telephony**: Vobiz SIP (+917971542939)
 - **Audio codec**: mu-law 8kHz (Vobiz ↔ server), PCM 24kHz (Gemini → server)
 - **Infrastructure**: Google Cloud Run (us-central1, project testcnx-169610)
-- **Data storage**: Google Sheets only (no database)
+- **Primary data store**: PostgreSQL 15 on GCE VM (34.122.77.178:5432) — `psycopg2-binary`, `ThreadedConnectionPool`, instance-based multi-tenancy via `INSTANCE_ID` env var
+- **Secondary data store**: Google Sheets (soft-fail; Sheets-only mode if `POSTGRES_URL` unset)
+- **Multi-tenancy**: Each Cloud Run deployment sets a unique `INSTANCE_ID` — all PG rows are tagged, enabling one shared database for multiple client deployments
 - **Notification**: Gmail SMTP SSL port 465 (App Password auth)
 
 ---

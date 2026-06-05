@@ -64,7 +64,8 @@ Customer Phone Call
         ▼
  save_service_request() tool call
         │
-        ├── Google Sheets API ──► Append row to Sheet1 (11 columns)
+        ├── PostgreSQL (primary) ──► service_requests + call_logs tables
+        ├── Google Sheets (secondary) ──► Append row to Sheet1 (11 columns)
         └── Gmail SMTP ──────────► Send transcript email to admin (after call)
 ```
 
@@ -162,7 +163,8 @@ mydoot-voice-agent/
 ├── Dockerfile
 │
 ├── config/
-│   └── settings.py         # API keys, URLs loaded from env
+│   ├── settings.py         # API keys, URLs, POSTGRES_URL, INSTANCE_ID loaded from env
+│   └── database.py         # PostgreSQL ThreadedConnectionPool — init_db(), get_conn(), put_conn()
 │
 ├── core/
 │   ├── state_engine.py     # Legacy 7-field state tracker
@@ -221,6 +223,8 @@ Server starts on `http://localhost:5050`
 | `GMAIL_USER` | Yes | Gmail address for transcript emails |
 | `GMAIL_APP_PASSWORD` | Yes | Gmail App Password (16-char, spaces OK) |
 | `PUBLIC_URL` | Yes | Public HTTPS URL (for Vobiz webhook) |
+| `POSTGRES_URL` | No | PostgreSQL DSN — enables dual-write to PG + Sheets (`postgresql://user:pass@host/db`) |
+| `INSTANCE_ID` | No | Tenant identifier — tags all PG rows (default: `"default"`) |
 | `PORT` | No | Server port (default: 5050) |
 | `RECORD_CALLS` | No | Set to `1` to save inbound audio as WAV files |
 | `GCS_RECORDINGS_BUCKET` | No | GCS bucket for WAV upload |
@@ -237,12 +241,14 @@ Every push to `main` auto-deploys to Google Cloud Run via GitHub Actions.
 | Secret | Value |
 |--------|-------|
 | `GCP_SA_KEY` | Full GCP service account JSON |
-| `GEMINI_API_KEY` | Gemini API key |
+| `GEMINI_API_KEY` | Gemini API key (paid tier required for Live API) |
 | `SARVAM_API_KEY` | Sarvam AI API key |
 | `GOOGLE_SPREADSHEET_ID` | Sheet ID |
 | `GMAIL_USER` | Gmail address |
 | `GMAIL_APP_PASSWORD` | Gmail App Password |
 | `PUBLIC_URL` | Cloud Run service URL |
+| `POSTGRES_URL` | PostgreSQL DSN (optional — enables dual-write) |
+| `INSTANCE_ID` | Tenant identifier for multi-tenancy (optional) |
 
 ### Cloud Run Configuration
 
@@ -281,7 +287,7 @@ After every call (including dropped/incomplete calls), an email is sent to `GMAI
 
 ## Observability Dashboard
 
-Every call is logged to a **Call_Logs** tab in the same Google Sheet with 18 columns:
+Every call is logged to **both PostgreSQL** (`call_logs` table) and the **Call_Logs tab** in Google Sheets, with 18 columns each. PostgreSQL is the primary store; Sheets is secondary (soft-fail). If `POSTGRES_URL` is unset, Sheets-only mode is used.
 
 | Column | Field |
 |--------|-------|
@@ -305,4 +311,4 @@ The dashboard is available at `<your-url>/calls` — shows summary stats, a per-
 
 **Alok Ranjan** — [alokranjan04@gmail.com](mailto:alokranjan04@gmail.com)
 
-Powered by Google Gemini Live · Sarvam Saaras v3 STT · LangGraph · Vobiz SIP · Google Cloud Run · GitHub Actions
+Powered by Google Gemini Live · Sarvam Saaras v3 STT · LangGraph · Vobiz SIP · PostgreSQL · Google Cloud Run · GitHub Actions

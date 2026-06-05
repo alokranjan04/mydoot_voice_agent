@@ -12,6 +12,7 @@ Everything starts here. `app.py` starts an `aiohttp` async web server on port `5
 
 **What it does at startup:**
 - Reads `GOOGLE_CREDENTIALS` from the environment and writes it to `google-credentials.json` on disk (cloud deployments pass secrets as env vars, not files).
+- Calls `init_db()` — opens a `ThreadedConnectionPool` to PostgreSQL (if `POSTGRES_URL` is set), runs the DDL to create `instances`, `service_requests`, and `call_logs` tables, and upserts the current `INSTANCE_ID` into `instances`. If `POSTGRES_URL` is unset, logs a warning and continues in Sheets-only mode.
 - Registers the `/answer` webhook that Vobiz calls when a customer dials +917971542939.
 - Registers the `/gemini-stream` WebSocket endpoint for the active hybrid pipeline.
 - Serves the dashboard at `/` and the Voice Lab at `/voice-lab`.
@@ -232,12 +233,23 @@ Five layers prevent audio from disrupting the conversation:
 
 ### `save_service_request()`
 
-Called from the Gemini pipeline tool handler. Writes one row to Google Sheets:
+Called from the Gemini pipeline tool handler. Dual-writes to PostgreSQL (primary) and Google Sheets (secondary):
 
+**PostgreSQL (primary):**
+```python
+conn = get_conn()  # borrow from ThreadedConnectionPool
+cur.execute(INSERT INTO service_requests (...) VALUES (...))
+conn.commit()
+put_conn(conn)
+```
+Rows are tagged with `INSTANCE_ID` for multi-tenancy. If the pool is not initialized (`POSTGRES_URL` unset), skips silently.
+
+**Google Sheets (secondary, soft-fail):**
 ```
 Sheet1 columns (A–K):
 Customer Name | Category | Subcategory | Issue Type | Brand | Model | Severity | Address | Preferred Time | Timestamp | Caller ID
 ```
+If the PostgreSQL write already succeeded, a Sheets failure is non-fatal — returns `{"success": True}` based on `pg_ok`.
 
 **Caching:** `_get_sheets_service()` caches the service object with a 3000s (50-min) TTL. The discovery-doc fetch + TCP handshake costs ~500ms; caching ensures only the first call per warm instance pays this cost.
 
@@ -253,7 +265,7 @@ Sent to GMAIL_USER (admin email).
 
 ### `save_call_log()`
 
-Called in the `finally` block of `gemini_handler` — runs **after every call** (completed or dropped). Writes one row to the **Call_Logs** sheet tab with 18 columns:
+Called in the `finally` block of `gemini_handler` — runs **after every call** (completed or dropped). Dual-writes to PostgreSQL `call_logs` table (primary) and **Call_Logs** sheet tab (secondary) with 18 columns:
 
 ```python
 asyncio.create_task(asyncio.to_thread(
