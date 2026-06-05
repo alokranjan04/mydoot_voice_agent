@@ -651,6 +651,81 @@ def save_call_log(
         return {"success": pg_ok}
 
 
+def save_turn_latency(caller_id: str, turns: list) -> None:
+    """Bulk-insert completed TurnSpan records into turn_latency_metrics (PostgreSQL only)."""
+    if not turns:
+        return
+    conn = get_conn()
+    if conn is None:
+        return
+    try:
+        with conn.cursor() as cur:
+            for span in turns:
+                cur.execute(
+                    """
+                    INSERT INTO turn_latency_metrics
+                        (instance_id, caller_id, turn_id, customer_text,
+                         vad_ms, stt_ms, langgraph_ms,
+                         llm_first_token_ms, llm_total_ms,
+                         tts_first_audio_ms, tts_total_ms, end_to_end_turn_ms)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    """,
+                    (
+                        INSTANCE_ID, caller_id, span.turn_id, span.customer_text,
+                        span.vad_ms, span.stt_ms, span.langgraph_ms,
+                        span.llm_first_token_ms, span.llm_total_ms,
+                        span.tts_first_audio_ms, span.tts_total_ms,
+                        span.end_to_end_turn_ms,
+                    ),
+                )
+        conn.commit()
+        put_conn(conn)
+        print(f"[LATENCY][PG]: Saved {len(turns)} turns — caller={caller_id}")
+    except Exception as e:
+        print(f"[LATENCY][PG ERROR]: {e}")
+        put_conn(conn, discard=True)
+
+
+def get_latency_stats(lookback_hours: int = 24) -> dict:
+    """Return P50/P95/P99 for each latency metric over the last N hours from PostgreSQL."""
+    conn = get_conn()
+    if conn is None:
+        return {}
+    try:
+        metrics = [
+            "vad_ms", "stt_ms", "langgraph_ms",
+            "llm_first_token_ms", "llm_total_ms",
+            "tts_first_audio_ms", "tts_total_ms", "end_to_end_turn_ms",
+        ]
+        selects = []
+        for m in metrics:
+            selects += [
+                f"PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY {m}) AS {m}_p50",
+                f"PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY {m}) AS {m}_p95",
+                f"PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY {m}) AS {m}_p99",
+            ]
+        sql = (
+            f"SELECT COUNT(*) AS sample_count, {', '.join(selects)} "
+            f"FROM turn_latency_metrics "
+            f"WHERE instance_id = %s "
+            f"  AND created_at >= NOW() - INTERVAL '{lookback_hours} hours' "
+            f"  AND end_to_end_turn_ms IS NOT NULL"
+        )
+        with conn.cursor() as cur:
+            cur.execute(sql, (INSTANCE_ID,))
+            row = cur.fetchone()
+            cols = [desc[0] for desc in cur.description]
+        put_conn(conn)
+        if not row:
+            return {}
+        result = dict(zip(cols, row))
+        return {k: (float(v) if v is not None else None) for k, v in result.items()}
+    except Exception as e:
+        print(f"[LATENCY STATS ERROR]: {e}")
+        put_conn(conn, discard=True)
+        return {}
+
+
 def get_call_logs(n: int = 200) -> list:
     """Return the last n rows from Call_Logs sheet as list of dicts."""
     try:

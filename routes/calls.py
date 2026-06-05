@@ -99,6 +99,13 @@ _CALLS_HTML = """\
 
   .loading { padding: 48px; text-align: center; color: var(--text-muted); font-size: 0.9rem; }
   .empty { padding: 48px; text-align: center; color: var(--text-muted); }
+
+  /* Latency table */
+  .lat-table { width: 100%; border-collapse: collapse; font-size: 0.84rem; }
+  .lat-table th { padding: 10px 16px; text-align: left; font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-muted); background: #f8fafc; border-bottom: 1px solid var(--border); }
+  .lat-table td { padding: 10px 16px; border-bottom: 1px solid #f1f5f9; font-variant-numeric: tabular-nums; }
+  .lat-table tr:last-child td { border-bottom: none; }
+  .lat-warn { color: #b45309; font-weight: 700; }
 </style>
 </head>
 <body>
@@ -122,6 +129,13 @@ _CALLS_HTML = """\
     <div class="stat"><div class="stat-label">Avg Barge-Ins</div><div class="stat-val" id="s-bargeins">—</div></div>
   </div>
 
+  <div class="card" style="margin-bottom:24px">
+    <div class="card-header">
+      <h2>Turn Latency — last 24 h (P50 / P95 / P99)</h2>
+    </div>
+    <div id="latency-wrap"><div class="loading">Loading…</div></div>
+  </div>
+
   <div class="card">
     <div class="card-header">
       <h2>Calls</h2>
@@ -135,6 +149,34 @@ _CALLS_HTML = """\
 
 <script>
 let _rows = [];
+
+async function loadLatency() {
+  const wrap = document.getElementById('latency-wrap');
+  try {
+    const r = await fetch('/latency?hours=24');
+    const d = await r.json();
+    const n = d['sample_count'];
+    if (!n) { wrap.innerHTML = '<div class="empty">No latency data yet — data populates after calls complete.</div>'; return; }
+    const rows = [
+      ['STT',        'stt_ms',              800],
+      ['LLM first token', 'llm_first_token_ms', 2500],
+      ['End-to-end', 'end_to_end_turn_ms',  4000],
+    ];
+    const fmt = (v, thresh) => {
+      if (v == null) return '—';
+      const ms = Math.round(v);
+      return ms > thresh ? `<span class="lat-warn">${ms} ms ⚠</span>` : `${ms} ms`;
+    };
+    let html = `<table class="lat-table"><thead><tr><th>Stage</th><th>P50</th><th>P95</th><th>P99</th></tr></thead><tbody>`;
+    rows.forEach(([label, key, thresh]) => {
+      html += `<tr><td>${label}</td><td>${fmt(d[key+'_p50'],thresh)}</td><td>${fmt(d[key+'_p95'],thresh)}</td><td>${fmt(d[key+'_p99'],thresh)}</td></tr>`;
+    });
+    html += `</tbody></table><div style="padding:8px 16px;font-size:0.72rem;color:var(--text-muted)">${n} turns sampled</div>`;
+    wrap.innerHTML = html;
+  } catch(e) {
+    wrap.innerHTML = '<div class="empty">Latency data unavailable (PostgreSQL not configured).</div>';
+  }
+}
 
 async function load() {
   document.getElementById('table-wrap').innerHTML = '<div class="loading">Loading…</div>';
@@ -279,6 +321,7 @@ function toggleDetail(i) {
 }
 
 load();
+loadLatency();
 </script>
 </body>
 </html>

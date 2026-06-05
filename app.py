@@ -22,6 +22,7 @@ from routes.voice_lab import voice_lab_page
 from routes.metrics   import metrics_page, metrics_data
 from routes.uploads   import upload_file, list_files, delete_file
 from routes.calls     import calls_page, calls_data, audio_proxy
+from routes.latency   import latency_data
 from mydoot_functions import get_google_creds_health, get_gmail_health, SPREADSHEET_ID
 from config.database import init_db
 
@@ -75,6 +76,7 @@ async def main():
     app.router.add_get( "/calls",             calls_page)
     app.router.add_get( "/calls/data",        calls_data)
     app.router.add_get( "/calls/audio",       audio_proxy)
+    app.router.add_get( "/latency",           latency_data)
 
     runner = web.AppRunner(app)
     await runner.setup()

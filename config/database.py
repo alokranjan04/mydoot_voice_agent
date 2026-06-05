@@ -88,6 +88,27 @@ CREATE INDEX IF NOT EXISTS idx_sr_instance  ON service_requests(instance_id);
 CREATE INDEX IF NOT EXISTS idx_sr_created   ON service_requests(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_cl_instance  ON call_logs(instance_id);
 CREATE INDEX IF NOT EXISTS idx_cl_created   ON call_logs(created_at DESC);
+
+CREATE TABLE IF NOT EXISTS turn_latency_metrics (
+    id                  BIGSERIAL PRIMARY KEY,
+    instance_id         TEXT    NOT NULL REFERENCES instances(instance_id),
+    caller_id           TEXT,
+    turn_id             INTEGER,
+    customer_text       TEXT,
+    vad_ms              INTEGER,
+    stt_ms              INTEGER,
+    langgraph_ms        INTEGER,
+    llm_first_token_ms  INTEGER,
+    llm_total_ms        INTEGER,
+    tts_first_audio_ms  INTEGER,
+    tts_total_ms        INTEGER,
+    end_to_end_turn_ms  INTEGER,
+    created_at          TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_tlm_instance ON turn_latency_metrics(instance_id);
+CREATE INDEX IF NOT EXISTS idx_tlm_created  ON turn_latency_metrics(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_tlm_e2e      ON turn_latency_metrics(end_to_end_turn_ms);
 """
 
 

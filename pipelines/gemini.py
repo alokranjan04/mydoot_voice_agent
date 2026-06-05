@@ -12,7 +12,8 @@ from aiohttp import web
 from config.settings import APP_CONFIG, GEMINI_API_KEY, GEMINI_WS_URL, SARVAM_API_KEY
 from core.state_engine import ConversationStateEngine
 from core.service_graph import ServiceGraph, ServiceState
-from mydoot_functions import FUNCTION_MAP, send_call_summary_email, upload_recording_to_gcs, save_call_log
+from mydoot_functions import FUNCTION_MAP, send_call_summary_email, upload_recording_to_gcs, save_call_log, save_turn_latency
+from core.latency_tracker import LatencyTracker
 
 # ── Sarvam Saaras v3 STT ─────────────────────────────────────────────────────
 SARVAM_STT_URL = "https://api.sarvam.ai/speech-to-text"
@@ -46,11 +47,11 @@ RECORDINGS_DIR             = os.getenv("RECORDINGS_DIR", "recordings")
 # Hard time ceiling on audio forwarding after save. The confirmation is ~6s.
 # 8s gives enough room for the message to complete and cuts off any Gemini
 # repetition (the model occasionally repeats the closing line twice).
-MAX_CONFIRMATION_AUDIO_SECS = 12.0
+MAX_CONFIRMATION_AUDIO_SECS = 8.0
 # Safety-net only: end-marker transcript detection (below) is the primary
-# mechanism to stop Gemini repetitions. This byte cap (12 s ≈ 3 messages)
-# only fires if the transcript-based detection somehow misses, preventing
-# the call from staying open indefinitely.
+# mechanism to stop Gemini repetitions — it sends {"event":"clear"} to flush
+# Vobiz's buffer immediately. This byte cap (8 s ≈ 1 message + 2s headroom)
+# only fires if transcript-based detection misses, preventing indefinite hold.
 # Minimum post-save audio that must have played before a turnComplete is
 # allowed to close the call. The wait message ("Ek second...") is ~2s.
 # Requiring 2.5s ensures the wait-message's own turnComplete is NOT treated
@@ -400,6 +401,7 @@ async def gemini_handler(request):
     caller_id      = request.query.get("caller_id", "Unknown")
     state_engine   = ConversationStateEngine()
     service_graph  = ServiceGraph()
+    lt             = LatencyTracker(caller_id)
     transcript_log = []     # ["Agent: ...", "Customer: ..."]
     call_ts        = datetime.now().strftime("%Y%m%d_%H%M%S")
     pcm8_frames    = []     # raw 8kHz PCM16 frames for WAV recording (RECORD_CALLS=1)
@@ -503,8 +505,9 @@ async def gemini_handler(request):
                 nonlocal greeting_started, greeting_done, save_done_ts, save_executed
                 nonlocal confirmation_done, confirmation_audio_secs, waiting_for_gemini
                 nonlocal agent_buf, customer_buf
-                _g_reconnects = 0
+                _g_reconnects  = 0
                 _reconnected   = False
+                _lt_first_audio = True   # reset each turn to capture first audio packet
                 try:
                     async for raw_msg in g_ws:
                         data = json.loads(raw_msg)
@@ -555,9 +558,14 @@ async def gemini_handler(request):
                                 if _end_pos != -1 and _buf_l[_end_pos:].strip():
                                     confirmation_done = True
                                     log("🔇 Repetition after end-marker — "
-                                        "blocking audio, closing in 2s")
+                                        "clearing Vobiz buffer + closing in 1s")
+                                    try:
+                                        if not ws.closed:
+                                            await ws.send_str(json.dumps({"event": "clear"}))
+                                    except Exception:
+                                        pass
                                     asyncio.create_task(
-                                        _close_after(ws, g_ws, 2.0, log))
+                                        _close_after(ws, g_ws, 1.0, log))
 
                         server_content = data.get("serverContent", {})
 
@@ -568,6 +576,9 @@ async def gemini_handler(request):
                                     continue  # hard-block any audio after confirmation
                                 if barge_in_active:
                                     continue  # customer interrupted — drop remaining agent audio
+                                if _lt_first_audio:
+                                    lt.mark("gemini_first_audio")
+                                    _lt_first_audio = False
                                 # Decode first so we can count audio duration before forwarding.
                                 pcm24 = base64.b64decode(part["inlineData"]["data"])
                                 # Accumulate post-save audio seconds. Requires
@@ -615,6 +626,9 @@ async def gemini_handler(request):
 
                         # ── turnComplete: agent finished speaking ────────────
                         if server_content.get("turnComplete"):
+                            lt.mark("gemini_turn_end")
+                            lt.complete_turn()
+                            _lt_first_audio = True  # reset for next turn
                             gemini_turn_end_ts = time.time()
                             waiting_for_gemini = False  # customer may speak again
                             ai_dur = gemini_turn_end_ts - last_ai_audio_ts if last_ai_audio_ts else 0
@@ -853,10 +867,11 @@ async def gemini_handler(request):
             MAX_CALL_SECS     = 600
             last_customer_ts  = 0.0   # time last transcript was sent to Gemini
             # VAD state
-            speech_buf        = []    # accumulated 8 kHz PCM bytes for current utterance
-            speech_start_ts   = 0.0
-            vad_last_speech   = 0.0   # time of last above-threshold packet
-            in_speech         = False
+            speech_buf          = []    # accumulated 8 kHz PCM bytes for current utterance
+            speech_start_ts     = 0.0
+            speech_start_perf   = 0.0  # perf_counter at VAD onset (for latency tracking)
+            vad_last_speech     = 0.0  # time of last above-threshold packet
+            in_speech           = False
             # Barge-in state
             barge_in_buf      = []    # accumulate frames during potential barge-in
             barge_in_start_ts = 0.0   # when high-RMS streak started
@@ -867,17 +882,25 @@ async def gemini_handler(request):
             # per utterance.
             sarvam_session = aiohttp.ClientSession()
 
-            async def _stt_and_send(pcm8_bytes: bytes):
+            async def _stt_and_send(pcm8_bytes: bytes, _vad_start_perf: float = 0.0):
                 """Transcribe utterance and send text turn to Gemini Live."""
                 nonlocal last_customer_ts, waiting_for_gemini, barge_in_active
+                _span = lt.new_turn()
+                if _vad_start_perf:
+                    _span.vad_start = _vad_start_perf
+                lt.mark("vad_end")
+                lt.mark("stt_start")
                 t0 = time.time()
                 transcript = await _sarvam_stt(pcm8_bytes, session=sarvam_session)
+                lt.mark("stt_end")
                 stt_ms = int((time.time() - t0) * 1000)
                 if not transcript:
                     log(f"📝 STT: empty ({stt_ms}ms) — ignoring")
+                    lt.discard_turn()
                     return
                 log(f"📝 STT ({stt_ms}ms) → {transcript!r}")
                 _call_track["stt_latencies_ms"].append(stt_ms)
+                lt.set_text(transcript)
                 # Re-check after STT: a concurrent task (started before
                 # waiting_for_gemini was set) may have already sent a turn.
                 # Sending two clientContent turns before Gemini responds
@@ -885,6 +908,7 @@ async def gemini_handler(request):
                 if waiting_for_gemini:
                     log(f"📝 STT concurrent-drop (Gemini busy): {transcript!r}")
                     _call_track["stt_dropped"] += 1
+                    lt.discard_turn()
                     return
                 line = f"[{_ts()}] Customer: {transcript}"
                 transcript_log.append(line)
@@ -934,10 +958,13 @@ async def gemini_handler(request):
                         if _clean_t not in _NAME_AFFIRMATIONS and _looks_like_name(_raw_name):
                             service_graph.set_pending("customer_name", _raw_name)
                             log(f"📝 Name candidate: {_raw_name!r}")
+                lt.mark("langgraph_start")
                 stage_ctx = service_graph.get_context()
+                lt.mark("langgraph_end")
                 full_text = f"{stage_ctx}\n\nCustomer: {transcript}"
                 log(f"📋 Stage: {service_graph.current_stage()}")
                 try:
+                    lt.mark("gemini_send")
                     await g_ws.send(json.dumps({
                         "clientContent": {
                             "turns": [{"role": "user", "parts": [{"text": full_text}]}],
@@ -949,6 +976,7 @@ async def gemini_handler(request):
                     log(f"📤 Gemini send OK (+{int((time.time()-t0)*1000)}ms total)")
                 except Exception as send_err:
                     log(f"❌ Gemini WS send failed after STT: {send_err}")
+                    lt.discard_turn()
 
             async for msg in ws:
                 if time.time() - call_start_ts > MAX_CALL_SECS:
@@ -1028,9 +1056,10 @@ async def gemini_handler(request):
                                     speech_buf.clear()
                                     speech_buf.extend(barge_in_buf)
                                     barge_in_buf.clear()
-                                    in_speech       = True
-                                    speech_start_ts = now - BARGE_IN_SUSTAIN_SECS
-                                    vad_last_speech = now
+                                    in_speech           = True
+                                    speech_start_ts     = now - BARGE_IN_SUSTAIN_SECS
+                                    speech_start_perf   = time.perf_counter() - BARGE_IN_SUSTAIN_SECS
+                                    vad_last_speech     = now
                             else:
                                 # RMS dropped below threshold — reset accumulator
                                 if barge_in_start_ts != 0.0:
@@ -1039,8 +1068,9 @@ async def gemini_handler(request):
 
                         if rms >= VAD_SPEECH_THRESHOLD:
                             if not in_speech:
-                                in_speech       = True
-                                speech_start_ts = now
+                                in_speech           = True
+                                speech_start_ts     = now
+                                speech_start_perf   = time.perf_counter()
                                 speech_buf.clear()
                                 log(f"🎙 Speech start (rms={rms})")
                             speech_buf.append(pcm8)
@@ -1051,7 +1081,7 @@ async def gemini_handler(request):
                                 speech_buf.clear()
                                 in_speech  = False
                                 log(f"🔁 Utterance max duration — flushing to STT")
-                                asyncio.create_task(_stt_and_send(combined))
+                                asyncio.create_task(_stt_and_send(combined, speech_start_perf))
 
                         elif in_speech:
                             speech_buf.append(pcm8)  # keep silence tail for natural phrase end
@@ -1066,7 +1096,7 @@ async def gemini_handler(request):
                                         log(f"⏭ Gemini busy — utterance dropped ({duration:.2f}s)")
                                         _call_track["stt_dropped"] += 1
                                     else:
-                                        asyncio.create_task(_stt_and_send(combined))
+                                        asyncio.create_task(_stt_and_send(combined, speech_start_perf))
                                 else:
                                     log(f"⏭ Too short ({duration:.2f}s) — ignoring")
 
@@ -1138,6 +1168,12 @@ async def gemini_handler(request):
             ))
         except Exception as _log_err:
             log(f"⚠️  Call log write failed: {_log_err}")
+        if lt.completed:
+            asyncio.create_task(asyncio.to_thread(
+                save_turn_latency,
+                caller_id = caller_id,
+                turns     = lt.completed,
+            ))
         if not ws.closed:
             await ws.close()
 
