@@ -76,6 +76,7 @@ async def _close_after(vobiz_ws, gemini_ws, delay: float, log_fn):
         await gemini_ws.close()
     except Exception:
         pass
+    await asyncio.sleep(0.1)  # let g_receiver clean up before dropping Vobiz
     try:
         if not vobiz_ws.closed:
             await vobiz_ws.close()
@@ -570,14 +571,14 @@ async def gemini_handler(request):
                                     # played; clear only removes the repeat audio.)
                                     confirmation_done = True
                                     log("🔇 End-marker reached — "
-                                        "clearing Vobiz buffer + closing in 1s")
+                                        "clearing Vobiz buffer + closing in 0.5s")
                                     try:
                                         if not ws.closed:
                                             await ws.send_str(json.dumps({"event": "clear"}))
                                     except Exception:
                                         pass
                                     asyncio.create_task(
-                                        _close_after(ws, g_ws, 1.0, log))
+                                        _close_after(ws, g_ws, 0.5, log))
 
                         server_content = data.get("serverContent", {})
 
