@@ -946,13 +946,34 @@ async def gemini_handler(request):
                 _words  = transcript.strip().split()
                 _clean_t = transcript.strip().rstrip("।.?! ").lower()
 
-                # ── Address and preferred_time: capture immediately, no confirmation ──
-                # Only customer_name uses the confirmation loop (to avoid
-                # saving a completely misheared name to Google Sheets).
-                if _cur == "address" and len(_words) >= 2:
+                # ── Address: capture immediately (no confirmation loop) ──────
+                # Require ≥2 words and reject simple affirmatives so noise
+                # like "haan ji" isn't stored as an address.
+                if _cur == "address" and len(_words) >= 2 and not _is_confirmation(_clean_t):
                     service_graph.on_field_collected("address", transcript.strip())
+
+                # ── preferred_time: confirmation loop (same as customer_name) ─
+                # Mirrors the customer_name loop so that a brief VAD/noise trigger
+                # between the agent's time-question and the customer's actual answer
+                # cannot prematurely advance the stage to customer_name.
+                # Stage only advances after customer explicitly confirms the value.
                 elif _cur == "preferred_time" and len(_words) >= 1:
-                    service_graph.on_field_collected("preferred_time", transcript.strip())
+                    if service_graph.pending is not None:
+                        _pv = service_graph.pending["value"]
+                        if _is_confirmation(_clean_t):
+                            service_graph.confirm_pending()
+                            log(f"✅ Time confirmed: {_pv!r} → stage=customer_name")
+                        else:
+                            # Customer corrected — store the new value as pending
+                            service_graph.clear_pending()
+                            if not _is_confirmation(_clean_t):
+                                service_graph.set_pending("preferred_time", transcript.strip())
+                                log(f"📝 Time correction: {transcript.strip()!r}")
+                    elif not _is_confirmation(_clean_t):
+                        # First response — store as pending, wait for confirmation
+                        service_graph.set_pending("preferred_time", transcript.strip())
+                        log(f"📝 Time candidate: {transcript.strip()!r}")
+
                 elif _cur == "customer_name" and len(_words) >= 1:
                     if service_graph.pending is not None:
                         # Waiting to confirm the captured name
