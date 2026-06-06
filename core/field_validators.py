@@ -403,14 +403,27 @@ _CITY_CANONICAL: dict = {
     "फरीदाबाद": "Faridabad",
 }
 
-_ADDR_FILLER_RE = re.compile(
+# Latin filler words — \b is safe for ASCII
+_ADDR_FILLER_LATIN_RE = re.compile(
     r'\b(?:mein|hai|ka|ki|ke|aur|main|technician|ko\s+aana|jahan|se|'
     r'tak|ko|par|pe|wala|wali|waale|address|pata|poora|apna|'
     r'bataiye|batao|batayein|rehna|rahna|rehta|rahta|'
-    r'nahi|nahin|sahi|galat|yaar|actually|correction|'
-    r'है|में|का|की|के|और|पर|से|तक|को|पास|वाला|वाली|नहीं|नही|गलत)\b',
+    r'nahi|nahin|sahi|galat|yaar|actually|correction)\b',
     re.IGNORECASE,
 )
+# Devanagari filler words — use Unicode-safe boundaries (\b fails for Devanagari)
+_ADDR_FILLER_DEVA_RE = re.compile(
+    r'(?<![a-zA-Z\u0900-\u097F])'
+    r'(?:है|में|का|की|के|और|पर|से|तक|को|पास|वाला|वाली|नहीं|नही|गलत)'
+    r'(?![a-zA-Z\u0900-\u097F])',
+)
+
+
+def _strip_addr_fillers(text: str) -> str:
+    """Remove filler words from address text, respecting script boundaries."""
+    t = _ADDR_FILLER_LATIN_RE.sub("", text)
+    t = _ADDR_FILLER_DEVA_RE.sub("", t)
+    return t
 
 _LANDMARK_RE = re.compile(
     r'\b(?:near|opp(?:osite)?|behind|adj(?:acent)?|next\s+to|'
@@ -501,7 +514,7 @@ def _extract_society(text: str, sector: str, city: str) -> str:
     # Strip sector word-form too (both Latin and Devanagari)
     t = _SECTOR_WORD_RE.sub("", t)
     t = _SECTOR_DEVA_WORD_RE.sub("", t)
-    t = _ADDR_FILLER_RE.sub("", t).strip(" ,।")
+    t = _strip_addr_fillers(t).strip(" ,।")
     # Take first comma-separated part with ≥ 2 words that starts like a proper noun
     # (first char uppercase, or contains a society/building keyword)
     _SOC_KW_RE = re.compile(
@@ -520,6 +533,18 @@ def _extract_society(text: str, sector: str, city: str) -> str:
         #   c) contains a society/building keyword
         first_char = words[0][0] if words[0] else ""
         is_deva = "\u0900" <= first_char <= "\u097F"
+        # Reject Devanagari phrases that are clearly NOT proper nouns —
+        # question/filler/pronoun words that start a phrase
+        _DEVA_FILLER_STARTS = frozenset({
+            "तो", "और", "या", "भी", "ही", "न", "ना", "नहीं", "नही",
+            "क्या", "कितना", "कितनी", "कहाँ", "कहां", "कब", "कैसे", "कैसा",
+            "कौन", "क्यों", "किसका", "किसकी", "किसके",
+            "मेरा", "मेरी", "मेरे", "हमारा", "हमारी", "आपका", "आपकी",
+            "यह", "ये", "वह", "वो", "इस", "उस", "उनका",
+            "हाँ", "हां", "नहीं", "ठीक", "बहुत", "थोड़ा", "अभी",
+        })
+        if is_deva and words[0] in _DEVA_FILLER_STARTS:
+            continue
         if words[0][:1].isupper() or is_deva or _SOC_KW_RE.search(part):
             return part
     return ""
