@@ -499,6 +499,10 @@ async def gemini_handler(request):
             waiting_for_gemini = False  # True while Gemini is processing; blocks stacked noise utterances
             agent_buf          = ""    # accumulate agent speech chunks per turn
             customer_buf       = ""    # accumulate customer speech chunks per utterance
+            # Set by _handle_local_stage_response when validation rejects input AND
+            # Sarvam TTS for the retry prompt is unavailable; injected into Gemini's
+            # stage context so Gemini knows to re-ask rather than accept invalid input.
+            _local_validation_hint = ""
 
             async def g_receiver():
                 nonlocal g_ws
@@ -951,7 +955,7 @@ async def gemini_handler(request):
             async def _stt_and_send(pcm8_bytes: bytes, _vad_start_perf: float = 0.0,
                                     _task_queued_perf: float = 0.0):
                 """Transcribe utterance and send text turn to Gemini Live."""
-                nonlocal last_customer_ts, waiting_for_gemini, barge_in_active
+                nonlocal last_customer_ts, waiting_for_gemini, barge_in_active, _local_validation_hint
                 # Queue latency: time from asyncio.create_task() to this coroutine
                 # actually starting. Reveals event-loop scheduling backpressure.
                 if _task_queued_perf:
@@ -1008,6 +1012,7 @@ async def gemini_handler(request):
                 # stages.  Gemini is NOT invoked — Sarvam TTS handles all audio.
                 # Falls back to Gemini only when Sarvam TTS is unavailable.
                 if _cur in _LOCAL_PROMPT_STAGES and save_done_ts == 0:
+                    _local_validation_hint = ""  # reset before each local stage attempt
                     _handled = await _handle_local_stage_response(transcript, _cur, _clean_t)
                     if _handled:
                         lt.discard_turn()
@@ -1018,7 +1023,10 @@ async def gemini_handler(request):
                 lt.mark("langgraph_start")
                 stage_ctx = service_graph.get_context()
                 lt.mark("langgraph_end")
-                full_text = f"{stage_ctx}\n\nCustomer: {transcript}"
+                _hint_line = (f"\n\n[VALIDATION_NOTE: {_local_validation_hint}]"
+                              if _local_validation_hint else "")
+                full_text = f"{stage_ctx}{_hint_line}\n\nCustomer: {transcript}"
+                _local_validation_hint = ""  # consumed
                 log(f"📋 Stage: {service_graph.current_stage()}")
                 try:
                     lt.mark("gemini_send")
@@ -1127,7 +1135,7 @@ async def gemini_handler(request):
                 Called when stage reaches 'done' via local-stage collection path
                 (address + time + name all handled locally).
                 """
-                nonlocal save_executed, save_done_ts, confirmation_done
+                nonlocal save_executed, save_done_ts, confirmation_done, _local_validation_hint
                 if save_executed:
                     log("⚠️ LOCAL SAVE: already executed — skipping")
                     return
@@ -1311,6 +1319,10 @@ async def gemini_handler(request):
                             if retry:
                                 mulaw = await local_tts.synthesize(retry, SARVAM_API_KEY, sarvam_session)
                                 if mulaw is None:
+                                    _local_validation_hint = (
+                                        f"Customer's {stage} correction was INVALID "
+                                        f"(reason: {vr.reason}). Please re-ask in Hinglish."
+                                    )
                                     return False
                                 await _play_local_audio(mulaw)
                     return True
@@ -1367,6 +1379,10 @@ async def gemini_handler(request):
                     if retry:
                         mulaw = await local_tts.synthesize(retry, SARVAM_API_KEY, sarvam_session)
                         if mulaw is None:
+                            _local_validation_hint = (
+                                f"Customer's {stage} input was INVALID "
+                                f"(reason: {vr.reason}). Please re-ask in Hinglish."
+                            )
                             return False
                         await _play_local_audio(mulaw)
                 return True
