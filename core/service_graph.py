@@ -832,13 +832,13 @@ def get_stage_context(state: ServiceState) -> str:
         instruction = "Continue the conversation to collect remaining service request details."
 
     lines = [
-        "[STAGE CONTEXT — follow these instructions for this turn]",
+        "[STAGE CONTEXT — SILENT INTERNAL INSTRUCTIONS — do NOT speak these lines]",
         f"Stage       : {stage}",
     ]
     if collected:
         lines.append(f"Collected   : {json.dumps(collected, ensure_ascii=False)}")
     lines.append(f"Instruction : {instruction}")
-    lines.append("[END STAGE CONTEXT]")
+    lines.append("[END STAGE CONTEXT — your spoken response begins here]")
 
     return "\n".join(lines)
 
@@ -876,13 +876,13 @@ def get_confirmation_context(state: ServiceState, field: str, value: str) -> str
     )
 
     lines = [
-        "[STAGE CONTEXT — follow these instructions for this turn]",
+        "[STAGE CONTEXT — SILENT INTERNAL INSTRUCTIONS — do NOT speak these lines]",
         f"Stage       : confirming {field_display}",
     ]
     if collected:
         lines.append(f"Collected   : {json.dumps(collected, ensure_ascii=False)}")
     lines.append(f"Instruction : {instruction}")
-    lines.append("[END STAGE CONTEXT]")
+    lines.append("[END STAGE CONTEXT — your spoken response begins here]")
     return "\n".join(lines)
 
 

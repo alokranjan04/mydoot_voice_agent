@@ -543,18 +543,19 @@ def _ensure_call_logs_sheet(service, spreadsheet_id: str) -> bool:
                 body={"requests": [{"addSheet": {"properties": {"title": "Call_Logs"}}}]},
             ).execute()
             print("[CALL LOG] Created 'Call_Logs' sheet.")
-        # Write headers if row 1 is empty
+        # Write headers if row 1 is empty OR column count has changed (schema migration)
         result = service.spreadsheets().values().get(
             spreadsheetId=spreadsheet_id, range="Call_Logs!A1:S1"
         ).execute()
-        if not result.get("values"):
+        existing_headers = result.get("values", [[]])[0]
+        if not existing_headers or len(existing_headers) != len(_CALL_LOGS_HEADERS):
             service.spreadsheets().values().update(
                 spreadsheetId=spreadsheet_id,
                 range="Call_Logs!A1:S1",
                 valueInputOption="RAW",
                 body={"values": [_CALL_LOGS_HEADERS]},
             ).execute()
-            print("[CALL LOG] Header row written.")
+            print("[CALL LOG] Header row written/updated.")
         _CALL_LOGS_CACHE["sheet_ensured"] = True
         return True
     except Exception as e:
@@ -919,7 +920,7 @@ def get_call_logs(n: int = 200) -> list:
             return []
         result = service.spreadsheets().values().get(
             spreadsheetId=spreadsheet_id,
-            range="Call_Logs!A1:R",
+            range="Call_Logs!A1:S",
         ).execute()
         rows = result.get("values", [])
         if not rows or len(rows) < 2:
