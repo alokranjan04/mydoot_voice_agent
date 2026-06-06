@@ -60,27 +60,38 @@ async def main():
 
     app = web.Application()
 
-    app.router.add_get( "/",                  home_page)
-    app.router.add_get( "/voice-lab",         voice_lab_page)
+    # ── Core telephony ────────────────────────────────────────────────────────
     app.router.add_post("/answer",            handle_answer)
-    app.router.add_post("/api/set-provider",  set_provider)
-    app.router.add_post("/api/set-parameters", set_parameters)
     app.router.add_get( "/sarvam-stream",     sarvam_handler)
     app.router.add_get( "/gemini-stream",     gemini_handler)
+
+    # ── Dashboards ────────────────────────────────────────────────────────────
+    app.router.add_get( "/",                  home_page)
+    app.router.add_get( "/voice-lab",         voice_lab_page)
     app.router.add_get( "/metrics",           metrics_page)
     app.router.add_get( "/metrics/data",      metrics_data)
-    app.router.add_get( "/health",           health_check)
-    app.router.add_post("/api/upload",        upload_file)
-    app.router.add_get( "/api/files",         list_files)
-    app.router.add_post("/api/delete-file",   delete_file)
-    app.router.add_static("/recordings",      "recordings", show_index=True)
+    app.router.add_get( "/analytics",         analytics_page)
+    app.router.add_get( "/analytics/data",    analytics_data)
+
+    # ── Call logs & recordings ────────────────────────────────────────────────
     app.router.add_get( "/calls",             calls_page)
     app.router.add_get( "/calls/data",        calls_data)
     app.router.add_get( "/calls/audio",       audio_proxy)
     app.router.add_get( "/calls/local-audio", local_audio)
+    app.router.add_static("/recordings",      "recordings", show_index=True)
+
+    # ── Latency metrics ───────────────────────────────────────────────────────
     app.router.add_get( "/latency",           latency_data)
-    app.router.add_get( "/analytics",         analytics_page)
-    app.router.add_get( "/analytics/data",    analytics_data)
+
+    # ── Configuration API ─────────────────────────────────────────────────────
+    app.router.add_post("/api/set-provider",  set_provider)
+    app.router.add_post("/api/set-parameters", set_parameters)
+    app.router.add_post("/api/upload",        upload_file)
+    app.router.add_get( "/api/files",         list_files)
+    app.router.add_post("/api/delete-file",   delete_file)
+
+    # ── Health ────────────────────────────────────────────────────────────────
+    app.router.add_get( "/health",            health_check)
 
     runner = web.AppRunner(app)
     await runner.setup()

@@ -344,10 +344,12 @@ loadLatency();
 # ── Route handlers ─────────────────────────────────────────────────────────────
 
 async def calls_page(request: web.Request) -> web.Response:
+    """Serve the call logs HTML dashboard."""
     return web.Response(text=_CALLS_HTML, content_type="text/html")
 
 
 async def calls_data(request: web.Request) -> web.Response:
+    """Return the last 200 call log records as JSON (from Google Sheets)."""
     records = await asyncio.to_thread(get_call_logs, 200)
     return web.json_response({"calls": records, "count": len(records)})
 
@@ -410,18 +412,24 @@ async def local_audio(request: web.Request) -> web.Response:
     Only filenames — no path traversal allowed.
     """
     filename = request.query.get("file", "").strip()
-    # Reject any path separators to prevent directory traversal
+    # First-pass: reject obvious traversal characters before touching the filesystem
     if not filename or "/" in filename or "\\" in filename or ".." in filename:
         return web.Response(status=400, text="Invalid filename")
     if not filename.endswith(".wav"):
         return web.Response(status=400, text="Only .wav files are served here")
 
     wav_path = os.path.join(_LOCAL_RECORDINGS_DIR, filename)
-    if not os.path.isfile(wav_path):
+    # Second-pass: resolve symlinks and verify the path stays inside recordings dir
+    recordings_real = os.path.realpath(_LOCAL_RECORDINGS_DIR)
+    wav_real        = os.path.realpath(wav_path)
+    if not wav_real.startswith(recordings_real + os.sep):
+        return web.Response(status=400, text="Invalid filename")
+
+    if not os.path.isfile(wav_real):
         return web.Response(status=404, text="Recording not found")
 
     try:
-        with open(wav_path, "rb") as f:
+        with open(wav_real, "rb") as f:
             data = f.read()
     except OSError as e:
         return web.Response(status=500, text=f"Read error: {e}")

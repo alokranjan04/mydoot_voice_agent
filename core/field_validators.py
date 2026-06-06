@@ -1,20 +1,37 @@
 # -*- coding: utf-8 -*-
 """
-core/field_validators.py — Strict entity validation for Mydoot voice agent.
+core/field_validators.py — Strict entity validation for the Mydoot voice pipeline.
 
 Every extracted field passes through a validator before being accepted into the
-ServiceGraph.  Validators return a ValidationResult with:
+ServiceGraph state. Validators return a :class:`ValidationResult` with:
+
   accepted    — bool: whether the value should be committed
   confidence  — 0.0–1.0 score
-  extracted   — cleaned/normalised value (name extraction strips intro phrases)
-  reason      — machine-readable rejection/acceptance code
+  extracted   — cleaned / normalised value (intro phrases stripped for names)
+  reason      — machine-readable acceptance / rejection code
   field       — which field was validated
-  raw         — original untouched transcript
+  raw         — original untouched STT transcript
 
-Usage:
-  from core.field_validators import validate_customer_name, validate_address, validate_preferred_time
-  vr = validate_customer_name("mera naam Alok Ranjan hai")
-  # ValidationResult(accepted=True, confidence=0.9, extracted="Alok Ranjan", ...)
+Sections
+--------
+1. CUSTOMER NAME  — validate_customer_name()
+2. ADDRESS        — validate_address(), parse_address_fields(),
+                    merge_address_correction()
+3. PREFERRED TIME — validate_preferred_time()
+4. ADDRESS ENTITY — AddressFields dataclass + all extraction helpers
+
+All regexes are compiled at **module load** time (never inside loops or
+repeated function calls) so there is no per-call compilation overhead.
+
+Usage::
+
+    from core.field_validators import (
+        validate_customer_name, validate_address, validate_preferred_time,
+        AddressFields, parse_address_fields, format_address_fields,
+        is_address_correction, merge_address_correction,
+    )
+    vr = validate_customer_name("mera naam Alok Ranjan hai")
+    # ValidationResult(accepted=True, confidence=0.95, extracted="Alok Ranjan", ...)
 """
 from __future__ import annotations
 
@@ -243,31 +260,31 @@ def validate_address(text: str) -> ValidationResult:
 # 3. PREFERRED TIME
 # ─────────────────────────────────────────────────────────────────────────────
 
-# (pattern_regex, confidence_if_matched)
-_TIME_PATTERN_RULES: list[tuple[str, float]] = [
+# (compiled_pattern, confidence_if_matched) — compiled at module load, never inside loops
+_TIME_PATTERN_RULES: list[tuple[re.Pattern, float]] = [
     # Numeric time: "10 baje", "5:30 PM", "10 AM"
-    (r'\b\d{1,2}(?::\d{2})?\s*(?:baje|am|pm|AM|PM)\b',          0.95),
+    (re.compile(r'\b\d{1,2}(?::\d{2})?\s*(?:baje|am|pm|AM|PM)\b', re.IGNORECASE),          0.95),
     # Explicit day + time: "kal subah", "aaj shaam"
-    (r'\b(kal|aaj|parso|kal\s+ko|is\s+hafte)\b.{0,20}'
-     r'\b(subah|shaam|dopahar|raat|morning|evening|afternoon|night)\b', 0.90),
+    (re.compile(r'\b(kal|aaj|parso|kal\s+ko|is\s+hafte)\b.{0,20}'
+                r'\b(subah|shaam|dopahar|raat|morning|evening|afternoon|night)\b', re.IGNORECASE), 0.90),
     # Just day words
-    (r'\b(kal|aaj|parso|kal\s+ko)\b',                            0.75),
+    (re.compile(r'\b(kal|aaj|parso|kal\s+ko)\b', re.IGNORECASE),                            0.75),
     # Time-of-day words
-    (r'\b(subah|shaam|dopahar|raat|morning|afternoon|evening|night)\b', 0.70),
+    (re.compile(r'\b(subah|shaam|dopahar|raat|morning|afternoon|evening|night)\b', re.IGNORECASE), 0.70),
     # Weekday names
-    (r'\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|'
-     r'somvar|mangalvar|budhvar|guruvar|shukravar|shanivar|ravivar)\b', 0.75),
+    (re.compile(r'\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|'
+                r'somvar|mangalvar|budhvar|guruvar|shukravar|shanivar|ravivar)\b', re.IGNORECASE), 0.75),
     # Relative time: "next week", "agle hafte", "is weekend"
-    (r'\b(next\s+(?:week|day|monday|morning)|agle\s+hafte|is\s+hafte|'
-     r'weekend|is\s+weekend|agle\s+hafte)\b',                     0.70),
+    (re.compile(r'\b(next\s+(?:week|day|monday|morning)|agle\s+hafte|is\s+hafte|'
+                r'weekend|is\s+weekend|agle\s+hafte)\b', re.IGNORECASE),                     0.70),
     # Anytime / flexible
-    (r'\b(anytime|koi\s+bhi\s+(?:time|samay|din)|convenient|'
-     r'flexible|jo\s+bhi|jo\s+time|suvidha\s+anusaar)\b',         0.65),
+    (re.compile(r'\b(anytime|koi\s+bhi\s+(?:time|samay|din)|convenient|'
+                r'flexible|jo\s+bhi|jo\s+time|suvidha\s+anusaar)\b', re.IGNORECASE),         0.65),
     # Urgency
-    (r'\b(jaldi|asap|urgent|turant|abhi|immediately|'
-     r'jitna\s+jaldi|as\s+soon)\b',                               0.70),
+    (re.compile(r'\b(jaldi|asap|urgent|turant|abhi|immediately|'
+                r'jitna\s+jaldi|as\s+soon)\b', re.IGNORECASE),                               0.70),
     # Month/week references
-    (r'\b(mahine|month|hafte|week|saptaah)\b',                    0.60),
+    (re.compile(r'\b(mahine|month|hafte|week|saptaah)\b', re.IGNORECASE),                    0.60),
 ]
 
 _TIME_REJECT_SET: frozenset = frozenset({
@@ -299,7 +316,7 @@ def validate_preferred_time(text: str) -> ValidationResult:
     best_reason = "no_time_pattern"
 
     for pattern, conf in _TIME_PATTERN_RULES:
-        if re.search(pattern, clean, re.IGNORECASE):
+        if pattern.search(clean):
             if conf > best_conf:
                 best_conf   = conf
                 best_reason = "pattern_match"
@@ -490,6 +507,23 @@ _CITY_PATTERNS: dict = {
     for city in _KNOWN_CITIES
 }
 
+# Society / building type keywords — compiled at module level (used in _extract_society)
+_SOC_KW_RE = re.compile(
+    r'\b(?:society|villa|casa|enclave|heights|towers?|residency|'
+    r'apartments?|complex|park|garden|nagar|vihar|puram|colony)\b',
+    re.IGNORECASE,
+)
+
+# Devanagari words that are never valid society name starters
+_DEVA_FILLER_STARTS: frozenset = frozenset({
+    "तो", "और", "या", "भी", "ही", "न", "ना", "नहीं", "नही",
+    "क्या", "कितना", "कितनी", "कहाँ", "कहां", "कब", "कैसे", "कैसा",
+    "कौन", "क्यों", "किसका", "किसकी", "किसके",
+    "मेरा", "मेरी", "मेरे", "हमारा", "हमारी", "आपका", "आपकी",
+    "यह", "ये", "वह", "वो", "इस", "उस", "उनका",
+    "हाँ", "हां", "नहीं", "ठीक", "बहुत", "थोड़ा", "अभी",
+})
+
 
 def _extract_city(text: str) -> str:
     """Return canonical city name, or '' if not found."""
@@ -504,7 +538,11 @@ def _extract_society(text: str, sector: str, city: str) -> str:
     """Extract society/building name: meaningful text before sector/city."""
     t = text.strip()
     if city:
-        t = _CITY_PATTERNS.get(city, re.compile(re.escape(city), re.IGNORECASE)).sub("", t)
+        pat = _CITY_PATTERNS.get(city)
+        if pat:
+            t = pat.sub("", t)
+        else:
+            t = re.sub(re.escape(city), "", t, flags=re.IGNORECASE)
     if sector:
         t = re.sub(
             r'(?<![a-zA-Z\u0900-\u097F])(?:sector|sec|सेक्टर)\s*[–\-]?\s*'
@@ -516,33 +554,15 @@ def _extract_society(text: str, sector: str, city: str) -> str:
     t = _SECTOR_DEVA_WORD_RE.sub("", t)
     t = _strip_addr_fillers(t).strip(" ,।")
     # Take first comma-separated part with ≥ 2 words that starts like a proper noun
-    # (first char uppercase, or contains a society/building keyword)
-    _SOC_KW_RE = re.compile(
-        r'\b(?:society|villa|casa|enclave|heights|towers?|residency|'
-        r'apartments?|complex|park|garden|nagar|vihar|puram|colony)\b',
-        re.IGNORECASE,
-    )
+    # (first char uppercase, or Devanagari, or contains a society/building keyword)
     for part in re.split(r'[,،]', t):
         part = part.strip(" ,।")
         words = part.split()
         if len(words) < 2:
             continue
-        # Accept if:
-        #   a) starts with Latin uppercase (proper noun), OR
-        #   b) starts with Devanagari character (no case in Devanagari), OR
-        #   c) contains a society/building keyword
         first_char = words[0][0] if words[0] else ""
         is_deva = "\u0900" <= first_char <= "\u097F"
-        # Reject Devanagari phrases that are clearly NOT proper nouns —
-        # question/filler/pronoun words that start a phrase
-        _DEVA_FILLER_STARTS = frozenset({
-            "तो", "और", "या", "भी", "ही", "न", "ना", "नहीं", "नही",
-            "क्या", "कितना", "कितनी", "कहाँ", "कहां", "कब", "कैसे", "कैसा",
-            "कौन", "क्यों", "किसका", "किसकी", "किसके",
-            "मेरा", "मेरी", "मेरे", "हमारा", "हमारी", "आपका", "आपकी",
-            "यह", "ये", "वह", "वो", "इस", "उस", "उनका",
-            "हाँ", "हां", "नहीं", "ठीक", "बहुत", "थोड़ा", "अभी",
-        })
+        # Reject Devanagari phrases starting with question/filler/pronoun words
         if is_deva and words[0] in _DEVA_FILLER_STARTS:
             continue
         if words[0][:1].isupper() or is_deva or _SOC_KW_RE.search(part):

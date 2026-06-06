@@ -159,7 +159,9 @@ def init_db() -> bool:
         try:
             with conn.cursor() as cur:
                 cur.execute(_DDL)
-                # Migrations for columns added after initial deployment
+                # ── Additive migrations (safe to re-run on every startup) ──────
+                # Add new columns here with IF NOT EXISTS so existing deployments
+                # pick them up automatically without a manual migration step.
                 cur.execute(
                     "ALTER TABLE call_logs ADD COLUMN IF NOT EXISTS local_wav TEXT DEFAULT ''"
                 )
@@ -186,7 +188,7 @@ def init_db() -> bool:
         return False
 
 
-def get_conn():
+def get_conn() -> "psycopg2.extensions.connection | None":
     """Borrow a connection from the pool. Caller MUST call put_conn() afterwards."""
     if _pool is None:
         return None
@@ -197,7 +199,7 @@ def get_conn():
         return None
 
 
-def put_conn(conn, discard: bool = False) -> None:
+def put_conn(conn: "psycopg2.extensions.connection | None", discard: bool = False) -> None:
     """Return a connection to the pool. Pass discard=True after an exception."""
     if _pool and conn:
         _pool.putconn(conn, close=discard)

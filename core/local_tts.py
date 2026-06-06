@@ -90,6 +90,39 @@ def build_confirmation_text(state: dict) -> str:
 
 # ── Synthesis ─────────────────────────────────────────────────────────────────
 
+_TTS_TIMEOUT = aiohttp.ClientTimeout(total=8.0)
+
+
+async def _do_tts_request(
+    sess:    aiohttp.ClientSession,
+    payload: dict,
+    headers: dict,
+) -> Optional[bytes]:
+    """
+    POST one TTS request to the Sarvam API and return μ-law PCM bytes.
+
+    Returns None on HTTP error, empty response, or WAV conversion failure.
+    Separated from synthesize() so it can be tested independently and called
+    with either a shared session (per-pipeline) or a one-shot session.
+    """
+    async with sess.post(
+        SARVAM_TTS_URL,
+        json=payload,
+        headers=headers,
+        timeout=_TTS_TIMEOUT,
+    ) as r:
+        if r.status != 200:
+            body = await r.text()
+            print(f"[LOCAL TTS] Sarvam TTS {r.status}: {body[:200]}")
+            return None
+        result = await r.json()
+        audios = result.get("audios", [])
+        if not audios:
+            print("[LOCAL TTS] No audio in response")
+            return None
+        return _wav_to_mulaw8k(base64.b64decode(audios[0]))
+
+
 async def synthesize(
     text:    str,
     api_key: str,
@@ -101,54 +134,31 @@ async def synthesize(
     Returns raw μ-law bytes ready to base64-encode for Vobiz playAudio.
     Returns None on failure — caller should fall back to Gemini-generated speech.
 
-    The Sarvam TTS API returns a base64-encoded WAV; we convert it to
-    8 kHz μ-law so it matches the Vobiz audio format exactly.
+    Pass an existing ``session`` to reuse a per-call aiohttp session; otherwise
+    a short-lived session is created and closed automatically.
     """
     if not text or not api_key:
         return None
+    payload = {
+        "inputs":                [text],
+        "target_language_code":  "hi-IN",
+        "speaker":               "anushka",
+        "pitch":                 0,
+        "pace":                  1.05,
+        "loudness":              1.5,
+        "speech_sample_rate":    8000,
+        "enable_preprocessing":  True,
+        "model":                 "bulbul:v1",
+    }
+    headers = {
+        "api-subscription-key": api_key,
+        "Content-Type":         "application/json",
+    }
     try:
-        payload = {
-            "inputs":                [text],
-            "target_language_code":  "hi-IN",
-            "speaker":               "anushka",
-            "pitch":                 0,
-            "pace":                  1.05,
-            "loudness":              1.5,
-            "speech_sample_rate":    8000,
-            "enable_preprocessing":  True,
-            "model":                 "bulbul:v1",
-        }
-        headers = {
-            "api-subscription-key": api_key,
-            "Content-Type":         "application/json",
-        }
-        timeout = aiohttp.ClientTimeout(total=8.0)
-
-        async def _post(sess: aiohttp.ClientSession) -> Optional[bytes]:
-            async with sess.post(
-                SARVAM_TTS_URL,
-                json=payload,
-                headers=headers,
-                timeout=timeout,
-            ) as r:
-                if r.status != 200:
-                    body = await r.text()
-                    print(f"[LOCAL TTS] Sarvam TTS {r.status}: {body[:200]}")
-                    return None
-                result = await r.json()
-                audios = result.get("audios", [])
-                if not audios:
-                    print("[LOCAL TTS] No audio in response")
-                    return None
-                wav_b64 = audios[0]
-                wav_bytes = base64.b64decode(wav_b64)
-                return _wav_to_mulaw8k(wav_bytes)
-
         if session is not None:
-            return await _post(session)
+            return await _do_tts_request(session, payload, headers)
         async with aiohttp.ClientSession() as s:
-            return await _post(s)
-
+            return await _do_tts_request(s, payload, headers)
     except Exception as exc:
         print(f"[LOCAL TTS] synthesis error: {exc}")
         return None

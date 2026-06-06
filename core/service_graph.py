@@ -728,6 +728,18 @@ def advance_stage(state: ServiceState) -> ServiceState:
 
 # ── Context injection ─────────────────────────────────────────────────────────
 
+# Fields included in the [STAGE CONTEXT] "Collected" summary
+_COLLECTED_FIELDS = (
+    "category", "subcategory", "issue_type", "brand", "model",
+    "severity", "error_code", "address", "preferred_time", "customer_name",
+)
+
+
+def _build_collected(state: ServiceState) -> dict:
+    """Return dict of non-empty collected fields for stage context display."""
+    return {k: state[k] for k in _COLLECTED_FIELDS if state.get(k)}
+
+
 def get_stage_context(state: ServiceState) -> str:
     """
     Generate the [STAGE CONTEXT] block prepended to every Gemini clientContent turn.
@@ -741,12 +753,7 @@ def get_stage_context(state: ServiceState) -> str:
     subcats     = cat_info.get("subcategories", [])
     needs_brand = cat_info.get("needs_brand", False)
 
-    # Collected fields summary
-    collected = {}
-    for k in ["category", "subcategory", "issue_type", "brand", "model",
-              "severity", "error_code", "address", "preferred_time", "customer_name"]:
-        if state.get(k):
-            collected[k] = state[k]
+    collected = _build_collected(state)
 
     # ── Stage-specific instruction ─────────────────────────────────────────
     if stage == "category":
@@ -849,11 +856,7 @@ def get_confirmation_context(state: ServiceState, field: str, value: str) -> str
     Injected when the pipeline has captured a value but is waiting for
     the customer to say haan/yes before the stage advances.
     """
-    collected = {}
-    for k in ["category", "subcategory", "issue_type", "brand", "model",
-              "severity", "error_code", "address", "preferred_time", "customer_name"]:
-        if state.get(k):
-            collected[k] = state[k]
+    collected = _build_collected(state)
 
     field_display = {
         "address": "address",
