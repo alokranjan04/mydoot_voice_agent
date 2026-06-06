@@ -1104,9 +1104,17 @@ async def gemini_handler(request):
                 log(f"💬 Confirmation: {confirm_text!r}")
                 mulaw = await local_tts.synthesize(confirm_text, SARVAM_API_KEY, sarvam_session)
                 if mulaw:
+                    # Compute how long Vobiz needs to finish playing after we stop sending.
+                    # _play_local_audio streams at 800 bytes/80ms ≈ 1.25× realtime, so when
+                    # the last chunk is sent the buffer still holds ~20% of audio_duration.
+                    # Wait for that remainder + 0.5s safety margin before closing WS.
+                    audio_secs  = len(mulaw) / 8000          # μ-law 8 kHz: 1 byte = 1/8000 s
+                    stream_secs = (len(mulaw) / 800) * 0.08  # approx time to push all chunks
                     await _play_local_audio(mulaw)
-                    log("EVT final_confirmation_completed")
-                    await asyncio.sleep(0.4)  # let audio flush to PSTN before closing
+                    log(f"EVT final_confirmation_completed audio_secs={audio_secs:.1f}")
+                    wait_secs = max(audio_secs - stream_secs + 0.5, 0.4)
+                    log(f"⏳ Waiting {wait_secs:.1f}s for Vobiz to finish playback before closing")
+                    await asyncio.sleep(wait_secs)
                 else:
                     log("⚠️ EVT local_tts_failed — routing confirmation through Gemini")
                     try:
