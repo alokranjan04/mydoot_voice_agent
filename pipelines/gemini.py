@@ -18,7 +18,8 @@ from core.field_validators import (
     is_address_correction, merge_address_correction,
 )
 import core.local_tts as local_tts
-from mydoot_functions import FUNCTION_MAP, send_call_summary_email, upload_recording_to_gcs, save_call_log, save_turn_latency
+from mydoot_functions import (FUNCTION_MAP, send_call_summary_email, upload_recording_to_gcs,
+                              save_call_log, save_turn_latency, save_field_quality_log)
 from core.latency_tracker import LatencyTracker
 
 # ── Sarvam Saaras v3 STT ─────────────────────────────────────────────────────
@@ -412,6 +413,13 @@ async def gemini_handler(request):
         "reconnects": 0,          # Gemini WS reconnect attempts
         "gcs_uri": "",            # recording GCS URI (set at end if RECORD_CALLS=1)
     }
+    # Per-call extraction quality tracker.  Guarded so any import failure
+    # cannot disrupt the call — all tracking calls check `if _eq:` first.
+    try:
+        from core.extraction_quality import ExtractionQualityTracker as _EQT
+        _eq = _EQT(caller_id)
+    except Exception:
+        _eq = None
     # Initialized here (not inside async with) so the finally block can always
     # reference it, even when Gemini fails during connect (e.g. credits depleted).
     save_executed = False
@@ -792,6 +800,10 @@ async def gemini_handler(request):
                                         tool_result         = {"success": True}
                                         _trigger_local_conf = True
                                         log("🔒 Save OK — local TTS confirmation queued, Gemini closing")
+                                        # Hook B: record Gemini-handled fields (category/subcategory/
+                                        # issue_type/brand/model) from the successful save args.
+                                        if _eq and fn == "save_service_request":
+                                            _eq.record_gemini_fields(args)
                                     elif is_save_fn and not res.get("success"):
                                         # Save failed — send explicit error so Gemini knows
                                         # not to say "request registered" and instead apologises.
@@ -1130,6 +1142,9 @@ async def gemini_handler(request):
                     save_done_ts     = time.time()
                     confirmation_done = True
                     log("✅ LOCAL SAVE OK")
+                    # Record Gemini-handled fields from local-save args
+                    if _eq:
+                        _eq.record_gemini_fields(args)
                     await _local_final_confirmation()
                 else:
                     err = res.get("message", "unknown error")
@@ -1201,6 +1216,9 @@ async def gemini_handler(request):
                         log(f"✅ LOCAL {stage} confirmed: {pend_value!r} → stage={new_stage}")
                         evt("local_field_confirmed", field=stage, value=pend_value[:40],
                             next_stage=new_stage)
+                        # Hook C3 — field confirmed
+                        if _eq:
+                            _eq.record_local_confirmed(stage, pend_value)
                         if new_stage in _LOCAL_PROMPT_STAGES:
                             prompt = local_tts.PROMPTS.get(new_stage, "")
                             if prompt:
@@ -1231,6 +1249,9 @@ async def gemini_handler(request):
                                     correction_detected=correction_detected,
                                 )
                                 service_graph.set_pending(stage, merged)
+                                # Hook C2a — address merge correction
+                                if _eq:
+                                    _eq.record_local_correction(stage, merged, None)
                                 echo = local_tts.build_echo_text(stage, merged)
                                 mulaw = await local_tts.synthesize(echo, SARVAM_API_KEY, sarvam_session)
                                 if mulaw is None:
@@ -1261,6 +1282,10 @@ async def gemini_handler(request):
 
                         if vr.accepted:
                             service_graph.set_pending(stage, pending_val or vr.extracted)
+                            # Hook C2b — validate-path correction
+                            if _eq:
+                                _eq.record_local_correction(stage, pending_val or vr.extracted,
+                                                            vr.confidence)
                             echo = local_tts.build_echo_text(stage, pending_val or vr.extracted)
                             mulaw = await local_tts.synthesize(echo, SARVAM_API_KEY, sarvam_session)
                             if mulaw is None:
@@ -1302,6 +1327,9 @@ async def gemini_handler(request):
                         f"(conf={vr.confidence:.2f})")
                     evt("local_field_candidate", field=stage,
                         value=pending_val[:40], confidence=round(vr.confidence, 2))
+                    # Hook C1 — first candidate for local field
+                    if _eq:
+                        _eq.record_local_candidate(stage, pending_val, vr.confidence)
                     echo = local_tts.build_echo_text(stage, pending_val)
                     mulaw = await local_tts.synthesize(echo, SARVAM_API_KEY, sarvam_session)
                     if mulaw is None:
@@ -1529,6 +1557,18 @@ async def gemini_handler(request):
                 caller_id = caller_id,
                 turns     = lt.completed,
             ))
+        # Hook D — flush extraction quality records (non-blocking)
+        if _eq:
+            try:
+                _eq.mark_call_saved(save_executed)
+                _qual_records = _eq.flush()
+                if _qual_records:
+                    log(f"QUAL_SNAPSHOT {json.dumps(_qual_records, ensure_ascii=False, default=str)}")
+                    asyncio.create_task(asyncio.to_thread(
+                        save_field_quality_log, records=_qual_records,
+                    ))
+            except Exception as _eq_err:
+                log(f"⚠️  Quality log flush failed: {_eq_err}")
         if not ws.closed:
             await ws.close()
 

@@ -109,6 +109,25 @@ CREATE TABLE IF NOT EXISTS turn_latency_metrics (
 CREATE INDEX IF NOT EXISTS idx_tlm_instance ON turn_latency_metrics(instance_id);
 CREATE INDEX IF NOT EXISTS idx_tlm_created  ON turn_latency_metrics(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_tlm_e2e      ON turn_latency_metrics(end_to_end_turn_ms);
+
+CREATE TABLE IF NOT EXISTS field_quality_log (
+    id               BIGSERIAL PRIMARY KEY,
+    instance_id      TEXT        NOT NULL REFERENCES instances(instance_id),
+    caller_id        TEXT        NOT NULL,
+    field            TEXT        NOT NULL,
+    first_value      TEXT        DEFAULT '',
+    final_value      TEXT        DEFAULT '',
+    num_attempts     INTEGER     NOT NULL DEFAULT 1,
+    num_corrections  INTEGER     NOT NULL DEFAULT 0,
+    confidence       NUMERIC(6,4),
+    source           TEXT        NOT NULL DEFAULT 'gemini',
+    call_saved       BOOLEAN     NOT NULL DEFAULT FALSE,
+    created_at       TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_fql_instance ON field_quality_log(instance_id);
+CREATE INDEX IF NOT EXISTS idx_fql_field    ON field_quality_log(field);
+CREATE INDEX IF NOT EXISTS idx_fql_created  ON field_quality_log(created_at DESC);
 """
 
 

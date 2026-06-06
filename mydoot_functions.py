@@ -686,6 +686,190 @@ def save_turn_latency(caller_id: str, turns: list) -> None:
         put_conn(conn, discard=True)
 
 
+def save_field_quality_log(records: list) -> None:
+    """
+    Bulk-insert FieldRecord dicts into field_quality_log (PostgreSQL only).
+    `records` is the list returned by ExtractionQualityTracker.flush().
+    """
+    if not records:
+        return
+    conn = get_conn()
+    if conn is None:
+        return
+    try:
+        with conn.cursor() as cur:
+            for r in records:
+                cur.execute(
+                    """
+                    INSERT INTO field_quality_log
+                        (instance_id, caller_id, field,
+                         first_value, final_value,
+                         num_attempts, num_corrections,
+                         confidence, source, call_saved)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    """,
+                    (
+                        INSTANCE_ID,
+                        r["caller_id"],
+                        r["field"],
+                        r.get("first_value", ""),
+                        r.get("final_value", ""),
+                        r.get("num_attempts", 1),
+                        r.get("num_corrections", 0),
+                        r.get("confidence"),
+                        r.get("source", "gemini"),
+                        r.get("call_saved", False),
+                    ),
+                )
+        conn.commit()
+        put_conn(conn)
+        print(f"[QUAL][PG]: Saved {len(records)} quality records")
+    except Exception as exc:
+        print(f"[QUAL][PG ERROR]: {exc}")
+        put_conn(conn, discard=True)
+
+
+def get_quality_analytics(lookback_days: int = 30) -> dict:
+    """
+    Return extraction quality aggregates for the analytics dashboard.
+    Queries field_quality_log; returns {} when PostgreSQL not configured.
+
+    Returned keys:
+      window_days, total_records,
+      field_accuracy   — list of per-field dicts
+      top_corrections  — dict keyed by field, each a list of {heard_as, corrected_to, count}
+      confusion_pairs  — top-30 ASR confusion pairs across all fields
+      daily_trend      — per-day per-field totals/correction counts (last 14 days)
+    """
+    conn = get_conn()
+    if conn is None:
+        return {}
+    try:
+        with conn.cursor() as cur:
+            # ── Field-level accuracy (saved calls only) ────────────────────────
+            cur.execute(
+                """
+                SELECT
+                    field,
+                    COUNT(*)                                                  AS total,
+                    SUM(CASE WHEN num_corrections = 0 THEN 1 ELSE 0 END)     AS first_pass,
+                    SUM(CASE WHEN num_corrections > 0 THEN 1 ELSE 0 END)     AS corrected,
+                    ROUND(AVG(num_attempts)::numeric, 2)                     AS avg_attempts,
+                    ROUND(AVG(confidence)::numeric, 3)                       AS avg_confidence,
+                    ROUND(
+                        100.0 * SUM(CASE WHEN num_corrections = 0 THEN 1 ELSE 0 END)
+                        / NULLIF(COUNT(*), 0), 1
+                    )                                                         AS first_pass_pct,
+                    ROUND(
+                        100.0 * SUM(CASE WHEN num_corrections > 0 THEN 1 ELSE 0 END)
+                        / NULLIF(COUNT(*), 0), 1
+                    )                                                         AS correction_rate_pct
+                FROM field_quality_log
+                WHERE instance_id  = %s
+                  AND call_saved   = TRUE
+                  AND created_at  >= NOW() - (%s || ' days')::INTERVAL
+                GROUP BY field
+                ORDER BY correction_rate_pct DESC NULLS LAST
+                """,
+                (INSTANCE_ID, lookback_days),
+            )
+            cols = [d[0] for d in cur.description]
+            field_accuracy = [dict(zip(cols, row)) for row in cur.fetchall()]
+            total_records  = sum(r["total"] for r in field_accuracy)
+
+            # ── Top 20 corrections per field ───────────────────────────────────
+            top_corrections: dict = {}
+            for fld in ("brand", "address", "customer_name",
+                        "category", "subcategory", "issue_type", "preferred_time"):
+                cur.execute(
+                    """
+                    SELECT first_value AS heard_as,
+                           final_value AS corrected_to,
+                           COUNT(*)    AS count
+                    FROM field_quality_log
+                    WHERE instance_id  = %s
+                      AND field        = %s
+                      AND call_saved   = TRUE
+                      AND num_corrections > 0
+                      AND first_value <> ''
+                      AND final_value <> ''
+                      AND first_value <> final_value
+                      AND created_at  >= NOW() - (%s || ' days')::INTERVAL
+                    GROUP BY first_value, final_value
+                    ORDER BY count DESC
+                    LIMIT 20
+                    """,
+                    (INSTANCE_ID, fld, lookback_days),
+                )
+                rows = cur.fetchall()
+                if rows:
+                    top_corrections[fld] = [
+                        {"heard_as": r[0], "corrected_to": r[1], "count": r[2]}
+                        for r in rows
+                    ]
+
+            # ── Top-30 ASR confusion pairs across all fields ───────────────────
+            cur.execute(
+                """
+                SELECT field,
+                       first_value AS heard_as,
+                       final_value AS corrected_to,
+                       COUNT(*)    AS count
+                FROM field_quality_log
+                WHERE instance_id  = %s
+                  AND call_saved   = TRUE
+                  AND num_corrections > 0
+                  AND first_value <> ''
+                  AND final_value <> ''
+                  AND first_value <> final_value
+                  AND created_at  >= NOW() - (%s || ' days')::INTERVAL
+                GROUP BY field, first_value, final_value
+                ORDER BY count DESC
+                LIMIT 30
+                """,
+                (INSTANCE_ID, lookback_days),
+            )
+            confusion_pairs = [
+                {"field": r[0], "heard_as": r[1], "corrected_to": r[2], "count": r[3]}
+                for r in cur.fetchall()
+            ]
+
+            # ── Daily trend (last 14 days) ─────────────────────────────────────
+            cur.execute(
+                """
+                SELECT created_at::date       AS day,
+                       field,
+                       COUNT(*)               AS total,
+                       SUM(CASE WHEN num_corrections > 0 THEN 1 ELSE 0 END) AS corrected
+                FROM field_quality_log
+                WHERE instance_id = %s
+                  AND call_saved  = TRUE
+                  AND created_at >= NOW() - INTERVAL '14 days'
+                GROUP BY day, field
+                ORDER BY day DESC, field
+                """,
+                (INSTANCE_ID,),
+            )
+            daily_trend = [
+                {"date": str(r[0]), "field": r[1], "total": r[2], "corrected": r[3]}
+                for r in cur.fetchall()
+            ]
+
+        put_conn(conn)
+        return {
+            "window_days":    lookback_days,
+            "total_records":  total_records,
+            "field_accuracy": field_accuracy,
+            "top_corrections": top_corrections,
+            "confusion_pairs": confusion_pairs,
+            "daily_trend":    daily_trend,
+        }
+    except Exception as exc:
+        print(f"[QUAL ANALYTICS ERROR]: {exc}")
+        put_conn(conn, discard=True)
+        return {}
+
+
 def get_latency_stats(lookback_hours: int = 24) -> dict:
     """Return P50/P95/P99 for each latency metric over the last N hours from PostgreSQL."""
     conn = get_conn()
