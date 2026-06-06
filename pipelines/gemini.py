@@ -1098,9 +1098,22 @@ async def gemini_handler(request):
                 if mulaw:
                     await _play_local_audio(mulaw)
                     log("EVT final_confirmation_completed")
+                    await asyncio.sleep(0.4)  # let audio flush to PSTN before closing
                 else:
-                    log("⚠️ EVT local_tts_failed — confirmation audio skipped")
-                await asyncio.sleep(0.4)  # let audio flush to PSTN before closing
+                    log("⚠️ EVT local_tts_failed — routing confirmation through Gemini")
+                    try:
+                        await g_ws.send(json.dumps({
+                            "clientContent": {
+                                "turns": [{"role": "user", "parts": [{"text": (
+                                    "[SAVE ALREADY DONE — do NOT call save_service_request again]\n"
+                                    f"Speak this confirmation to the customer exactly:\n{confirm_text}"
+                                )}]}],
+                                "turnComplete": True,
+                            }
+                        }))
+                        await asyncio.sleep(6.0)  # wait for Gemini audio to finish
+                    except Exception as _fb_err:
+                        log(f"⚠️ Gemini confirmation fallback failed: {_fb_err}")
                 log("EVT ws_close_vobiz reason=local_confirmation_complete")
                 if not ws.closed:
                     try:

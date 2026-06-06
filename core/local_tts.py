@@ -110,7 +110,7 @@ async def synthesize(
         payload = {
             "inputs":                [text],
             "target_language_code":  "hi-IN",
-            "speaker":               "ananya",
+            "speaker":               "anushka",
             "pitch":                 0,
             "pace":                  1.05,
             "loudness":              1.5,
