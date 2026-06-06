@@ -348,13 +348,47 @@ _EN_ONES = {
     "nineteen": 19,
 }
 
+# Sector: Devanagari transliteration of English number words.
+# Sarvam STT often returns English number words written in Devanagari
+# when the speaker says "sector seventy-one" in Hinglish speech.
+# e.g. "सेवेंटी एक" (seventy one), "एटी टू" (eighty two)
+_DEVA_TENS = {
+    "ट्वेंटी": 20, "थर्टी": 30, "फोर्टी": 40, "फिफ्टी": 50,
+    "सिक्सटी": 60, "सेवेंटी": 70, "एटी": 80, "नाइनटी": 90,
+}
+_DEVA_ONES = {
+    # English ones written in Devanagari script
+    "वन": 1, "टू": 2, "थ्री": 3, "फोर": 4, "फाइव": 5,
+    "सिक्स": 6, "सेवन": 7, "एट": 8, "नाइन": 9,
+    "टेन": 10, "इलेवन": 11, "ट्वेल्व": 12,
+    # Hindi native unit words (used in Hinglish: "सेवेंटी एक" = seventy-one)
+    "एक": 1, "दो": 2, "तीन": 3, "चार": 4,
+    "पाँच": 5, "पांच": 5, "छह": 6, "सात": 7, "आठ": 8, "नौ": 9,
+}
+
+# Build combined lookup for _word_to_sector_int
+_ALL_TENS = {**_EN_TENS, **_DEVA_TENS}
+_ALL_ONES = {**_EN_ONES, **_DEVA_ONES}
+
+# Latin sector word pattern (e.g. "sector seventy one")
 _SECTOR_WORD_RE = re.compile(
-    r'\b(?:sector|sec|सेक्टर)\s+'
+    r'(?<![a-zA-Z\u0900-\u097F])(?:sector|sec|सेक्टर)\s+'
     r'((?:twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety)'
     r'(?:\s*[\-–]?\s*(?:one|two|three|four|five|six|seven|eight|nine))?'
     r'|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|'
     r'thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen)',
     re.IGNORECASE,
+)
+
+# Devanagari transliteration pattern (e.g. "सेक्टर सेवेंटी एक")
+# Supports both Devanagari-script English ("वन") and Hindi native units ("एक")
+_SECTOR_DEVA_WORD_RE = re.compile(
+    r'(?<![a-zA-Z\u0900-\u097F])(?:sector|sec|सेक्टर)\s+'
+    r'((?:ट्वेंटी|थर्टी|फोर्टी|फिफ्टी|सिक्सटी|सेवेंटी|एटी|नाइनटी)'
+    r'(?:\s+(?:वन|टू|थ्री|फोर|फाइव|सिक्स|सेवन|एट|नाइन'
+    r'|एक|दो|तीन|चार|पाँच|पांच|छह|सात|आठ|नौ))?'
+    r'|वन|टू|थ्री|फोर|फाइव|सिक्स|सेवन|एट|नाइन|टेन|इलेवन|ट्वेल्व'
+    r'|एक|दो|तीन|चार|पाँच|पांच|छह|सात|आठ|नौ)',
 )
 
 _CITY_CANONICAL: dict = {
@@ -391,37 +425,60 @@ _CORRECTION_TRIGGER_RE = re.compile(
 
 
 def _word_to_sector_int(s: str) -> Optional[int]:
-    """Convert English number word(s) like 'seventy one' to int."""
-    s = s.lower().replace("-", " ").strip()
-    parts = s.split()
-    if len(parts) == 1:
-        return _EN_TENS.get(parts[0]) or _EN_ONES.get(parts[0])
-    if len(parts) == 2:
-        t = _EN_TENS.get(parts[0])
-        o = _EN_ONES.get(parts[1])
-        if t and o:
-            return t + o
+    """Convert number word(s) — Latin or Devanagari transliteration — to int."""
+    s = s.strip().replace("-", " ")
+    # Try as-is (Devanagari) then lower-cased (Latin)
+    for key in (s, s.lower()):
+        parts = key.split()
+        if len(parts) == 1:
+            v = _ALL_TENS.get(parts[0]) or _ALL_ONES.get(parts[0])
+            if v:
+                return v
+        if len(parts) == 2:
+            t = _ALL_TENS.get(parts[0])
+            o = _ALL_ONES.get(parts[1])
+            if t and o:
+                return t + o
     return None
 
 
 def _extract_sector(text: str) -> str:
     """Return sector number as digit string, or '' if not found."""
+    # 1. Digit form: "sector 71", "सेक्टर-71"
     m = _SECTOR_DIGIT_RE.search(text)
     if m:
         return m.group(1)
+    # 2. Latin word form: "sector seventy one"
     m2 = _SECTOR_WORD_RE.search(text)
     if m2:
         n = _word_to_sector_int(m2.group(1))
         if n is not None:
             return str(n)
+    # 3. Devanagari transliteration: "सेक्टर सेवेंटी एक"
+    m3 = _SECTOR_DEVA_WORD_RE.search(text)
+    if m3:
+        n = _word_to_sector_int(m3.group(1))
+        if n is not None:
+            return str(n)
     return ""
+
+
+# Unicode-safe city pattern cache: \b doesn't work for Devanagari so we use
+# character-class boundaries that cover both Latin and Devanagari scripts.
+_CITY_PATTERNS: dict = {
+    city: re.compile(
+        r'(?<![a-zA-Z\u0900-\u097F])' + re.escape(city) + r'(?![a-zA-Z\u0900-\u097F])',
+        re.IGNORECASE,
+    )
+    for city in _KNOWN_CITIES
+}
 
 
 def _extract_city(text: str) -> str:
     """Return canonical city name, or '' if not found."""
-    t = text.lower()
+    # Check longer names first to avoid "noida" matching inside "greater noida"
     for city in sorted(_KNOWN_CITIES, key=len, reverse=True):
-        if re.search(r'\b' + re.escape(city) + r'\b', t):
+        if _CITY_PATTERNS[city].search(text):
             return _CITY_CANONICAL.get(city, city.title())
     return ""
 
@@ -430,13 +487,16 @@ def _extract_society(text: str, sector: str, city: str) -> str:
     """Extract society/building name: meaningful text before sector/city."""
     t = text.strip()
     if city:
-        t = re.sub(r'\b' + re.escape(city) + r'\b', "", t, flags=re.IGNORECASE)
+        t = _CITY_PATTERNS.get(city, re.compile(re.escape(city), re.IGNORECASE)).sub("", t)
     if sector:
         t = re.sub(
-            r'\b(?:sector|sec|सेक्टर)\s*[–\-]?\s*' + re.escape(sector) + r'\b',
+            r'(?<![a-zA-Z\u0900-\u097F])(?:sector|sec|सेक्टर)\s*[–\-]?\s*'
+            + re.escape(sector) + r'(?![a-zA-Z\u0900-\u097F\d])',
             "", t, flags=re.IGNORECASE,
         )
+    # Strip sector word-form too (both Latin and Devanagari)
     t = _SECTOR_WORD_RE.sub("", t)
+    t = _SECTOR_DEVA_WORD_RE.sub("", t)
     t = _ADDR_FILLER_RE.sub("", t).strip(" ,।")
     # Take first comma-separated part with ≥ 2 words that starts like a proper noun
     # (first char uppercase, or contains a society/building keyword)
@@ -450,8 +510,13 @@ def _extract_society(text: str, sector: str, city: str) -> str:
         words = part.split()
         if len(words) < 2:
             continue
-        # Accept if starts with uppercase (proper noun) or contains society keyword
-        if words[0][:1].isupper() or _SOC_KW_RE.search(part):
+        # Accept if:
+        #   a) starts with Latin uppercase (proper noun), OR
+        #   b) starts with Devanagari character (no case in Devanagari), OR
+        #   c) contains a society/building keyword
+        first_char = words[0][0] if words[0] else ""
+        is_deva = "\u0900" <= first_char <= "\u097F"
+        if words[0][:1].isupper() or is_deva or _SOC_KW_RE.search(part):
             return part
     return ""
 

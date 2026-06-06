@@ -2,15 +2,19 @@
 """
 Calls observability dashboard.
 
-GET /calls          → HTML dashboard showing per-call quality metrics
-GET /calls/data     → JSON from Call_Logs Google Sheet (last 200 calls)
-GET /calls/audio    → Stream WAV audio from GCS to browser
+GET /calls               → HTML dashboard showing per-call quality metrics
+GET /calls/data          → JSON from Call_Logs Google Sheet (last 200 calls)
+GET /calls/audio         → Stream WAV audio from GCS to browser
+GET /calls/local-audio   → Stream WAV audio from local recordings/ directory
 """
 import asyncio
 import io
 import os
 from aiohttp import web
 from mydoot_functions import get_call_logs, get_google_creds
+
+# Must match RECORDINGS_DIR in pipelines/gemini.py
+_LOCAL_RECORDINGS_DIR = os.getenv("RECORDINGS_DIR", "recordings")
 
 
 # ── Dashboard HTML ────────────────────────────────────────────────────────────
@@ -261,17 +265,26 @@ function renderTable(rows) {
       : '<span class="badge badge-red">No</span>';
     const stage = r['Stage Reached'] || '—';
     const audio = r['Audio GCS'] || '';
+    const localWav = r['Local Recording'] || '';
     const transcriptHTML = buildTranscriptHTML(r['Transcript'] || '');
 
-    const audioSection = audio
-      ? `<div class="audio-section">
+    let audioSection;
+    if (audio) {
+      audioSection = `<div class="audio-section">
           <div class="section-label">&#9654; Recording</div>
           <audio class="audio-player" controls src="/calls/audio?uri=${encodeURIComponent(audio)}"></audio>
-         </div>`
-      : `<div class="audio-section">
+         </div>`;
+    } else if (localWav) {
+      audioSection = `<div class="audio-section">
+          <div class="section-label">&#9654; Recording (local)</div>
+          <audio class="audio-player" controls src="/calls/local-audio?file=${encodeURIComponent(localWav)}"></audio>
+         </div>`;
+    } else {
+      audioSection = `<div class="audio-section">
           <div class="section-label">&#9654; Recording</div>
           <div class="no-audio">No recording for this call.</div>
          </div>`;
+    }
 
     html += `<tr class="data-row" id="row-${i}" onclick="toggleDetail(${i})">
       <td style="width:28px;text-align:center"><span class="toggle-arrow">&#9654;</span></td>
@@ -386,4 +399,35 @@ async def audio_proxy(request: web.Request) -> web.Response:
         body=data,
         content_type="audio/wav",
         headers={"Content-Disposition": f'inline; filename="{os.path.basename(blob_name)}"'},
+    )
+
+
+async def local_audio(request: web.Request) -> web.Response:
+    """
+    Stream a WAV file from the local recordings/ directory to the browser.
+
+    Query param: file=<caller_id>_<timestamp>.wav
+    Only filenames — no path traversal allowed.
+    """
+    filename = request.query.get("file", "").strip()
+    # Reject any path separators to prevent directory traversal
+    if not filename or "/" in filename or "\\" in filename or ".." in filename:
+        return web.Response(status=400, text="Invalid filename")
+    if not filename.endswith(".wav"):
+        return web.Response(status=400, text="Only .wav files are served here")
+
+    wav_path = os.path.join(_LOCAL_RECORDINGS_DIR, filename)
+    if not os.path.isfile(wav_path):
+        return web.Response(status=404, text="Recording not found")
+
+    try:
+        with open(wav_path, "rb") as f:
+            data = f.read()
+    except OSError as e:
+        return web.Response(status=500, text=f"Read error: {e}")
+
+    return web.Response(
+        body=data,
+        content_type="audio/wav",
+        headers={"Content-Disposition": f'inline; filename="{filename}"'},
     )

@@ -80,6 +80,7 @@ CREATE TABLE IF NOT EXISTS call_logs (
     barge_ins      INTEGER,
     reconnects     INTEGER,
     audio_gcs      TEXT,
+    local_wav      TEXT        DEFAULT '',
     transcript     TEXT,
     created_at     TIMESTAMPTZ DEFAULT NOW()
 );
@@ -158,6 +159,10 @@ def init_db() -> bool:
         try:
             with conn.cursor() as cur:
                 cur.execute(_DDL)
+                # Migrations for columns added after initial deployment
+                cur.execute(
+                    "ALTER TABLE call_logs ADD COLUMN IF NOT EXISTS local_wav TEXT DEFAULT ''"
+                )
                 cur.execute(
                     """
                     INSERT INTO instances (instance_id, display_name)

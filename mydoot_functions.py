@@ -526,7 +526,7 @@ _CALL_LOGS_HEADERS = [
     "Timestamp (IST)", "Caller ID", "Duration (s)", "Stage Reached", "Saved",
     "Category", "Subcategory", "Issue Type", "Customer Name", "Address",
     "Preferred Time", "STT Count", "STT Avg (ms)", "STT Drops",
-    "Barge-Ins", "Reconnects", "Audio GCS", "Transcript",
+    "Barge-Ins", "Reconnects", "Audio GCS", "Local Recording", "Transcript",
 ]
 
 
@@ -545,12 +545,12 @@ def _ensure_call_logs_sheet(service, spreadsheet_id: str) -> bool:
             print("[CALL LOG] Created 'Call_Logs' sheet.")
         # Write headers if row 1 is empty
         result = service.spreadsheets().values().get(
-            spreadsheetId=spreadsheet_id, range="Call_Logs!A1:R1"
+            spreadsheetId=spreadsheet_id, range="Call_Logs!A1:S1"
         ).execute()
         if not result.get("values"):
             service.spreadsheets().values().update(
                 spreadsheetId=spreadsheet_id,
-                range="Call_Logs!A1:R1",
+                range="Call_Logs!A1:S1",
                 valueInputOption="RAW",
                 body={"values": [_CALL_LOGS_HEADERS]},
             ).execute()
@@ -579,6 +579,7 @@ def save_call_log(
     barge_ins: int,
     reconnects: int,
     audio_gcs: str,
+    local_wav: str,
     transcript: list,
 ) -> dict:
     """Append one row to call_logs. Writes PostgreSQL first, then Google Sheets."""
@@ -597,8 +598,8 @@ def save_call_log(
                          saved, category, subcategory, issue_type,
                          customer_name, address, preferred_time,
                          stt_count, stt_avg_ms, stt_drops,
-                         barge_ins, reconnects, audio_gcs, transcript)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                         barge_ins, reconnects, audio_gcs, local_wav, transcript)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                     """,
                     (
                         INSTANCE_ID, caller_id, round(duration_secs, 1),
@@ -608,7 +609,7 @@ def save_call_log(
                         stt_count,
                         round(stt_avg_ms) if stt_avg_ms else None,
                         stt_drops, barge_ins, reconnects,
-                        audio_gcs or "", transcript_str,
+                        audio_gcs or "", local_wav or "", transcript_str,
                     ),
                 )
             conn.commit()
@@ -635,7 +636,7 @@ def save_call_log(
             customer_name or "", address or "", preferred_time or "",
             stt_count, round(stt_avg_ms) if stt_avg_ms else "",
             stt_drops, barge_ins, reconnects,
-            audio_gcs or "", transcript_str,
+            audio_gcs or "", local_wav or "", transcript_str,
         ]]
         service.spreadsheets().values().append(
             spreadsheetId=spreadsheet_id,

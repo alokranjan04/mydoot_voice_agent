@@ -412,6 +412,7 @@ async def gemini_handler(request):
         "barge_ins": 0,           # confirmed barge-in events
         "reconnects": 0,          # Gemini WS reconnect attempts
         "gcs_uri": "",            # recording GCS URI (set at end if RECORD_CALLS=1)
+        "local_wav": "",          # local WAV filename (set at end if RECORD_CALLS=1)
     }
     # Per-call extraction quality tracker.  Guarded so any import failure
     # cannot disrupt the call — all tracking calls check `if _eq:` first.
@@ -1513,6 +1514,7 @@ async def gemini_handler(request):
                     wf.setsampwidth(2)   # 16-bit PCM
                     wf.setframerate(8000)
                     wf.writeframes(b"".join(pcm8_frames))
+                _call_track["local_wav"] = f"{caller_id}_{call_ts}.wav"
                 log(f"🎙️  Recording saved → {wav_path} ({len(pcm8_frames)} frames, {elapsed:.0f}s)")
                 gcs_uri = await asyncio.to_thread(upload_recording_to_gcs, wav_path, caller_id)
                 if gcs_uri:
@@ -1547,6 +1549,7 @@ async def gemini_handler(request):
                 barge_ins    = _call_track["barge_ins"],
                 reconnects   = _call_track["reconnects"],
                 audio_gcs    = _call_track["gcs_uri"],
+                local_wav    = _call_track["local_wav"],
                 transcript   = transcript_log,
             ))
         except Exception as _log_err:
