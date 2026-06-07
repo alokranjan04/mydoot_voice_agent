@@ -1173,10 +1173,6 @@ async def gemini_handler(request):
                     waiting_for_gemini = True   # block new utterances until Gemini responds
                     barge_in_active   = False   # clear interrupt flag — new response incoming
                     log(f"📤 Gemini send OK (+{int((time.time()-t0)*1000)}ms total)")
-                    # Play a brief "theek hai" tone while Gemini processes (~2.5s).
-                    # Without this, the customer hears 2.5s of dead silence.
-                    if "theek" in _cached_audio and save_done_ts == 0:
-                        await _play_local_audio(_cached_audio["theek"])
                 except Exception as send_err:
                     log(f"❌ Gemini WS send failed after STT: {send_err}")
                     lt.discard_turn()
