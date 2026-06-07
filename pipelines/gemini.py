@@ -577,6 +577,8 @@ async def gemini_handler(request):
                                  or sc.get("outputTranscription")
                                  or {})
                         if out_t and out_t.get("text"):
+                            if confirmation_done:
+                                continue  # block duplicate text after confirmation
                             # Agent started speaking — flush pending customer line
                             if customer_buf.strip():
                                 line = f"[{_ts()}] Customer: {_clean_transcript(customer_buf.strip())}"
