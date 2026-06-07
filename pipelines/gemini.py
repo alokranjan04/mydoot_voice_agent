@@ -51,7 +51,11 @@ BARGE_IN_SUSTAIN_SECS  = float(os.getenv("BARGE_IN_SUSTAIN_SECS", "0.3"))
 # Gemini handles turn detection, language understanding, and barge-in natively.
 # Sarvam STT still runs in background for transcript logging if enabled.
 # Set NATIVE_AUDIO_INPUT=0 to fall back to the legacy VAD → STT → text path.
-NATIVE_AUDIO_INPUT = os.getenv("NATIVE_AUDIO_INPUT", "1").lower() in ("1", "true", "yes")
+# Disabled by default: native audio causes hallucinations (fabricated
+# addresses, brands, names) and Gemini loses track of conversation state
+# (skips tool calls). Legacy STT path is more accurate.
+# Set NATIVE_AUDIO_INPUT=1 to re-enable for latency testing.
+NATIVE_AUDIO_INPUT = os.getenv("NATIVE_AUDIO_INPUT", "0").lower() in ("1", "true", "yes")
 
 # ── Call recording ────────────────────────────────────────────────────────────
 # Set RECORD_CALLS=1 to save each call's inbound PSTN audio as a WAV file.
