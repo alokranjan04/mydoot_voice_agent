@@ -592,7 +592,13 @@ async def gemini_handler(request):
                             # for that repetition before it reaches Vobiz.
                             # (Customer-name counting was unreliable: the name can
                             # appear earlier in the same turn, firing too early.)
-                            if save_done_ts > 0 and not confirmation_done:
+                            if (save_done_ts > 0 and not confirmation_done
+                                    and _LOCAL_PROMPT_STAGES):
+                                # End-marker detection: only active when local TTS
+                                # handles confirmation.  When Gemini speaks its own
+                                # confirmation (_LOCAL_PROMPT_STAGES is empty), text
+                                # arrives BEFORE audio — blocking here would kill the
+                                # audio before it plays.
                                 _buf_l = agent_buf.lower()
                                 _end_pos = -1
                                 for _marker, _mlen in [
@@ -604,14 +610,6 @@ async def gemini_handler(request):
                                         _end_pos = _p + _mlen
                                         break
                                 if _end_pos != -1:
-                                    # End-marker reached ("shukriya" / "thank you for
-                                    # calling") — the confirmation message is complete.
-                                    # Fire clear + close immediately so any duplicate
-                                    # audio Gemini queued AFTER this marker is flushed
-                                    # from Vobiz's buffer before it plays.
-                                    # (Audio leads text by ~200-500ms, so by the time
-                                    # this text arrives the first message has already
-                                    # played; clear only removes the repeat audio.)
                                     evt("confirmation_done", reason="end_marker",
                                         tc_seq=_tc_seq, burst=_post_save_burst,
                                         audio_secs=round(confirmation_audio_secs, 2))
@@ -765,12 +763,18 @@ async def gemini_handler(request):
                                 log(f"🔔 turnComplete — GREETING DONE, customer audio now live "
                                     f"(last audio {ai_dur:.2f}s ago)")
                             elif save_done_ts > 0:
-                                if confirmation_audio_secs >= CONFIRMATION_MIN_AUDIO_SECS and not confirmation_done:
-                                    # Enough confirmation audio has played — close now.
-                                    # Also clear Vobiz's audio buffer: if Gemini generated
-                                    # two turns (or a second repetition starts before this
-                                    # turnComplete), the duplicate audio is already in
-                                    # Vobiz's buffer — "clear" stops it playing.
+                                if not _LOCAL_PROMPT_STAGES and not confirmation_done:
+                                    # Gemini speaks confirmation (local TTS disabled).
+                                    # First turnComplete after save = confirmation done.
+                                    # Close after 1s to let Vobiz buffer drain.
+                                    evt("confirmation_done", reason="gemini_turn_complete",
+                                        tc_seq=_tc_seq,
+                                        audio_secs=round(confirmation_audio_secs, 2))
+                                    confirmation_done = True
+                                    log(f"✅ Gemini confirmation done (audio={confirmation_audio_secs:.1f}s) — closing in 1s")
+                                    asyncio.create_task(_close_after(ws, g_ws, 1.0, log))
+                                elif confirmation_audio_secs >= CONFIRMATION_MIN_AUDIO_SECS and not confirmation_done:
+                                    # Local TTS mode: enough audio played — close now.
                                     evt("confirmation_done", reason="turn_complete",
                                         tc_seq=_tc_seq, burst=_post_save_burst,
                                         audio_secs=round(confirmation_audio_secs, 2))
@@ -785,8 +789,6 @@ async def gemini_handler(request):
                                 elif confirmation_done:
                                     log("⚠️  Extra turnComplete after confirmation — ignoring")
                                 else:
-                                    # Not enough audio yet — this is the wait-message's turnComplete
-                                    # (save completed before wait-message audio arrived). Do NOT close.
                                     log(f"ℹ️  turnComplete after save — audio {confirmation_audio_secs:.1f}s < {CONFIRMATION_MIN_AUDIO_SECS}s, waiting for confirmation")
                             else:
                                 log(f"🔔 turnComplete — echo guard releases in 1.0s "
