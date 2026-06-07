@@ -447,7 +447,8 @@ async def gemini_handler(request):
             "## SPEED RULES — CRITICAL\n"
             "1. MAX 15 WORDS per response. No exceptions.\n"
             "2. NEVER repeat what the customer just said. Move to next question.\n"
-            "3. Skip 'Theek hai' / 'Main samajh gayi' filler — ask directly.\n"
+            "3. Start EVERY response with a 1-word acknowledgment: 'Theek hai.' or 'Achcha.' — "
+            "this lets the customer know you heard them before your full answer.\n"
             "4. Say confirmation ONCE only. Never repeat the closing message.\n\n"
             f"REAL-TIME: {datetime.now().strftime('%I:%M %p')} on {datetime.now().strftime('%A')}."
         )
@@ -1172,6 +1173,10 @@ async def gemini_handler(request):
                     waiting_for_gemini = True   # block new utterances until Gemini responds
                     barge_in_active   = False   # clear interrupt flag — new response incoming
                     log(f"📤 Gemini send OK (+{int((time.time()-t0)*1000)}ms total)")
+                    # Play a brief "theek hai" tone while Gemini processes (~2.5s).
+                    # Without this, the customer hears 2.5s of dead silence.
+                    if "theek" in _cached_audio and save_done_ts == 0:
+                        await _play_local_audio(_cached_audio["theek"])
                 except Exception as send_err:
                     log(f"❌ Gemini WS send failed after STT: {send_err}")
                     lt.discard_turn()
