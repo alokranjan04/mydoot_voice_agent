@@ -95,9 +95,11 @@ _LATIN_ALPHA_RE = re.compile(r'[A-Za-z]{2,}')
 
 # Address-like markers inside a supposed name
 _ADDR_IN_NAME_RE = re.compile(
-    r'\b(sector|सेक्टर|plot|प्लॉट|flat|फ्लैट|floor|building|block|'
-    r'gali|गली|nagar|नगर|marg|road|street|phase|ward|area|locality|'
-    r'society|apartment|में\s+है|रहता\s+है|रहती\s+है|address|पता)\b|\d{3,}',
+    r'(?:\b(?:sector|plot|flat|floor|building|block|'
+    r'gali|nagar|marg|road|street|phase|ward|area|locality|'
+    r'society|apartment|address)\b'
+    r'|सेक्टर|प्लॉट|फ्लैट|गली|नगर|में\s+है|रहता\s+है|रहती\s+है|पता'
+    r'|\d{3,})',
     re.IGNORECASE,
 )
 
@@ -172,13 +174,14 @@ def validate_customer_name(text: str) -> ValidationResult:
         return ValidationResult(False, 0.0, raw, "no_alphabetic_content", "customer_name", raw)
 
     # ── Confidence scoring ────────────────────────────────────────────────────
+    # At this point has_deva or has_latin is always True (returned earlier if
+    # False), so the alphabetic bonus always applies.
+    # Multi-word names: 0.50 base + 0.30 (multi-word) + 0.15 (alpha) = 0.95
+    # Single-word names: 0.50 base + 0.15 (alpha) = 0.65
     confidence = 0.5
     if len(extracted_words) >= 2:
         confidence += 0.30   # full name raises confidence
-    if has_deva or has_latin:
-        confidence += 0.15
-    if len(extracted_words) == 1 and extracted_clean in _NAME_REJECT_WORDS:
-        return ValidationResult(False, 0.0, raw, "single_word_rejection", "customer_name", raw)
+    confidence += 0.15       # alphabetic content (always True here)
 
     return ValidationResult(
         True, min(confidence, 1.0), extracted.strip(), "accepted", "customer_name", raw
@@ -191,15 +194,16 @@ def validate_customer_name(text: str) -> ValidationResult:
 
 # Location keywords that indicate real address content
 _ADDR_KEYWORD_RE = re.compile(
-    r'\b(sector|सेक्टर|block|ब्लॉक|plot|प्लॉट|flat|फ्लैट|'
-    r'society|सोसाइटी|colony|कॉलोनी|nagar|नगर|vihar|विहार|'
+    r'(?:\b(?:sector|block|plot|flat|'
+    r'society|colony|nagar|vihar|'
     r'garden|enclave|park|puram|'
-    r'locality|area|गली|lane|road|marg|'
+    r'locality|area|lane|road|marg|'
     r'noida|gurgaon|gurugram|delhi|ncr|faridabad|ghaziabad|'
     r'apartment|tower|residency|heights|phase|'
     r'house|ghar|building|floor|'
     r'mohalla|bazaar|chowk|gate|'
-    r'sector\s*\d|block\s*[a-z])\b',
+    r'sector\s*\d|block\s*[a-z])\b'
+    r'|सेक्टर|ब्लॉक|प्लॉट|फ्लैट|सोसाइटी|कॉलोनी|नगर|विहार|गली)',
     re.IGNORECASE,
 )
 _NUM_IN_ADDR_RE = re.compile(r'\b\d+\b')
@@ -271,7 +275,7 @@ _TIME_PATTERN_RULES: list[tuple[re.Pattern, float]] = [
     (re.compile(r'\b\d{1,2}\s*(?:se|से)\s*\d{1,2}\b', re.IGNORECASE),                      0.90),
     # Explicit day + time: "kal subah", "aaj shaam", "कल सुबह", "आज शाम"
     (re.compile(r'(?:(?:^|\s|\b)(?:kal|aaj|parso|kal\s+ko|is\s+hafte)|'
-                r'(?:कल|आज|परसों|अगले)).{0,20}'
+                r'(?:कल|आज|परसों|अगले))[\w\s,।]{0,20}'
                 r'(?:\b(?:subah|shaam|dopahar|raat|morning|evening|afternoon|night)\b|'
                 r'(?:सुबह|शाम|दोपहर|रात))', re.IGNORECASE),                                0.90),
     # Just day words (Romanized + Devanagari)

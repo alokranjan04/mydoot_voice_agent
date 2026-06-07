@@ -18,6 +18,7 @@ Usage:
 """
 from __future__ import annotations
 
+import asyncio
 import audioop
 import base64
 import io
@@ -137,7 +138,9 @@ async def synthesize(
     Pass an existing ``session`` to reuse a per-call aiohttp session; otherwise
     a short-lived session is created and closed automatically.
     """
-    if not text or not api_key:
+    if not text or not text.strip():
+        return None
+    if not api_key:
         return None
     payload = {
         "inputs":                [text],
@@ -159,8 +162,14 @@ async def synthesize(
             return await _do_tts_request(session, payload, headers)
         async with aiohttp.ClientSession() as s:
             return await _do_tts_request(s, payload, headers)
+    except aiohttp.ClientError as exc:
+        print(f"[LOCAL TTS] network error: {exc}")
+        return None
+    except asyncio.TimeoutError:
+        print("[LOCAL TTS] request timed out")
+        return None
     except Exception as exc:
-        print(f"[LOCAL TTS] synthesis error: {exc}")
+        print(f"[LOCAL TTS] unexpected synthesis error: {exc}")
         return None
 
 

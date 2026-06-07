@@ -428,14 +428,4 @@ async def local_audio(request: web.Request) -> web.Response:
     if not os.path.isfile(wav_real):
         return web.Response(status=404, text="Recording not found")
 
-    try:
-        with open(wav_real, "rb") as f:
-            data = f.read()
-    except OSError as e:
-        return web.Response(status=500, text=f"Read error: {e}")
-
-    return web.Response(
-        body=data,
-        content_type="audio/wav",
-        headers={"Content-Disposition": f'inline; filename="{filename}"'},
-    )
+    return web.FileResponse(wav_real, headers={"Content-Type": "audio/wav"})

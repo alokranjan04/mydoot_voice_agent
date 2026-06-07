@@ -94,6 +94,26 @@ _BRAND_HINT_PHRASES: list[str] = [
     "हिताची", "एलजी", "सैमसंग", "डाइकिन", "वोल्टास",
 ]
 
+_ADDRESS_HINT_PHRASES: list[str] = [
+    "sector", "society", "colony", "apartment", "flat", "tower", "block",
+    "road", "street", "avenue", "lane", "gali", "mohalla", "nagar",
+    "Noida", "Gurgaon", "Gurugram", "Delhi", "Ghaziabad", "Faridabad",
+    "Greater Noida", "Dwarka", "Rohini", "Vasant Kunj", "Saket",
+    "सेक्टर", "सोसाइटी", "कॉलोनी", "नगर", "गली", "मोहल्ला",
+]
+
+_TIME_HINT_PHRASES: list[str] = [
+    "subah", "shaam", "dopahar", "raat", "morning", "evening",
+    "kal", "aaj", "parso", "baje", "ghante",
+    "सुबह", "शाम", "दोपहर", "कल", "आज", "बजे", "घंटे",
+]
+
+_HINT_PHRASES_BY_STAGE: dict[str, list[str]] = {
+    "brand": _BRAND_HINT_PHRASES,
+    "address": _ADDRESS_HINT_PHRASES,
+    "preferred_time": _TIME_HINT_PHRASES,
+}
+
 
 def _ts():
     """Short HH:MM:SS.mmm timestamp for log lines."""
@@ -116,6 +136,9 @@ async def _close_after(vobiz_ws, gemini_ws, delay: float, log_fn):
             await vobiz_ws.close()
     except Exception:
         pass
+
+
+_RE_MULTI_UNCLEAR = re.compile(r"(\[unclear\]\s*)+")
 
 
 def _clean_transcript(text: str) -> str:
@@ -144,8 +167,7 @@ def _clean_transcript(text: str) -> str:
         result.append("[unclear]")
     cleaned = "".join(result).strip()
     # Collapse multiple [unclear] tags
-    import re
-    cleaned = re.sub(r"(\[unclear\]\s*)+", "[unclear] ", cleaned).strip()
+    cleaned = _RE_MULTI_UNCLEAR.sub("[unclear] ", cleaned).strip()
     return cleaned
 
 
@@ -385,6 +407,7 @@ async def gemini_handler(request):
     await ws.prepare(request)
 
     caller_id      = request.query.get("caller_id", "Unknown")
+    caller_id      = re.sub(r'[^a-zA-Z0-9_+\-]', '', caller_id)
     state_engine   = ConversationStateEngine()
     service_graph  = ServiceGraph()
     lt             = LatencyTracker(caller_id)
@@ -973,7 +996,7 @@ async def gemini_handler(request):
                 lt.mark("vad_end")
                 lt.mark("stt_start")
                 t0 = time.time()
-                _hints = _BRAND_HINT_PHRASES if service_graph.current_stage() == "brand" else None
+                _hints = _HINT_PHRASES_BY_STAGE.get(service_graph.current_stage())
                 transcript = await _sarvam_stt(pcm8_bytes, session=sarvam_session,
                                                hint_phrases=_hints)
                 lt.mark("stt_end")
@@ -1090,8 +1113,9 @@ async def gemini_handler(request):
                     return validate_address(transcript)
                 if stage == "preferred_time":
                     return validate_preferred_time(transcript)
+                log(f"WARNING: no validator for stage={stage}, accepting with low confidence")
                 from core.field_validators import ValidationResult as VR
-                return VR(True, 1.0, transcript, "unvalidated", stage, transcript)
+                return VR(True, 0.5, transcript, "no_validator", stage, transcript)
 
             def _log_field_confidence(vr: ValidationResult) -> None:
                 """Emit structured JSON confidence log for analytics."""
