@@ -30,7 +30,7 @@ SARVAM_STT_URL = "https://api.sarvam.ai/speech-to-text"
 VAD_SPEECH_THRESHOLD  = int(os.getenv("VAD_SPEECH_THRESHOLD",  "100"))
 # Seconds of silence after speech that signals end-of-utterance.
 # 0.3s keeps latency low; raise to 0.5 via env if callers get cut off.
-VAD_END_SECS          = float(os.getenv("VAD_END_SECS",          "0.3"))
+VAD_END_SECS          = float(os.getenv("VAD_END_SECS",          "0.2"))
 # Minimum utterance duration to bother sending to STT (avoids noise blips).
 # 0.3s catches short responses like "LG", "haan", "kal" (0.5 would drop these).
 VAD_MIN_SPEECH_SECS   = float(os.getenv("VAD_MIN_SPEECH_SECS",  "0.3"))
@@ -444,6 +444,11 @@ async def gemini_handler(request):
     def get_system_prompt():
         return (
             f"{APP_CONFIG['agent']['system_prompt']}\n\n"
+            "## SPEED RULES — CRITICAL\n"
+            "1. MAX 15 WORDS per response. No exceptions.\n"
+            "2. NEVER repeat what the customer just said. Move to next question.\n"
+            "3. Skip 'Theek hai' / 'Main samajh gayi' filler — ask directly.\n"
+            "4. Say confirmation ONCE only. Never repeat the closing message.\n\n"
             f"REAL-TIME: {datetime.now().strftime('%I:%M %p')} on {datetime.now().strftime('%A')}."
         )
 

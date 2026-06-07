@@ -756,96 +756,57 @@ def get_stage_context(state: ServiceState) -> str:
     collected = _build_collected(state)
 
     # ── Stage-specific instruction ─────────────────────────────────────────
+    # ── Compressed stage instructions (fewer tokens = faster LLM response) ────
     if stage == "category":
         cat_list = " / ".join(CATEGORIES.keys())
-        instruction = (
-            f"ASK: What type of service does the customer need? "
-            f"Router — classify from description into one of: {cat_list}. "
-            f"Confidence threshold: detect even from partial descriptions "
-            f"('fridge nahi chal raha' → Appliance Repair / Refrigerator). "
-            f"Once category detected, immediately move to subcategory or diagnosis."
-        )
+        instruction = f"Route to: {cat_list}."
 
     elif stage == "subcategory":
-        if subcats:
-            opts = ", ".join(subcats[:7])
-            instruction = (
-                f"Category confirmed: '{cat}'. "
-                f"ASK: Which specific type? Give a brief example to help the customer understand. "
-                f"Options: {opts}. "
-                f"Frame as a natural Hinglish question with 2-3 examples, e.g. "
-                f"'Kaunsa kaam chahiye — wiring, MCB/fuse, light fitting, ya switch-socket?'"
-            )
-        else:
-            instruction = f"Category confirmed: '{cat}'. ASK: Describe the specific problem with an example."
+        opts = " / ".join(subcats[:5]) if subcats else cat
+        instruction = f"Category: '{cat}'. Which type? {opts}?"
 
     elif stage == "diagnosis":
         what = subcat or cat or "this"
         flow = DIAGNOSTIC_FLOWS.get(subcat or "", DEFAULT_DIAGNOSTIC)
-        issue_opts = " / ".join(flow["issue_types"])
-        q_list     = " | ".join(flow["questions"][:3])
-        hints      = flow.get("hints", "")
+        issue_opts = " / ".join(flow["issue_types"][:5])
+        q1 = flow["questions"][0] if flow["questions"] else ""
+        hints = flow.get("hints", "")[:100]
         instruction = (
-            f"Subcategory: '{what}'. Run DIAGNOSTIC to identify the issue type. "
-            f"Possible issue types: {issue_opts}. "
-            f"Ask these diagnostic questions ONE AT A TIME in simple Hinglish. "
-            f"IMPORTANT: Each question must include 2-3 concrete examples in brackets so the customer "
-            f"understands — do NOT ask abstract questions like 'kya specific dikkat hai' or "
-            f"'diagnosis batao'. Ask specific yes/no or choice questions with examples: {q_list}. "
-            f"If customer says 'pata nahi', 'electrician dekhega', or cannot answer → "
-            f"pick the most likely issue type from routing hints and say "
-            f"'Main sabse common problem select kar rahi hoon — [issue type].' then move on. "
-            f"Routing hints: {hints} "
-            f"If error code mentioned (e.g. E3, F1), record it. "
-            f"Once issue type is clear, record issue_type (and severity if obvious) then proceed."
+            f"'{what}' diagnostic: {issue_opts}. "
+            f"Ask: {q1} "
+            f"If unclear: pick most likely. Hints: {hints}"
         )
 
     elif stage == "brand":
         what = subcat or cat or "it"
-        instruction = f"ASK: Which brand is {what}? (e.g. Samsung, LG, Maruti, Honda)"
+        instruction = f"ASK: {what} ka brand?"
 
     elif stage == "address":
-        instruction = (
-            "ASK: What is your address? We need your society/building name and "
-            "area or locality to send a technician."
-        )
+        instruction = "ASK: Society/building name aur area?"
 
     elif stage == "preferred_time":
-        instruction = (
-            "ASK: When would you like the technician to visit? "
-            "Preferred date and time? (e.g. 'kal subah 10 baje', 'aaj shaam 5 baje', 'Sunday morning')"
-        )
+        instruction = "ASK: Technician kab aaye — din aur time?"
 
     elif stage == "customer_name":
-        instruction = (
-            "ASK the customer's name directly — do NOT ask yes/no permission. "
-            "Hinglish: 'Aapka naam kya hai?' / English: 'What is your name?' "
-            "One direct question only. If customer responds with only 'haan', 'ji', 'yes', or "
-            "any affirmative without stating a name — ask again: 'Kripya apna naam batayein.'"
-        )
+        instruction = "ASK: Aapka naam? If only haan/ji → ask again."
 
     elif stage == "done":
-        summary = json.dumps(collected, ensure_ascii=False)
         instruction = (
-            f"ALL FIELDS COLLECTED: {summary}. "
-            "Call save_service_request tool IMMEDIATELY — do NOT say anything to the customer "
-            "before calling the tool. After tool success, speak the confirmation — "
-            "first word must be the customer's name: "
-            "'[name] ji, aapki request register ho gayi hai. Hamari team jald se jald aapse sampark karegi. MyDoot ko call karne ke liye shukriya!' "
-            "Say it ONCE only. Then go COMPLETELY SILENT. Do not repeat."
+            "Call save_service_request NOW. "
+            "After success: '[name] ji, aapki request register ho gayi hai. "
+            "MyDoot ko call karne ke liye shukriya!' Say ONCE. Then SILENT."
         )
 
     else:
-        instruction = "Continue the conversation to collect remaining service request details."
+        instruction = "Continue collecting service request details."
 
     lines = [
-        "[STAGE CONTEXT — SILENT INTERNAL INSTRUCTIONS — do NOT speak these lines]",
-        f"Stage       : {stage}",
+        f"[STAGE stage={stage}]",
     ]
     if collected:
-        lines.append(f"Collected   : {json.dumps(collected, ensure_ascii=False)}")
-    lines.append(f"Instruction : {instruction}")
-    lines.append("[END STAGE CONTEXT — your spoken response begins here]")
+        lines.append(f"Collected: {json.dumps(collected, ensure_ascii=False)}")
+    lines.append(f"Do: {instruction}")
+    lines.append("[/STAGE]")
 
     return "\n".join(lines)
 
@@ -870,22 +831,13 @@ def get_confirmation_context(state: ServiceState, field: str, value: str) -> str
         "customer_name": "advance to done, then call save_service_request immediately",
     }.get(field, "advance to next step")
 
-    instruction = (
-        f"You just collected {field_display} = \"{value}\". "
-        f"CONFIRM with a brief echo — one sentence only: "
-        f"Hinglish — \"{value}, sahi hai?\" / English — \"{value} — is that correct?\" "
-        f"If customer says haan/yes/theek/bilkul/sahi/correct → {next_hint}. "
-        f"If customer says nahi/no or gives a different value → note the correction and confirm the new value before advancing."
-    )
+    instruction = f"Confirm: \"{value}, sahi hai?\" Haan → {next_hint}. Nahi → ask again."
 
-    lines = [
-        "[STAGE CONTEXT — SILENT INTERNAL INSTRUCTIONS — do NOT speak these lines]",
-        f"Stage       : confirming {field_display}",
-    ]
+    lines = [f"[STAGE confirming={field_display}]"]
     if collected:
-        lines.append(f"Collected   : {json.dumps(collected, ensure_ascii=False)}")
-    lines.append(f"Instruction : {instruction}")
-    lines.append("[END STAGE CONTEXT — your spoken response begins here]")
+        lines.append(f"Collected: {json.dumps(collected, ensure_ascii=False)}")
+    lines.append(f"Do: {instruction}")
+    lines.append("[/STAGE]")
     return "\n".join(lines)
 
 
