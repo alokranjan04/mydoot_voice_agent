@@ -1,7 +1,7 @@
 # Technical Architecture: Mydoot Customer Care Voice Agent
 
 **Agent Name:** Mydoot Customer Care Representative
-**Active Pipeline:** Hybrid — Sarvam Saaras v3 STT + Gemini Live LLM+TTS
+**Active Pipeline:** Native Audio — Gemini Live (audio-in, audio-out) with optional Sarvam STT sidecar
 **Orchestration:** LangGraph ServiceGraph
 **Stack:** Gemini 2.5 Flash Native Audio, Sarvam Saaras v3, LangGraph, Vobiz SIP, PostgreSQL, Google Sheets, Gmail SMTP, Google Cloud Run
 
@@ -9,12 +9,14 @@
 
 ## 1. System Overview
 
-Mydoot Customer Care is an AI voice agent that handles inbound phone calls on the Vobiz SIP platform. It uses a hybrid pipeline:
-- **Sarvam Saaras v3** (REST API) for speech-to-text — transcribes customer audio with local VAD pre-filtering to reject PSTN line noise
-- **Google Gemini Live** (text-in, audio-out) for LLM reasoning and TTS voice synthesis
-- **LangGraph ServiceGraph** for structured conversation orchestration — injects stage-specific context into each Gemini turn
+Mydoot Customer Care is an AI voice agent that handles inbound phone calls on the Vobiz SIP platform. It uses a native audio pipeline:
+- **Google Gemini Live** (audio-in, audio-out) for real-time speech understanding, LLM reasoning, and TTS voice synthesis
+- **Gemini's native turn detection** handles VAD, barge-in, and language understanding natively
+- **LangGraph ServiceGraph** for tracking conversation state and field extraction quality
 
-Customer audio is never sent raw to Gemini. Only clean text transcripts are sent, eliminating hallucinations caused by line noise.
+Customer audio is streamed directly to Gemini as PCM 16kHz via `realtimeInput`. Gemini handles turn detection and responds with audio. This eliminates the previous VAD → STT → text pipeline, reducing response latency from ~3.1s to ~1.5-2.0s.
+
+**Legacy mode:** Set `NATIVE_AUDIO_INPUT=0` to fall back to the previous Sarvam STT → text → Gemini clientContent pipeline (preserved in code).
 
 ---
 
@@ -46,7 +48,7 @@ Customer audio is never sent raw to Gemini. Only clean text transcripts are sent
 │ 4. gemini_handler opens second WebSocket to Gemini Live API         │
 │    wss://generativelanguage.googleapis.com/.../BidiGenerateContent  │
 │    Sends setup: model, systemInstruction, tools                     │
-│    Mode: text clientContent in, audio out (no realtimeInput)        │
+│    Mode: realtimeInput audio in + audio out (native audio pipeline)  │
 │    Instantiates: ServiceGraph() per call                            │
 └─────────────────────────┬───────────────────────────────────────────┘
                           │
@@ -55,25 +57,22 @@ Customer audio is never sent raw to Gemini. Only clean text transcripts are sent
            ▼                             ▼
 ┌──────────────────────┐    ┌────────────────────────┐
 │ Audio IN loop        │    │ g_receiver task         │
-│ (Vobiz → VAD → STT)  │    │ (Gemini → Vobiz)        │
+│ (Vobiz → Gemini)     │    │ (Gemini → Vobiz)        │
 │                      │    │                         │
 │ mu-law 8kHz          │    │ PCM 24kHz               │
 │ → ulaw2lin → PCM 8k  │    │ → ratecv(24000→8000)    │
-│                      │    │ → lin2ulaw              │
-│ VAD: RMS ≥ 100       │    │ → mu-law 8kHz           │
-│ accumulate speech    │    │ → Vobiz playAudio        │
-│ end on 0.3s silence  │    │ (blocked if barge_in_   │
-│ min 0.3s utterance   │    │  active=True)           │
+│ → ratecv(8000→16000) │    │ → lin2ulaw              │
+│ → realtimeInput.audio│    │ → mu-law 8kHz           │
+│   (PCM 16kHz, b64)   │    │ → Vobiz playAudio       │
 │                      │    │                         │
-│ Barge-in: RMS ≥ 350  │    │ Tracks turnComplete:    │
-│                      │    │ flushes transcript buf  │
-│ Sarvam Saaras v3     │    │ sets gemini_turn_end_ts │
-│ REST → transcript    │    │                         │
+│ Gemini handles:      │    │ Tracks turnComplete:    │
+│ • Turn detection     │    │ flushes transcript buf  │
+│ • Language/intent    │    │ sets gemini_turn_end_ts │
+│ • Barge-in (native)  │    │                         │
 │                      │    │ confirmation_audio_secs │
-│ ServiceGraph.        │    │ accumulates post-save   │
-│ get_context() inject │    │ audio (float, not bool) │
-│ → clientContent text │    │                         │
-│ → Gemini Live        │    │                         │
+│ No VAD, no STT,      │    │ accumulates post-save   │
+│ no stage context     │    │ audio (float, not bool) │
+│ injection needed     │    │                         │
 └──────────────────────┘    └────────────────────────┘
                           │
                           ▼
@@ -111,8 +110,9 @@ Customer audio is never sent raw to Gemini. Only clean text transcripts are sent
 
 ## 3. Audio Pipeline
 
-### Inbound (Customer Voice → Sarvam STT → Gemini text)
+### Inbound (Customer Voice → Gemini Native Audio)
 
+**Native mode (NATIVE_AUDIO_INPUT=1, default):**
 ```
 Vobiz WebSocket frame
   └── event: "media"
@@ -121,19 +121,20 @@ Vobiz WebSocket frame
         ▼ audioop.ulaw2lin(data, 2)
   Linear PCM, 8kHz, mono, 16-bit
         │
-        ▼ Local VAD (RMS threshold = 100)
-  Speech frames accumulated; silence > 0.3s triggers flush (VAD_END_SECS, tunable via env var)
-  Utterances < 0.3s discarded (noise blips)
+        ▼ audioop.ratecv(pcm8, 2, 1, 8000, 16000, state)
+  Linear PCM, 16kHz, mono, 16-bit
         │
-        ▼ Sarvam Saaras v3 REST  (POST /speech-to-text)
-  Persistent aiohttp.ClientSession() per call — avoids TCP+TLS handshake per utterance (~200-300ms saved)
-  model=saaras:v3 | language_code=hi-IN | file=audio.wav (8kHz WAV)
-        │
-        ▼ Transcript string (Hinglish / English)
-        │
-        ▼ ServiceGraph.get_context() → [STAGE CONTEXT] block
-        │
-        ▼ Gemini clientContent { turns: [{ role: "user", parts: [{ text: ... }] }] }
+        ▼ Gemini realtimeInput { audio: { data: base64(pcm16k), mimeType: "audio/pcm;rate=16000" } }
+  Gemini handles turn detection, language understanding, barge-in natively.
+  No VAD, no STT, no stage context injection needed.
+  Response latency: ~1.5-2.0s (vs ~3.1s with legacy STT path)
+```
+
+**Legacy mode (NATIVE_AUDIO_INPUT=0):**
+```
+Same as above but routed through:
+  Local VAD (RMS ≥ 100, 0.3s silence) → Sarvam STT → text → Gemini clientContent
+  Response latency: ~3.1s
 ```
 
 ### Outbound (Gemini Voice → Customer)
