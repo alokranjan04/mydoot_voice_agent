@@ -338,8 +338,9 @@ _AGENT_STAGE_TRIGGERS: list[tuple[str, list[str]]] = [
         r"\bwhen\b.{0,30}\b(visit|come|technician|would you like)\b",
     ]),
     ("customer_name", [
-        r"\bapna\s+naam\b", r"\baapka\s+naam\b", r"\byour\s+name\b",
-        r"\bnaam\b.{0,40}(batayein|chahiye|register|darj|kya\s+hai|jaan\s+sak)",
+        r"\bapna\s+(?:poora\s+)?naam\b", r"\baapka\s+(?:poora\s+)?naam\b",
+        r"\byour\s+(?:full\s+)?name\b",
+        r"\bpoora\s+naam\b.{0,40}(batayein|chahiye|kya\s+hai|jaan\s+sak)",
         r"\bname\b.{0,20}(please|register|may i have|what is)",
     ]),
 ]
@@ -728,8 +729,22 @@ async def gemini_handler(request):
                                                 if _cur in _STAGE_ORDER_LIST else 0)
                                     for _tgt, _pats in _AGENT_STAGE_TRIGGERS:
                                         _tgt_idx = _STAGE_ORDER_LIST.index(_tgt)
-                                        if (_tgt_idx > _cur_idx
-                                                and any(re.search(p, _t) for p in _pats)):
+                                        if _tgt_idx <= _cur_idx:
+                                            continue
+                                        # Guard: don't skip past a local-prompt stage
+                                        # whose field hasn't been collected yet.
+                                        # e.g. if address is empty, don't jump to
+                                        # customer_name just because Gemini said "naam".
+                                        _skip = False
+                                        for _mid_idx in range(_cur_idx, _tgt_idx):
+                                            _mid = _STAGE_ORDER_LIST[_mid_idx]
+                                            if (_mid in _LOCAL_PROMPT_STAGES
+                                                    and not service_graph.state.get(_mid)):
+                                                _skip = True
+                                                break
+                                        if _skip:
+                                            continue
+                                        if any(re.search(p, _t) for p in _pats):
                                             service_graph.state = ServiceState(
                                                 **{**service_graph.state, "stage": _tgt})
                                             log(f"📋 Stage ← agent asked for "
