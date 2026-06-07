@@ -1158,58 +1158,42 @@ async def gemini_handler(request):
 
             async def _local_final_confirmation() -> None:
                 """
-                Synthesize and play the final confirmation, then close both WebSockets.
-                Called after save_service_request succeeds — replaces Gemini-generated
-                confirmation entirely, eliminating the duplicate-audio bug.
+                Play the pre-synthesized confirmation audio, then close Vobiz WS.
+                Uses pre_mulaw (synthesized before save) to eliminate silence gap.
                 """
                 confirm_text = local_tts.build_confirmation_text(service_graph.state)
-                evt("conf_tts_start", text_len=len(confirm_text))
-                log(f"💬 Confirmation: {confirm_text!r}")
-                # Add confirmation text to transcript so it appears in email
                 transcript_log.append(f"[{_ts()}] Agent: {confirm_text}")
-                mulaw = await local_tts.synthesize(confirm_text, SARVAM_API_KEY, sarvam_session)
+                # Use pre-synthesized audio if available, otherwise synthesize now
+                mulaw = pre_mulaw
+                if not mulaw:
+                    log("⚠️ CONF_DIAG: pre_mulaw was None, synthesizing now")
+                    mulaw = await local_tts.synthesize(
+                        confirm_text, SARVAM_API_KEY, sarvam_session)
                 if mulaw:
                     audio_secs = len(mulaw) / 8000
                     n_chunks = (len(mulaw) + 799) // 800
-                    evt("conf_tts_ok", audio_secs=round(audio_secs, 1), chunks=n_chunks)
+                    log(f"CONF_DIAG: playing {audio_secs:.1f}s ({n_chunks} chunks) ws_closed={ws.closed}")
                     ok = await _play_local_audio(mulaw)
-                    evt("conf_play_done", complete=ok,
-                        ws_closed=ws.closed)
+                    log(f"CONF_DIAG: play done ok={ok} ws_closed={ws.closed}")
                     if not ws.closed:
                         await asyncio.sleep(1.0)
                 else:
-                    evt("conf_tts_failed", fallback="short")
-                    short_msg = (
-                        f"{service_graph.state.get('customer_name', '')} ji, "
-                        "aapki request register ho gayi hai. Shukriya!"
-                    )
-                    mulaw_fb = await local_tts.synthesize(short_msg, SARVAM_API_KEY, sarvam_session)
-                    if mulaw_fb:
-                        await _play_local_audio(mulaw_fb)
-                        if not ws.closed:
-                            await asyncio.sleep(1.0)
-                    else:
-                        evt("conf_tts_failed", fallback="gemini")
-                        try:
-                            await g_ws.send(json.dumps({
-                                "clientContent": {
-                                    "turns": [{"role": "user", "parts": [{"text": (
-                                        "[SAVE ALREADY DONE — do NOT call save_service_request again]\n"
-                                        f"Speak this confirmation to the customer exactly:\n{confirm_text}"
-                                    )}]}],
-                                    "turnComplete": True,
-                                }
-                            }))
-                            await asyncio.sleep(6.0)
-                        except Exception as _fb_err:
-                            evt("conf_tts_failed", fallback="none",
-                                error=str(_fb_err)[:100])
-                evt("conf_ws_close", ws_already_closed=ws.closed)
-                if not ws.closed:
+                    log("CONF_DIAG: ALL TTS FAILED — no confirmation audio")
+                    # Try Gemini as last resort
                     try:
-                        await ws.close()
-                    except Exception:
-                        pass
+                        await g_ws.send(json.dumps({
+                            "clientContent": {
+                                "turns": [{"role": "user", "parts": [{"text": (
+                                    "[SAVE ALREADY DONE — do NOT call save_service_request again]\n"
+                                    f"Speak this confirmation to the customer exactly:\n{confirm_text}"
+                                )}]}],
+                                "turnComplete": True,
+                            }
+                        }))
+                        await asyncio.sleep(6.0)
+                    except Exception as _fb_err:
+                        log(f"CONF_DIAG: Gemini fallback failed: {_fb_err}")
+                log(f"CONF_DIAG: closing ws (ws_closed={ws.closed})")
 
             async def _trigger_local_save() -> None:
                 """
@@ -1243,6 +1227,16 @@ async def gemini_handler(request):
                     "preferred_time": service_graph.state.get("preferred_time") or "",
                     "customer_name":  service_graph.state.get("customer_name")  or "",
                 }
+                # Pre-synthesize confirmation audio BEFORE the blocking save.
+                # This eliminates the ~2s silence gap (save + TTS synthesis)
+                # that could cause Vobiz to drop the connection.
+                confirm_text = local_tts.build_confirmation_text(service_graph.state)
+                log(f"🔧 Pre-synthesizing confirmation TTS ({len(confirm_text)} chars)")
+                pre_mulaw = await local_tts.synthesize(
+                    confirm_text, SARVAM_API_KEY, sarvam_session)
+                pre_audio_secs = len(pre_mulaw) / 8000 if pre_mulaw else 0
+                log(f"🔧 TTS {'OK' if pre_mulaw else 'FAILED'} "
+                    f"({pre_audio_secs:.1f}s audio)")
                 log(f"🔧 LOCAL SAVE args: {json.dumps(args, ensure_ascii=False)}")
                 evt("tool_call_start", fn="save_service_request", call_id="local", save_already=False)
                 t0 = time.time()
@@ -1252,15 +1246,16 @@ async def gemini_handler(request):
                     took_ms=round((time.time() - t0) * 1000))
                 if res.get("success"):
                     log("✅ LOCAL SAVE OK")
-                    # Record Gemini-handled fields from local-save args
                     if _eq:
                         _eq.record_gemini_fields(args)
                     try:
                         await _local_final_confirmation()
                     except Exception as _conf_err:
-                        log(f"❌ _local_final_confirmation crashed: {_conf_err}")
+                        log(f"❌ CONF_DIAG crashed: {_conf_err}")
                         traceback.print_exc()
-                        # Still close ws so the call doesn't hang forever
+                    finally:
+                        # Always close ws after confirmation (success or failure)
+                        # so the call doesn't hang forever.
                         if not ws.closed:
                             try:
                                 await ws.close()
