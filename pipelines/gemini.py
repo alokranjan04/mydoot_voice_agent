@@ -1163,20 +1163,22 @@ async def gemini_handler(request):
                 confirmation entirely, eliminating the duplicate-audio bug.
                 """
                 confirm_text = local_tts.build_confirmation_text(service_graph.state)
-                log(f"EVT final_confirmation_started text_len={len(confirm_text)}")
+                evt("conf_tts_start", text_len=len(confirm_text))
                 log(f"💬 Confirmation: {confirm_text!r}")
+                # Add confirmation text to transcript so it appears in email
+                transcript_log.append(f"[{_ts()}] Agent: {confirm_text}")
                 mulaw = await local_tts.synthesize(confirm_text, SARVAM_API_KEY, sarvam_session)
                 if mulaw:
-                    audio_secs = len(mulaw) / 8000  # μ-law 8 kHz: 1 byte = 1/8000 s
-                    await _play_local_audio(mulaw)
-                    log(f"EVT final_confirmation_completed audio_secs={audio_secs:.1f}")
-                    # _play_local_audio now paces at realtime (0.1s per 100 ms chunk),
-                    # so Vobiz buffer is near-empty when streaming ends.  A small safety
-                    # margin lets any residual buffer drain before we close the WS.
-                    await asyncio.sleep(1.0)
+                    audio_secs = len(mulaw) / 8000
+                    n_chunks = (len(mulaw) + 799) // 800
+                    evt("conf_tts_ok", audio_secs=round(audio_secs, 1), chunks=n_chunks)
+                    ok = await _play_local_audio(mulaw)
+                    evt("conf_play_done", complete=ok,
+                        ws_closed=ws.closed)
+                    if not ws.closed:
+                        await asyncio.sleep(1.0)
                 else:
-                    log("⚠️ EVT local_tts_failed — trying short fallback TTS")
-                    # Retry with a shorter message — Sarvam might handle a simpler string
+                    evt("conf_tts_failed", fallback="short")
                     short_msg = (
                         f"{service_graph.state.get('customer_name', '')} ji, "
                         "aapki request register ho gayi hai. Shukriya!"
@@ -1184,10 +1186,10 @@ async def gemini_handler(request):
                     mulaw_fb = await local_tts.synthesize(short_msg, SARVAM_API_KEY, sarvam_session)
                     if mulaw_fb:
                         await _play_local_audio(mulaw_fb)
-                        await asyncio.sleep(1.0)
+                        if not ws.closed:
+                            await asyncio.sleep(1.0)
                     else:
-                        # Both TTS attempts failed — try Gemini as last resort
-                        log("⚠️ Short TTS also failed — trying Gemini fallback")
+                        evt("conf_tts_failed", fallback="gemini")
                         try:
                             await g_ws.send(json.dumps({
                                 "clientContent": {
@@ -1200,8 +1202,9 @@ async def gemini_handler(request):
                             }))
                             await asyncio.sleep(6.0)
                         except Exception as _fb_err:
-                            log(f"⚠️ Gemini fallback also failed: {_fb_err} — closing without confirmation audio")
-                log("EVT ws_close_vobiz reason=local_confirmation_complete")
+                            evt("conf_tts_failed", fallback="none",
+                                error=str(_fb_err)[:100])
+                evt("conf_ws_close", ws_already_closed=ws.closed)
                 if not ws.closed:
                     try:
                         await ws.close()
