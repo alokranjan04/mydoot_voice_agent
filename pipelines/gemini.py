@@ -75,6 +75,12 @@ CONFIRMATION_MIN_AUDIO_SECS = 2.5
 # Gemini is bypassed completely — zero LLM latency for these turns.
 _LOCAL_PROMPT_STAGES: frozenset = frozenset({"address", "preferred_time", "customer_name"})
 
+# Minimum confidence to skip the "X, sahi hai?" echo and auto-confirm.
+# High-confidence values are accepted directly and the flow moves to the next
+# stage (or triggers save if all fields are collected).  Below this threshold
+# the two-step echo → confirm cycle is used.
+_AUTO_CONFIRM_CONFIDENCE = float(os.getenv("AUTO_CONFIRM_CONFIDENCE", "0.85"))
+
 # ── STT hint phrases injected per-stage to reduce misrecognition ─────────────
 # "brand" stage: common appliance / vehicle brands that Saaras v3 often mishears
 # when embedded in Hindi speech ("Hitachi" → "पिताची" / "Zetac", etc.)
@@ -1230,6 +1236,31 @@ async def gemini_handler(request):
                     city=(parsed.city if parsed else ""),
                     final=final[:60])
 
+            async def _auto_confirm_and_advance(stage: str, value: str):
+                """Auto-confirm a high-confidence field and advance to the next stage.
+
+                Skips the "X, sahi hai?" echo — the value is accepted directly.
+                Returns True if handled, False if TTS failed (fall through to Gemini),
+                or None if TTS failed and caller should fall back to the echo path.
+                """
+                service_graph.confirm_pending()
+                new_stage = service_graph.current_stage()
+                log(f"⚡ AUTO-CONFIRM {stage}: {value!r} → stage={new_stage}")
+                evt("local_field_auto_confirmed", field=stage, value=value[:40],
+                    next_stage=new_stage)
+                if _eq:
+                    _eq.record_local_confirmed(stage, value)
+                if new_stage in _LOCAL_PROMPT_STAGES:
+                    prompt = local_tts.PROMPTS.get(new_stage, "")
+                    if prompt:
+                        mulaw = await local_tts.synthesize(prompt, SARVAM_API_KEY, sarvam_session)
+                        if mulaw is None:
+                            return None  # TTS down — let caller fall through
+                        await _play_local_audio(mulaw)
+                elif new_stage == "done":
+                    asyncio.create_task(_trigger_local_save())
+                return True
+
             async def _handle_local_stage_response(
                 transcript: str, stage: str, clean_t: str,
             ) -> bool:
@@ -1238,7 +1269,8 @@ async def gemini_handler(request):
                 without invoking Gemini.
 
                 Flow:
-                  No pending → validate → if OK: set_pending + play echo
+                  No pending → validate → if conf ≥ threshold: auto-confirm + advance
+                                        → if conf < threshold: set_pending + play echo
                                         → if fail: play retry prompt
                   Pending     → if confirm: confirm_pending → play next prompt / trigger save
                               → if correction:
@@ -1325,12 +1357,18 @@ async def gemini_handler(request):
                             pending_val = vr.extracted
 
                         if vr.accepted:
-                            service_graph.set_pending(stage, pending_val or vr.extracted)
+                            _corr_val = pending_val or vr.extracted
+                            service_graph.set_pending(stage, _corr_val)
                             # Hook C2b — validate-path correction
                             if _eq:
-                                _eq.record_local_correction(stage, pending_val or vr.extracted,
-                                                            vr.confidence)
-                            echo = local_tts.build_echo_text(stage, pending_val or vr.extracted)
+                                _eq.record_local_correction(stage, _corr_val, vr.confidence)
+
+                            if vr.confidence >= _AUTO_CONFIRM_CONFIDENCE:
+                                result = await _auto_confirm_and_advance(stage, _corr_val)
+                                if result is not None:
+                                    return result
+                            # Low confidence or TTS failed — echo for manual confirm
+                            echo = local_tts.build_echo_text(stage, _corr_val)
                             mulaw = await local_tts.synthesize(echo, SARVAM_API_KEY, sarvam_session)
                             if mulaw is None:
                                 return False
@@ -1378,11 +1416,19 @@ async def gemini_handler(request):
                     # Hook C1 — first candidate for local field
                     if _eq:
                         _eq.record_local_candidate(stage, pending_val, vr.confidence)
-                    echo = local_tts.build_echo_text(stage, pending_val)
-                    mulaw = await local_tts.synthesize(echo, SARVAM_API_KEY, sarvam_session)
-                    if mulaw is None:
-                        return False
-                    await _play_local_audio(mulaw)
+
+                    if vr.confidence >= _AUTO_CONFIRM_CONFIDENCE:
+                        # High confidence — skip "sahi hai?" and auto-confirm
+                        result = await _auto_confirm_and_advance(stage, pending_val)
+                        if result is not None:
+                            return result
+                        # _auto_confirm_and_advance returned None → TTS failed, fall through
+                    else:
+                        echo = local_tts.build_echo_text(stage, pending_val)
+                        mulaw = await local_tts.synthesize(echo, SARVAM_API_KEY, sarvam_session)
+                        if mulaw is None:
+                            return False
+                        await _play_local_audio(mulaw)
                 else:
                     log(f"❌ LOCAL {stage} rejected: {transcript!r} "
                         f"reason={vr.reason} conf={vr.confidence:.2f}")
