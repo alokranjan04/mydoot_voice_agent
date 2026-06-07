@@ -730,6 +730,17 @@ async def gemini_handler(request):
                                     audio_secs=round(confirmation_audio_secs, 2))
                             _post_save_in_burst = False  # next audio packet = new burst
                             ai_dur = gemini_turn_end_ts - last_ai_audio_ts if last_ai_audio_ts else 0
+                            # Truncate duplicate confirmation text before flushing.
+                            # Gemini sometimes generates two copies of the confirmation
+                            # message back-to-back before turnComplete fires.
+                            if save_done_ts > 0:
+                                _buf_l = agent_buf.lower()
+                                _shuk_pos = _buf_l.find("shukriya")
+                                if _shuk_pos != -1:
+                                    # Keep everything up to and including "shukriya!"
+                                    _cut = _shuk_pos + len("shukriya!")
+                                    if _cut < len(agent_buf):
+                                        agent_buf = agent_buf[:_cut]
                             # Flush agent buffer as one clean line
                             _flushed = agent_buf.strip()
                             if _flushed:
