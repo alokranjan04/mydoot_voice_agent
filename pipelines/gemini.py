@@ -73,7 +73,11 @@ CONFIRMATION_MIN_AUDIO_SECS = 2.5
 # For these stages: Sarvam TTS plays the fixed prompt, field_validators validates
 # the customer's response, and echo/confirmation are handled in-process.
 # Gemini is bypassed completely — zero LLM latency for these turns.
-_LOCAL_PROMPT_STAGES: frozenset = frozenset({"address", "preferred_time", "customer_name"})
+# Local TTS disabled — Sarvam voice quality not acceptable. All stages
+# go through Gemini for consistent voice. Set via env var to re-enable.
+_LOCAL_PROMPT_STAGES: frozenset = frozenset(
+    os.getenv("LOCAL_PROMPT_STAGES", "").split(",")
+) - frozenset({""})
 
 # Minimum confidence to skip the "X, sahi hai?" echo and auto-confirm.
 # High-confidence values are accepted directly and the flow moves to the next
@@ -848,13 +852,18 @@ async def gemini_handler(request):
                                     log(f"🔧 Tool result: {res}")
                                     _trigger_local_conf = False
                                     if is_save_fn and res.get("success"):
-                                        save_executed     = True
-                                        save_done_ts      = time.time()
-                                        confirmation_done = True  # block any Gemini audio
-                                        # Minimal ack to Gemini — local TTS handles confirmation
-                                        tool_result         = {"success": True}
-                                        _trigger_local_conf = True
-                                        log("🔒 Save OK — local TTS confirmation queued, Gemini closing")
+                                        save_executed = True
+                                        save_done_ts  = time.time()
+                                        if _LOCAL_PROMPT_STAGES:
+                                            # Local TTS enabled — block Gemini audio, play our own
+                                            confirmation_done = True
+                                            tool_result         = {"success": True}
+                                            _trigger_local_conf = True
+                                            log("🔒 Save OK — local TTS confirmation queued")
+                                        else:
+                                            # Local TTS disabled — let Gemini speak confirmation
+                                            tool_result = res
+                                            log("🔒 Save OK — Gemini will speak confirmation")
                                         # Hook B: record Gemini-handled fields (category/subcategory/
                                         # issue_type/brand/model) from the successful save args.
                                         if _eq and fn == "save_service_request":
