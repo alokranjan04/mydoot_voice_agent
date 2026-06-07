@@ -1205,6 +1205,15 @@ async def gemini_handler(request):
                 if save_executed:
                     log("⚠️ LOCAL SAVE: already executed — skipping")
                     return
+                # Set guard flags BEFORE the blocking save operation.
+                # If Gemini's WS closes while the save is in progress,
+                # g_receiver's finally block checks these flags to decide
+                # whether to close the Vobiz WS.  Without setting them early,
+                # g_receiver sees confirmation_done=False + save_done_ts=0
+                # and kills the call before the confirmation audio plays.
+                save_executed     = True
+                save_done_ts      = time.time()
+                confirmation_done = True
                 args = {
                     "caller_id":      caller_id,
                     "category":       service_graph.state.get("category")       or "",
@@ -1226,9 +1235,6 @@ async def gemini_handler(request):
                     success=res.get("success"),
                     took_ms=round((time.time() - t0) * 1000))
                 if res.get("success"):
-                    save_executed    = True
-                    save_done_ts     = time.time()
-                    confirmation_done = True
                     log("✅ LOCAL SAVE OK")
                     # Record Gemini-handled fields from local-save args
                     if _eq:
