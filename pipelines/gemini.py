@@ -348,11 +348,17 @@ _AGENT_STAGE_TRIGGERS: list[tuple[str, list[str]]] = [
 # Confirmation words — customer agreeing that the agent's echo is correct.
 # Used in the pending-confirmation check to decide whether to commit a field.
 _CONFIRM_WORDS: frozenset = frozenset({
-    "हाँ", "हां", "ha", "haan", "han", "yes", "yeah", "yep",
+    # Romanized
+    "ha", "haan", "han", "yes", "yeah", "yep",
     "okay", "ok", "sure", "ji", "bilkul", "theek", "sahi", "correct",
-    "right", "absolutely", "perfect", "हाँ जी", "जी हाँ", "जी हां",
+    "right", "absolutely", "perfect", "accha", "achha", "achcha",
     "theek hai", "sahi hai", "bilkul sahi", "haan ji", "ji haan",
     "yes correct", "yes that's right", "yes that is correct",
+    "accha ji", "achha ji", "achcha ji",
+    # Devanagari
+    "हाँ", "हां", "हाँ जी", "जी हाँ", "जी हां", "जी",
+    "अच्छा", "अच्छा जी", "ठीक", "ठीक है", "सही", "सही है",
+    "बिल्कुल", "बिल्कुल सही", "हां जी", "जी हां",
 })
 
 def _is_confirmation(text: str) -> bool:
