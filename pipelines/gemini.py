@@ -1288,6 +1288,7 @@ async def gemini_handler(request):
                 Returns True if handled, False if TTS failed (fall through to Gemini),
                 or None if TTS failed and caller should fall back to the echo path.
                 """
+                nonlocal save_executed, save_done_ts, confirmation_done
                 service_graph.confirm_pending()
                 new_stage = service_graph.current_stage()
                 log(f"⚡ AUTO-CONFIRM {stage}: {value!r} → stage={new_stage}")
@@ -1303,6 +1304,13 @@ async def gemini_handler(request):
                             return None  # TTS down — let caller fall through
                         await _play_local_audio(mulaw)
                 elif new_stage == "done":
+                    # Set guard flags SYNCHRONOUSLY before scheduling the task.
+                    # asyncio processes I/O callbacks (Gemini close frame) before
+                    # newly-scheduled tasks, so g_receiver's finally block could
+                    # run before _trigger_local_save's first line executes.
+                    save_executed     = True
+                    save_done_ts      = time.time()
+                    confirmation_done = True
                     asyncio.create_task(_trigger_local_save())
                 return True
 
@@ -1325,7 +1333,7 @@ async def gemini_handler(request):
                 Returns True if the turn was handled locally.
                 Returns False if Sarvam TTS is unavailable (fall through to Gemini).
                 """
-                nonlocal _local_validation_hint
+                nonlocal _local_validation_hint, save_executed, save_done_ts, confirmation_done
                 pend = service_graph.pending
 
                 # ── Confirmation turn ─────────────────────────────────────────────
@@ -1348,6 +1356,11 @@ async def gemini_handler(request):
                                     return False  # TTS down, let Gemini handle
                                 await _play_local_audio(mulaw)
                         elif new_stage == "done":
+                            # Set guard flags SYNCHRONOUSLY — same reason as in
+                            # _auto_confirm_and_advance (see comment there).
+                            save_executed     = True
+                            save_done_ts      = time.time()
+                            confirmation_done = True
                             asyncio.create_task(_trigger_local_save())
                     else:
                         # ── Correction path ───────────────────────────────────────
