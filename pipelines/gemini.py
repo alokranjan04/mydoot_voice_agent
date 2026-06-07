@@ -773,8 +773,20 @@ async def gemini_handler(request):
                                         tc_seq=_tc_seq,
                                         audio_secs=round(confirmation_audio_secs, 2))
                                     confirmation_done = True
-                                    log(f"✅ Gemini confirmation done (audio={confirmation_audio_secs:.1f}s) — closing in 1s")
-                                    asyncio.create_task(_close_after(ws, g_ws, 1.0, log))
+                                    log(f"✅ Gemini confirmation done (audio={confirmation_audio_secs:.1f}s) — clearing + closing")
+                                    # Clear Vobiz buffer to flush any duplicate audio
+                                    # that Gemini generated before turnComplete arrived.
+                                    try:
+                                        if not ws.closed:
+                                            await ws.send_str(json.dumps({"event": "clear"}))
+                                    except Exception:
+                                        pass
+                                    # Truncate agent_buf to remove any duplicate text
+                                    # (Gemini may concatenate two turns before turnComplete)
+                                    _shukriya_pos = agent_buf.lower().find("shukriya")
+                                    if _shukriya_pos != -1:
+                                        agent_buf = agent_buf[:_shukriya_pos + len("shukriya!")]
+                                    asyncio.create_task(_close_after(ws, g_ws, 0.5, log))
                                 elif confirmation_audio_secs >= CONFIRMATION_MIN_AUDIO_SECS and not confirmation_done:
                                     # Local TTS mode: enough audio played — close now.
                                     evt("confirmation_done", reason="turn_complete",
