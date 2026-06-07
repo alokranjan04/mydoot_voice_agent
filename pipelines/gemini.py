@@ -1002,6 +1002,27 @@ async def gemini_handler(request):
             # per utterance.
             sarvam_session = aiohttp.ClientSession()
 
+            # Pre-cache short engagement phrases so we can play them instantly
+            # during pauses (TTS synthesis, save operations).  Synthesized in
+            # the background while the greeting plays — zero added latency.
+            _cached_audio: dict[str, bytes] = {}
+
+            async def _precache_phrases():
+                for key, text in [
+                    ("wait",   "Ek second, aapki request note ho rahi hai."),
+                    ("theek",  "Theek hai."),
+                ]:
+                    try:
+                        mulaw = await local_tts.synthesize(
+                            text, SARVAM_API_KEY, sarvam_session)
+                        if mulaw:
+                            _cached_audio[key] = mulaw
+                            log(f"🔊 Cached engagement phrase: {key!r} ({len(mulaw)/8000:.1f}s)")
+                    except Exception:
+                        pass
+
+            asyncio.create_task(_precache_phrases())
+
             async def _stt_and_send(pcm8_bytes: bytes, _vad_start_perf: float = 0.0,
                                     _task_queued_perf: float = 0.0):
                 """Transcribe utterance and send text turn to Gemini Live."""
@@ -1318,21 +1339,23 @@ async def gemini_handler(request):
                 if _eq:
                     _eq.record_local_confirmed(stage, value)
                 if new_stage in _LOCAL_PROMPT_STAGES:
+                    # Play cached "Theek hai." instantly so customer hears
+                    # acknowledgment within 100ms, WHILE we synthesize the
+                    # full next-stage prompt (which takes 1-2s).
+                    if "theek" in _cached_audio:
+                        await _play_local_audio(_cached_audio["theek"])
                     prompt = local_tts.PROMPTS.get(new_stage, "")
                     if prompt:
-                        # Brief acknowledgment so customer knows the call is alive
-                        ack = f"Theek hai. {prompt}"
-                        mulaw = await local_tts.synthesize(ack, SARVAM_API_KEY, sarvam_session)
+                        mulaw = await local_tts.synthesize(prompt, SARVAM_API_KEY, sarvam_session)
                         if mulaw is None:
                             return None  # TTS down — let caller fall through
                         await _play_local_audio(mulaw)
                 elif new_stage == "done":
+                    # Play "Ek second..." so customer hears acknowledgment
+                    # while save + TTS synthesis happen in the background.
+                    if "wait" in _cached_audio:
+                        await _play_local_audio(_cached_audio["wait"])
                     # Set guard flags SYNCHRONOUSLY before scheduling the task.
-                    # asyncio processes I/O callbacks (Gemini close frame) before
-                    # newly-scheduled tasks, so g_receiver's finally block could
-                    # run before _trigger_local_save's first line executes.
-                    # NOTE: do NOT set save_executed here — _trigger_local_save
-                    # checks it to avoid double-execution and must see False.
                     save_done_ts      = time.time()
                     confirmation_done = True
                     asyncio.create_task(_trigger_local_save())
@@ -1373,6 +1396,9 @@ async def gemini_handler(request):
                         if _eq:
                             _eq.record_local_confirmed(stage, pend_value)
                         if new_stage in _LOCAL_PROMPT_STAGES:
+                            # Play cached "Theek hai." instantly while synthesizing
+                            if "theek" in _cached_audio:
+                                await _play_local_audio(_cached_audio["theek"])
                             prompt = local_tts.PROMPTS.get(new_stage, "")
                             if prompt:
                                 mulaw = await local_tts.synthesize(prompt, SARVAM_API_KEY, sarvam_session)
@@ -1380,10 +1406,9 @@ async def gemini_handler(request):
                                     return False  # TTS down, let Gemini handle
                                 await _play_local_audio(mulaw)
                         elif new_stage == "done":
-                            # Set guard flags SYNCHRONOUSLY — same reason as in
-                            # _auto_confirm_and_advance (see comment there).
-                            # NOTE: do NOT set save_executed — _trigger_local_save
-                            # checks it to avoid double-execution.
+                            # Play "Ek second..." while save runs in background
+                            if "wait" in _cached_audio:
+                                await _play_local_audio(_cached_audio["wait"])
                             save_done_ts      = time.time()
                             confirmation_done = True
                             asyncio.create_task(_trigger_local_save())
