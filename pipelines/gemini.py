@@ -1049,7 +1049,12 @@ async def gemini_handler(request):
             # Gemini is not invoked — latency for these turns = STT + TTS only.
 
             async def _play_local_audio(mulaw_bytes: bytes) -> None:
-                """Stream μ-law 8 kHz audio to Vobiz in 100 ms chunks."""
+                """Stream μ-law 8 kHz audio to Vobiz at realtime pace.
+
+                Each 800-byte chunk = 100 ms of 8 kHz μ-law audio.
+                Sleeping 0.1s per chunk keeps Vobiz's buffer near-empty so that
+                when the WS closes, little or no audio is discarded.
+                """
                 nonlocal waiting_for_gemini, last_ai_audio_ts
                 if not mulaw_bytes:
                     return
@@ -1068,7 +1073,7 @@ async def gemini_handler(request):
                         },
                     }))
                     last_ai_audio_ts = time.time()
-                    await asyncio.sleep(0.08)  # pace sends; keeps Vobiz buffer comfortable
+                    await asyncio.sleep(0.1)  # realtime pace: 800 bytes = 100 ms at 8 kHz
                 waiting_for_gemini = False
 
             def _validate_field(stage: str, transcript: str) -> ValidationResult:
@@ -1104,32 +1109,40 @@ async def gemini_handler(request):
                 log(f"💬 Confirmation: {confirm_text!r}")
                 mulaw = await local_tts.synthesize(confirm_text, SARVAM_API_KEY, sarvam_session)
                 if mulaw:
-                    # Compute how long Vobiz needs to finish playing after we stop sending.
-                    # _play_local_audio streams at 800 bytes/80ms ≈ 1.25× realtime, so when
-                    # the last chunk is sent the buffer still holds ~20% of audio_duration.
-                    # Wait for that remainder + 0.5s safety margin before closing WS.
-                    audio_secs  = len(mulaw) / 8000          # μ-law 8 kHz: 1 byte = 1/8000 s
-                    stream_secs = (len(mulaw) / 800) * 0.08  # approx time to push all chunks
+                    audio_secs = len(mulaw) / 8000  # μ-law 8 kHz: 1 byte = 1/8000 s
                     await _play_local_audio(mulaw)
                     log(f"EVT final_confirmation_completed audio_secs={audio_secs:.1f}")
-                    wait_secs = max(audio_secs - stream_secs + 0.5, 0.4)
-                    log(f"⏳ Waiting {wait_secs:.1f}s for Vobiz to finish playback before closing")
-                    await asyncio.sleep(wait_secs)
+                    # _play_local_audio now paces at realtime (0.1s per 100 ms chunk),
+                    # so Vobiz buffer is near-empty when streaming ends.  A small safety
+                    # margin lets any residual buffer drain before we close the WS.
+                    await asyncio.sleep(1.0)
                 else:
-                    log("⚠️ EVT local_tts_failed — routing confirmation through Gemini")
-                    try:
-                        await g_ws.send(json.dumps({
-                            "clientContent": {
-                                "turns": [{"role": "user", "parts": [{"text": (
-                                    "[SAVE ALREADY DONE — do NOT call save_service_request again]\n"
-                                    f"Speak this confirmation to the customer exactly:\n{confirm_text}"
-                                )}]}],
-                                "turnComplete": True,
-                            }
-                        }))
-                        await asyncio.sleep(6.0)  # wait for Gemini audio to finish
-                    except Exception as _fb_err:
-                        log(f"⚠️ Gemini confirmation fallback failed: {_fb_err}")
+                    log("⚠️ EVT local_tts_failed — trying short fallback TTS")
+                    # Retry with a shorter message — Sarvam might handle a simpler string
+                    short_msg = (
+                        f"{service_graph.state.get('customer_name', '')} ji, "
+                        "aapki request register ho gayi hai. Shukriya!"
+                    )
+                    mulaw_fb = await local_tts.synthesize(short_msg, SARVAM_API_KEY, sarvam_session)
+                    if mulaw_fb:
+                        await _play_local_audio(mulaw_fb)
+                        await asyncio.sleep(1.0)
+                    else:
+                        # Both TTS attempts failed — try Gemini as last resort
+                        log("⚠️ Short TTS also failed — trying Gemini fallback")
+                        try:
+                            await g_ws.send(json.dumps({
+                                "clientContent": {
+                                    "turns": [{"role": "user", "parts": [{"text": (
+                                        "[SAVE ALREADY DONE — do NOT call save_service_request again]\n"
+                                        f"Speak this confirmation to the customer exactly:\n{confirm_text}"
+                                    )}]}],
+                                    "turnComplete": True,
+                                }
+                            }))
+                            await asyncio.sleep(6.0)
+                        except Exception as _fb_err:
+                            log(f"⚠️ Gemini fallback also failed: {_fb_err} — closing without confirmation audio")
                 log("EVT ws_close_vobiz reason=local_confirmation_complete")
                 if not ws.closed:
                     try:
@@ -1235,6 +1248,7 @@ async def gemini_handler(request):
                 Returns True if the turn was handled locally.
                 Returns False if Sarvam TTS is unavailable (fall through to Gemini).
                 """
+                nonlocal _local_validation_hint
                 pend = service_graph.pending
 
                 # ── Confirmation turn ─────────────────────────────────────────────

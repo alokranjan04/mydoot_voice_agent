@@ -261,30 +261,49 @@ def validate_address(text: str) -> ValidationResult:
 # ─────────────────────────────────────────────────────────────────────────────
 
 # (compiled_pattern, confidence_if_matched) — compiled at module load, never inside loops
+# \b doesn't work reliably with Devanagari (vowel signs like ी are non-\w
+# marks, so \b fires mid-word).  For Devanagari alternatives we use
+# (?:(?:^|\s)) / (?:(?:\s|$)) instead; for Latin-only rules \b is fine.
 _TIME_PATTERN_RULES: list[tuple[re.Pattern, float]] = [
     # Numeric time: "10 baje", "5:30 PM", "10 AM"
-    (re.compile(r'\b\d{1,2}(?::\d{2})?\s*(?:baje|am|pm|AM|PM)\b', re.IGNORECASE),          0.95),
-    # Explicit day + time: "kal subah", "aaj shaam"
-    (re.compile(r'\b(kal|aaj|parso|kal\s+ko|is\s+hafte)\b.{0,20}'
-                r'\b(subah|shaam|dopahar|raat|morning|evening|afternoon|night)\b', re.IGNORECASE), 0.90),
-    # Just day words
-    (re.compile(r'\b(kal|aaj|parso|kal\s+ko)\b', re.IGNORECASE),                            0.75),
-    # Time-of-day words
-    (re.compile(r'\b(subah|shaam|dopahar|raat|morning|afternoon|evening|night)\b', re.IGNORECASE), 0.70),
+    (re.compile(r'\b\d{1,2}(?::\d{2})?\s*(?:baje|am|pm)\b', re.IGNORECASE),                0.95),
+    # Numeric range: "4 se 7", "10 se 12"
+    (re.compile(r'\b\d{1,2}\s*(?:se|से)\s*\d{1,2}\b', re.IGNORECASE),                      0.90),
+    # Explicit day + time: "kal subah", "aaj shaam", "कल सुबह", "आज शाम"
+    (re.compile(r'(?:(?:^|\s|\b)(?:kal|aaj|parso|kal\s+ko|is\s+hafte)|'
+                r'(?:कल|आज|परसों|अगले)).{0,20}'
+                r'(?:\b(?:subah|shaam|dopahar|raat|morning|evening|afternoon|night)\b|'
+                r'(?:सुबह|शाम|दोपहर|रात))', re.IGNORECASE),                                0.90),
+    # Just day words (Romanized + Devanagari)
+    (re.compile(r'(?:\bkal\b|\baaj\b|\bparso\b|\bkal\s+ko\b|कल|आज|परसों)',
+                re.IGNORECASE),                                                              0.75),
+    # Time-of-day words (Romanized + Devanagari)
+    (re.compile(r'(?:\bsubah\b|\bshaam\b|\bdopahar\b|\braat\b|'
+                r'\bmorning\b|\bafternoon\b|\bevening\b|\bnight\b|'
+                r'सुबह|शाम|दोपहर|रात)', re.IGNORECASE),                                    0.70),
     # Weekday names
     (re.compile(r'\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|'
-                r'somvar|mangalvar|budhvar|guruvar|shukravar|shanivar|ravivar)\b', re.IGNORECASE), 0.75),
-    # Relative time: "next week", "agle hafte", "is weekend"
-    (re.compile(r'\b(next\s+(?:week|day|monday|morning)|agle\s+hafte|is\s+hafte|'
-                r'weekend|is\s+weekend|agle\s+hafte)\b', re.IGNORECASE),                     0.70),
+                r'somvar|mangalvar|budhvar|guruvar|shukravar|shanivar|ravivar)\b',
+                re.IGNORECASE),                                                              0.75),
+    # Relative time: "next week", "agle hafte", "अगले हफ्ते", "अगले एक घंटे"
+    (re.compile(r'(?:\bnext\s+(?:week|day|monday|morning)\b|'
+                r'\bagle\s+(?:hafte|ghante|din)\b|\bis\s+hafte\b|\bweekend\b|'
+                r'अगले\s*(?:हफ्ते|घंटे|दिन|एक))', re.IGNORECASE),                         0.70),
+    # Hour/minute references: "ek ghante", "do ghante", "एक घंटे", "30 minute"
+    (re.compile(r'(?:(?:\b(?:\d{1,2}|ek|do|teen)\b|(?:एक|दो|तीन))\s*'
+                r'(?:\b(?:ghante|ghanta|minute|mint|hour)\b|(?:घंटे|घंटा|मिनट)))',
+                re.IGNORECASE),                                                              0.75),
     # Anytime / flexible
-    (re.compile(r'\b(anytime|koi\s+bhi\s+(?:time|samay|din)|convenient|'
-                r'flexible|jo\s+bhi|jo\s+time|suvidha\s+anusaar)\b', re.IGNORECASE),         0.65),
-    # Urgency
-    (re.compile(r'\b(jaldi|asap|urgent|turant|abhi|immediately|'
-                r'jitna\s+jaldi|as\s+soon)\b', re.IGNORECASE),                               0.70),
+    (re.compile(r'(?:\banytime\b|\bkoi\s+bhi\s+(?:time|samay|din)\b|\bconvenient\b|'
+                r'\bflexible\b|\bjo\s+bhi\b|\bjo\s+time\b|\bsuvidha\s+anusaar\b|'
+                r'कोई\s+भी\s*(?:टाइम|समय))', re.IGNORECASE),                               0.65),
+    # Urgency (Romanized + Devanagari)
+    (re.compile(r'(?:\bjaldi\b|\basap\b|\burgent\b|\bturant\b|\babhi\b|\bimmediately\b|'
+                r'\bjitna\s+jaldi\b|\bas\s+soon\b|'
+                r'जल्दी|तुरंत|अभी)', re.IGNORECASE),                                       0.70),
     # Month/week references
-    (re.compile(r'\b(mahine|month|hafte|week|saptaah)\b', re.IGNORECASE),                    0.60),
+    (re.compile(r'(?:\bmahine\b|\bmonth\b|\bhafte\b|\bweek\b|\bsaptaah\b|'
+                r'महीने|हफ्ते|सप्ताह)', re.IGNORECASE),                                    0.60),
 ]
 
 _TIME_REJECT_SET: frozenset = frozenset({
