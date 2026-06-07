@@ -11,7 +11,7 @@ import asyncio
 import io
 import os
 from aiohttp import web
-from mydoot_functions import get_call_logs, get_google_creds
+from mydoot_functions import get_call_logs, get_call_turn_latency, get_google_creds
 
 # Must match RECORDINGS_DIR in pipelines/gemini.py
 _LOCAL_RECORDINGS_DIR = os.getenv("RECORDINGS_DIR", "recordings")
@@ -103,6 +103,17 @@ _CALLS_HTML = """\
 
   .loading { padding: 48px; text-align: center; color: var(--text-muted); font-size: 0.9rem; }
   .empty { padding: 48px; text-align: center; color: var(--text-muted); }
+
+  /* Per-call latency */
+  .latency-btn { background: none; border: 1px solid var(--primary); color: var(--primary); border-radius: 6px; padding: 3px 10px; font-size: 0.7rem; font-weight: 600; cursor: pointer; }
+  .latency-btn:hover { background: var(--primary); color: white; }
+  .call-lat-table { width: 100%; border-collapse: collapse; font-size: 0.78rem; margin-top: 8px; }
+  .call-lat-table th { padding: 6px 10px; text-align: left; font-size: 0.65rem; text-transform: uppercase; color: var(--text-muted); background: #f1f5f9; border-bottom: 1px solid var(--border); }
+  .call-lat-table td { padding: 5px 10px; border-bottom: 1px solid #f1f5f9; font-family: monospace; font-size: 0.76rem; }
+  .call-lat-table tr:last-child td { border-bottom: none; }
+  .lat-good { color: #059669; }
+  .lat-warn { color: #d97706; font-weight: 600; }
+  .lat-bad { color: #dc2626; font-weight: 700; }
 
   /* Latency table */
   .lat-table { width: 100%; border-collapse: collapse; font-size: 0.84rem; }
@@ -286,10 +297,12 @@ function renderTable(rows) {
          </div>`;
     }
 
+    const callerId = esc(r['Caller ID'] || '');
+
     html += `<tr class="data-row" id="row-${i}" onclick="toggleDetail(${i})">
       <td style="width:28px;text-align:center"><span class="toggle-arrow">&#9654;</span></td>
       <td style="white-space:nowrap;font-size:0.78rem">${esc(r['Timestamp (IST)'] || '—')}</td>
-      <td style="font-family:monospace;font-size:0.78rem">${esc(r['Caller ID'] || '—')}</td>
+      <td style="font-family:monospace;font-size:0.78rem">${callerId || '—'}</td>
       <td>${esc(r['Duration (s)'] || '—')}</td>
       <td>${esc(r['Category'] || '—')}</td>
       <td>${esc(r['Subcategory'] || '—')}</td>
@@ -311,6 +324,10 @@ function renderTable(rows) {
               <div class="transcript-section">${transcriptHTML}</div>
             </div>
           </div>
+          <div style="margin-top:16px">
+            <button class="latency-btn" onclick="event.stopPropagation(); loadCallLatency('${callerId}', ${i})">&#9202; Show Turn Latency</button>
+            <div id="call-lat-${i}" style="margin-top:8px"></div>
+          </div>
         </div>
       </td>
     </tr>`;
@@ -318,6 +335,48 @@ function renderTable(rows) {
 
   html += '</tbody></table>';
   document.getElementById('table-wrap').innerHTML = html;
+}
+
+async function loadCallLatency(callerId, idx) {
+  const wrap = document.getElementById('call-lat-' + idx);
+  if (!wrap) return;
+  if (wrap.innerHTML.includes('call-lat-table')) {
+    wrap.innerHTML = '';  // toggle off
+    return;
+  }
+  wrap.innerHTML = '<span style="font-size:0.8rem;color:var(--text-muted)">Loading…</span>';
+  try {
+    const r = await fetch('/calls/latency?caller_id=' + encodeURIComponent(callerId));
+    const d = await r.json();
+    if (!d.turns || !d.turns.length) {
+      wrap.innerHTML = '<span style="font-size:0.8rem;color:var(--text-muted)">No per-turn latency data for this call.</span>';
+      return;
+    }
+    const fmtMs = (v, warnAt, badAt) => {
+      if (v == null) return '<span style="color:var(--text-muted)">—</span>';
+      const ms = Math.round(v);
+      if (ms > badAt) return `<span class="lat-bad">${ms} ms</span>`;
+      if (ms > warnAt) return `<span class="lat-warn">${ms} ms</span>`;
+      return `<span class="lat-good">${ms} ms</span>`;
+    };
+    let html = '<table class="call-lat-table"><thead><tr>'
+      + '<th>Turn</th><th>Customer said</th><th>STT</th><th>LLM 1st token</th><th>End-to-end</th>'
+      + '</tr></thead><tbody>';
+    d.turns.forEach(t => {
+      const text = t.customer_text ? esc(t.customer_text).substring(0, 60) : '—';
+      html += `<tr>
+        <td>${t.turn_id || '—'}</td>
+        <td style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(t.customer_text || '')}">${text}</td>
+        <td>${fmtMs(t.stt_ms, 800, 1500)}</td>
+        <td>${fmtMs(t.llm_first_token_ms, 2500, 5000)}</td>
+        <td>${fmtMs(t.end_to_end_turn_ms, 4000, 8000)}</td>
+      </tr>`;
+    });
+    html += '</tbody></table>';
+    wrap.innerHTML = html;
+  } catch(e) {
+    wrap.innerHTML = '<span style="font-size:0.8rem;color:#dc2626">Failed to load latency: ' + e + '</span>';
+  }
 }
 
 function toggleDetail(i) {
@@ -352,6 +411,15 @@ async def calls_data(request: web.Request) -> web.Response:
     """Return the last 200 call log records as JSON (from Google Sheets)."""
     records = await asyncio.to_thread(get_call_logs, 200)
     return web.json_response({"calls": records, "count": len(records)})
+
+
+async def call_latency(request: web.Request) -> web.Response:
+    """Return per-turn latency metrics for a specific caller_id."""
+    caller_id = request.query.get("caller_id", "").strip()
+    if not caller_id:
+        return web.json_response({"error": "caller_id required"}, status=400)
+    turns = await asyncio.to_thread(get_call_turn_latency, caller_id)
+    return web.json_response({"caller_id": caller_id, "turns": turns, "count": len(turns)})
 
 
 async def audio_proxy(request: web.Request) -> web.Response:

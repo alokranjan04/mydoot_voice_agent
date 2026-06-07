@@ -872,6 +872,35 @@ def get_quality_analytics(lookback_days: int = 30) -> dict:
         return {}
 
 
+def get_call_turn_latency(caller_id: str) -> list:
+    """Return per-turn latency metrics for a specific call (by caller_id, most recent)."""
+    conn = get_conn()
+    if conn is None:
+        return []
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT turn_id, customer_text,
+                       stt_ms, llm_first_token_ms, end_to_end_turn_ms,
+                       vad_ms, langgraph_ms
+                FROM turn_latency_metrics
+                WHERE caller_id = %s
+                ORDER BY created_at DESC, turn_id ASC
+                LIMIT 50
+                """,
+                (caller_id,),
+            )
+            rows = cur.fetchall()
+            cols = [desc[0] for desc in cur.description]
+        put_conn(conn)
+        return [dict(zip(cols, row)) for row in rows]
+    except Exception as e:
+        print(f"[LATENCY PER-CALL ERROR]: {e}")
+        put_conn(conn, discard=True)
+        return []
+
+
 def get_latency_stats(lookback_hours: int = 24) -> dict:
     """Return P50/P95/P99 for each latency metric over the last N hours from PostgreSQL."""
     conn = get_conn()
