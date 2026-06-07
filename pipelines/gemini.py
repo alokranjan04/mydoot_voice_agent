@@ -1124,7 +1124,7 @@ async def gemini_handler(request):
 
                 Returns True if all audio was sent, False if playback was interrupted.
                 """
-                nonlocal waiting_for_gemini, last_ai_audio_ts
+                nonlocal waiting_for_gemini, last_ai_audio_ts, gemini_turn_end_ts
                 if not mulaw_bytes:
                     return False
                 waiting_for_gemini = True
@@ -1152,6 +1152,11 @@ async def gemini_handler(request):
                     log(f"⚠️ _play_local_audio: send failed after {sent}/{total} chunks: {exc}")
                 finally:
                     waiting_for_gemini = False
+                    # Update echo guard so customer audio isn't blocked for 8s
+                    # after local audio plays. Without this, the echo guard sees
+                    # last_ai_audio_ts > gemini_turn_end_ts and waits 8s for a
+                    # turnComplete that never comes (local audio has no Gemini turn).
+                    gemini_turn_end_ts = time.time()
                 return sent == total
 
             def _validate_field(stage: str, transcript: str) -> ValidationResult:
