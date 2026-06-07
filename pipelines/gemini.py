@@ -1177,14 +1177,13 @@ async def gemini_handler(request):
                     "raw":        vr.raw[:80],
                 }, ensure_ascii=False))
 
-            async def _local_final_confirmation() -> None:
+            async def _local_final_confirmation(pre_mulaw: "bytes | None" = None) -> None:
                 """
-                Play the pre-synthesized confirmation audio, then close Vobiz WS.
-                Uses pre_mulaw (synthesized before save) to eliminate silence gap.
+                Play confirmation audio, then close Vobiz WS.
+                pre_mulaw: pre-synthesized audio from _trigger_local_save (if available).
                 """
                 confirm_text = local_tts.build_confirmation_text(service_graph.state)
                 transcript_log.append(f"[{_ts()}] Agent: {confirm_text}")
-                # Use pre-synthesized audio if available, otherwise synthesize now
                 mulaw = pre_mulaw
                 if not mulaw:
                     log("⚠️ CONF_DIAG: pre_mulaw was None, synthesizing now")
@@ -1270,7 +1269,7 @@ async def gemini_handler(request):
                     if _eq:
                         _eq.record_gemini_fields(args)
                     try:
-                        await _local_final_confirmation()
+                        await _local_final_confirmation(pre_mulaw=pre_mulaw)
                     except Exception as _conf_err:
                         log(f"❌ CONF_DIAG crashed: {_conf_err}")
                         traceback.print_exc()

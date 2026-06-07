@@ -146,12 +146,11 @@ async def synthesize(
         "inputs":                [text],
         "target_language_code":  "hi-IN",
         "speaker":               "anushka",
-        "pitch":                 0,
         "pace":                  1.05,
-        "loudness":              1.5,
         "speech_sample_rate":    8000,
         "enable_preprocessing":  True,
         "model":                 "bulbul:v3",
+        # NOTE: pitch and loudness are NOT supported by bulbul:v3
     }
     headers = {
         "api-subscription-key": api_key,
