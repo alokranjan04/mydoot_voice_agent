@@ -45,6 +45,14 @@ BARGE_IN_RMS_THRESHOLD = int(os.getenv("BARGE_IN_RMS_THRESHOLD", "350"))
 # Prevents single loud noises (door slam, cough) from cutting off the agent.
 BARGE_IN_SUSTAIN_SECS  = float(os.getenv("BARGE_IN_SUSTAIN_SECS", "0.3"))
 
+# ── Native audio input mode ──────────────────────────────────────────────────
+# When True, customer audio is streamed directly to Gemini as PCM 16kHz
+# via realtimeInput (no local VAD, no Sarvam STT on the critical path).
+# Gemini handles turn detection, language understanding, and barge-in natively.
+# Sarvam STT still runs in background for transcript logging if enabled.
+# Set NATIVE_AUDIO_INPUT=0 to fall back to the legacy VAD → STT → text path.
+NATIVE_AUDIO_INPUT = os.getenv("NATIVE_AUDIO_INPUT", "1").lower() in ("1", "true", "yes")
+
 # ── Call recording ────────────────────────────────────────────────────────────
 # Set RECORD_CALLS=1 to save each call's inbound PSTN audio as a WAV file.
 # Files are written to RECORDINGS_DIR (default: ./recordings/).
@@ -493,6 +501,7 @@ async def gemini_handler(request):
                     "generationConfig": {
                         "responseModalities": ["AUDIO"],
                     },
+                    "inputAudioTranscription": {},
                     "outputAudioTranscription": {},
                     "systemInstruction": {
                         "parts": [{"text": get_system_prompt()}],
@@ -528,6 +537,7 @@ async def gemini_handler(request):
 
             # ── 4. Receive loop: audio + tool calls from Gemini ─────────────
             downsample_state   = None
+            upsample_state     = None   # for 8kHz → 16kHz (native audio input)
             last_ai_audio_ts   = 0.0   # timestamp of last audio packet from Gemini
             gemini_turn_end_ts = 0.0   # timestamp when Gemini signalled turnComplete
             greeting_done      = False  # True after first turnComplete (greeting finished)
@@ -811,6 +821,13 @@ async def gemini_handler(request):
                         # ── Interrupted: agent cut off mid-speech ────────────
                         if server_content.get("interrupted"):
                             log("⚡ serverContent.interrupted — agent speech was interrupted by customer")
+                            # Clear Vobiz audio buffer so buffered agent audio
+                            # stops playing on the phone immediately.
+                            try:
+                                if not ws.closed:
+                                    await ws.send_str(json.dumps({"event": "clear"}))
+                            except Exception:
+                                pass
 
                         # ── Tool calls ───────────────────────────────────────
                         tool_call = data.get("toolCall")
@@ -1619,7 +1636,6 @@ async def gemini_handler(request):
 
                         # ── Greeting guard: wait for Gemini to finish greeting ─
                         if not greeting_done:
-                            # Safety release at 20s in case turnComplete never fires
                             if now - call_start_ts > 20.0:
                                 greeting_done = True
                                 log(f"🔔 Greeting guard safety-released at "
@@ -1627,100 +1643,113 @@ async def gemini_handler(request):
                             else:
                                 continue
 
-                        # ── Safety: release echo guard if turnComplete missing ─
-                        if (last_ai_audio_ts > gemini_turn_end_ts and
-                                now - last_ai_audio_ts > 8.0):
-                            log(f"⚠️  Echo guard safety timeout — forcing release")
-                            gemini_turn_end_ts = now - 1.0
+                        if NATIVE_AUDIO_INPUT:
+                            # ── NATIVE AUDIO: forward PCM 16kHz directly to Gemini ──
+                            # No VAD, no STT, no echo guard — Gemini handles everything.
+                            pcm_16k, upsample_state = audioop.ratecv(
+                                pcm8, 2, 1, 8000, 16000, upsample_state)
+                            try:
+                                await g_ws.send(json.dumps({
+                                    "realtimeInput": {
+                                        "audio": {
+                                            "data": base64.b64encode(pcm_16k).decode(),
+                                            "mimeType": "audio/pcm;rate=16000",
+                                        }
+                                    }
+                                }))
+                            except Exception as _fwd_err:
+                                log(f"❌ Gemini audio forward failed: {_fwd_err}")
+                                break
 
-                        # ── Echo guard: 0.3s buffer after agent turn ──────────
-                        if now - gemini_turn_end_ts < 0.3:
-                            continue
+                        else:
+                            # ── LEGACY: VAD → STT → text path ──────────────────
+                            # Safety: release echo guard if turnComplete missing
+                            if (last_ai_audio_ts > gemini_turn_end_ts and
+                                    now - last_ai_audio_ts > 8.0):
+                                log(f"⚠️  Echo guard safety timeout — forcing release")
+                                gemini_turn_end_ts = now - 1.0
 
-                        # ── Inactivity timeout (25s no speech after agent turn) ─
-                        if (save_done_ts == 0
-                                and gemini_turn_end_ts > 0
-                                and last_customer_ts < gemini_turn_end_ts
-                                and now - gemini_turn_end_ts > 25.0):
-                            log("⏱ Inactivity — no customer speech for 25s, closing")
-                            break
+                            # Echo guard: 0.3s buffer after agent turn
+                            if now - gemini_turn_end_ts < 0.3:
+                                continue
 
-                        # ── VAD + Barge-in ────────────────────────────────────
-                        rms = audioop.rms(pcm8, 2)
+                            # Inactivity timeout (25s no speech after agent turn)
+                            if (save_done_ts == 0
+                                    and gemini_turn_end_ts > 0
+                                    and last_customer_ts < gemini_turn_end_ts
+                                    and now - gemini_turn_end_ts > 25.0):
+                                log("⏱ Inactivity — no customer speech for 25s, closing")
+                                break
 
-                        # ── Barge-in: stop agent audio when customer interrupts ─
-                        # Only fires while agent is actively speaking. Requires
-                        # BARGE_IN_SUSTAIN_SECS of sustained high-RMS so fan
-                        # noise and background sounds do NOT trigger it.
-                        _agent_speaking = (
-                            waiting_for_gemini
-                            and last_ai_audio_ts > 0
-                            and now - last_ai_audio_ts < 2.0
-                        )
-                        if _agent_speaking and not barge_in_active:
-                            if rms >= BARGE_IN_RMS_THRESHOLD:
-                                if barge_in_start_ts == 0.0:
-                                    barge_in_start_ts = now
-                                    barge_in_buf.clear()
-                                barge_in_buf.append(pcm8)
-                                if now - barge_in_start_ts >= BARGE_IN_SUSTAIN_SECS:
-                                    barge_in_active = True
-                                    _call_track["barge_ins"] += 1
-                                    log(f"⚡ Barge-in (rms={rms}, "
-                                        f"sustained={now - barge_in_start_ts:.2f}s) — stopping agent audio")
-                                    barge_in_start_ts = 0.0
-                                    if not ws.closed:
-                                        await ws.send_str(json.dumps({"event": "clear"}))
-                                    waiting_for_gemini = False  # let this utterance through
-                                    # Transfer barge-in frames → speech_buf (don't lose start)
-                                    speech_buf.clear()
-                                    speech_buf.extend(barge_in_buf)
-                                    barge_in_buf.clear()
-                                    in_speech           = True
-                                    speech_start_ts     = now - BARGE_IN_SUSTAIN_SECS
-                                    speech_start_perf   = time.perf_counter() - BARGE_IN_SUSTAIN_SECS
-                                    vad_last_speech     = now
-                            else:
-                                # RMS dropped below threshold — reset accumulator
-                                if barge_in_start_ts != 0.0:
-                                    barge_in_start_ts = 0.0
-                                    barge_in_buf.clear()
+                            # VAD + Barge-in
+                            rms = audioop.rms(pcm8, 2)
 
-                        if rms >= VAD_SPEECH_THRESHOLD:
-                            if not in_speech:
-                                in_speech           = True
-                                speech_start_ts     = now
-                                speech_start_perf   = time.perf_counter()
-                                speech_buf.clear()
-                                log(f"🎙 Speech start (rms={rms})")
-                            speech_buf.append(pcm8)
-                            vad_last_speech = now
-                            # Hard ceiling — force-flush if utterance runs too long
-                            if now - speech_start_ts >= VAD_MAX_SPEECH_SECS:
-                                combined   = b"".join(speech_buf)
-                                speech_buf.clear()
-                                in_speech  = False
-                                log(f"🔁 Utterance max duration — flushing to STT")
-                                asyncio.create_task(_stt_and_send(
-                                    combined, speech_start_perf, time.perf_counter()))
-
-                        elif in_speech:
-                            speech_buf.append(pcm8)  # keep silence tail for natural phrase end
-                            if now - vad_last_speech >= VAD_END_SECS:
-                                combined  = b"".join(speech_buf)
-                                speech_buf.clear()
-                                in_speech = False
-                                duration  = now - speech_start_ts
-                                log(f"🔇 Speech end — {duration:.2f}s")
-                                if duration >= VAD_MIN_SPEECH_SECS:
-                                    if waiting_for_gemini:
-                                        log(f"⏭ Gemini busy — utterance dropped ({duration:.2f}s)")
-                                        _call_track["stt_dropped"] += 1
-                                    else:
-                                        asyncio.create_task(_stt_and_send(
-                                            combined, speech_start_perf, time.perf_counter()))
+                            _agent_speaking = (
+                                waiting_for_gemini
+                                and last_ai_audio_ts > 0
+                                and now - last_ai_audio_ts < 2.0
+                            )
+                            if _agent_speaking and not barge_in_active:
+                                if rms >= BARGE_IN_RMS_THRESHOLD:
+                                    if barge_in_start_ts == 0.0:
+                                        barge_in_start_ts = now
+                                        barge_in_buf.clear()
+                                    barge_in_buf.append(pcm8)
+                                    if now - barge_in_start_ts >= BARGE_IN_SUSTAIN_SECS:
+                                        barge_in_active = True
+                                        _call_track["barge_ins"] += 1
+                                        log(f"⚡ Barge-in (rms={rms}, "
+                                            f"sustained={now - barge_in_start_ts:.2f}s) — stopping agent audio")
+                                        barge_in_start_ts = 0.0
+                                        if not ws.closed:
+                                            await ws.send_str(json.dumps({"event": "clear"}))
+                                        waiting_for_gemini = False
+                                        speech_buf.clear()
+                                        speech_buf.extend(barge_in_buf)
+                                        barge_in_buf.clear()
+                                        in_speech           = True
+                                        speech_start_ts     = now - BARGE_IN_SUSTAIN_SECS
+                                        speech_start_perf   = time.perf_counter() - BARGE_IN_SUSTAIN_SECS
+                                        vad_last_speech     = now
                                 else:
-                                    log(f"⏭ Too short ({duration:.2f}s) — ignoring")
+                                    if barge_in_start_ts != 0.0:
+                                        barge_in_start_ts = 0.0
+                                        barge_in_buf.clear()
+
+                            if rms >= VAD_SPEECH_THRESHOLD:
+                                if not in_speech:
+                                    in_speech           = True
+                                    speech_start_ts     = now
+                                    speech_start_perf   = time.perf_counter()
+                                    speech_buf.clear()
+                                    log(f"🎙 Speech start (rms={rms})")
+                                speech_buf.append(pcm8)
+                                vad_last_speech = now
+                                if now - speech_start_ts >= VAD_MAX_SPEECH_SECS:
+                                    combined   = b"".join(speech_buf)
+                                    speech_buf.clear()
+                                    in_speech  = False
+                                    log(f"🔁 Utterance max duration — flushing to STT")
+                                    asyncio.create_task(_stt_and_send(
+                                        combined, speech_start_perf, time.perf_counter()))
+
+                            elif in_speech:
+                                speech_buf.append(pcm8)
+                                if now - vad_last_speech >= VAD_END_SECS:
+                                    combined  = b"".join(speech_buf)
+                                    speech_buf.clear()
+                                    in_speech = False
+                                    duration  = now - speech_start_ts
+                                    log(f"🔇 Speech end — {duration:.2f}s")
+                                    if duration >= VAD_MIN_SPEECH_SECS:
+                                        if waiting_for_gemini:
+                                            log(f"⏭ Gemini busy — utterance dropped ({duration:.2f}s)")
+                                            _call_track["stt_dropped"] += 1
+                                        else:
+                                            asyncio.create_task(_stt_and_send(
+                                                combined, speech_start_perf, time.perf_counter()))
+                                    else:
+                                        log(f"⏭ Too short ({duration:.2f}s) — ignoring")
 
                 elif msg.type == aiohttp.WSMsgType.ERROR:
                     log(f"❌ Vobiz WS error: {ws.exception()}")
