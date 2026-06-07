@@ -1308,7 +1308,8 @@ async def gemini_handler(request):
                     # asyncio processes I/O callbacks (Gemini close frame) before
                     # newly-scheduled tasks, so g_receiver's finally block could
                     # run before _trigger_local_save's first line executes.
-                    save_executed     = True
+                    # NOTE: do NOT set save_executed here — _trigger_local_save
+                    # checks it to avoid double-execution and must see False.
                     save_done_ts      = time.time()
                     confirmation_done = True
                     asyncio.create_task(_trigger_local_save())
@@ -1358,7 +1359,8 @@ async def gemini_handler(request):
                         elif new_stage == "done":
                             # Set guard flags SYNCHRONOUSLY — same reason as in
                             # _auto_confirm_and_advance (see comment there).
-                            save_executed     = True
+                            # NOTE: do NOT set save_executed — _trigger_local_save
+                            # checks it to avoid double-execution.
                             save_done_ts      = time.time()
                             confirmation_done = True
                             asyncio.create_task(_trigger_local_save())

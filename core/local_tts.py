@@ -151,7 +151,7 @@ async def synthesize(
         "loudness":              1.5,
         "speech_sample_rate":    8000,
         "enable_preprocessing":  True,
-        "model":                 "bulbul:v1",
+        "model":                 "bulbul:v3",
     }
     headers = {
         "api-subscription-key": api_key,
