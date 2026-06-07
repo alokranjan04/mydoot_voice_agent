@@ -1098,33 +1098,40 @@ async def gemini_handler(request):
             # Sarvam TTS synthesizes audio, field_validators validates the response.
             # Gemini is not invoked — latency for these turns = STT + TTS only.
 
-            async def _play_local_audio(mulaw_bytes: bytes) -> None:
+            async def _play_local_audio(mulaw_bytes: bytes) -> bool:
                 """Stream μ-law 8 kHz audio to Vobiz at realtime pace.
 
-                Each 800-byte chunk = 100 ms of 8 kHz μ-law audio.
-                Sleeping 0.1s per chunk keeps Vobiz's buffer near-empty so that
-                when the WS closes, little or no audio is discarded.
+                Returns True if all audio was sent, False if playback was interrupted.
                 """
                 nonlocal waiting_for_gemini, last_ai_audio_ts
                 if not mulaw_bytes:
-                    return
+                    return False
                 waiting_for_gemini = True
                 CHUNK = 800  # 100 ms at 8 kHz μ-law
-                for i in range(0, len(mulaw_bytes), CHUNK):
-                    if ws.closed:
-                        break
-                    chunk = mulaw_bytes[i:i + CHUNK]
-                    await ws.send_str(json.dumps({
-                        "event": "playAudio",
-                        "media": {
-                            "contentType": "audio/x-mulaw",
-                            "sampleRate":  8000,
-                            "payload":     base64.b64encode(chunk).decode(),
-                        },
-                    }))
-                    last_ai_audio_ts = time.time()
-                    await asyncio.sleep(0.1)  # realtime pace: 800 bytes = 100 ms at 8 kHz
-                waiting_for_gemini = False
+                total = (len(mulaw_bytes) + CHUNK - 1) // CHUNK
+                sent  = 0
+                try:
+                    for i in range(0, len(mulaw_bytes), CHUNK):
+                        if ws.closed:
+                            log(f"⚠️ _play_local_audio: ws closed after {sent}/{total} chunks")
+                            break
+                        chunk = mulaw_bytes[i:i + CHUNK]
+                        await ws.send_str(json.dumps({
+                            "event": "playAudio",
+                            "media": {
+                                "contentType": "audio/x-mulaw",
+                                "sampleRate":  8000,
+                                "payload":     base64.b64encode(chunk).decode(),
+                            },
+                        }))
+                        sent += 1
+                        last_ai_audio_ts = time.time()
+                        await asyncio.sleep(0.1)  # realtime pace: 800 bytes = 100 ms at 8 kHz
+                except Exception as exc:
+                    log(f"⚠️ _play_local_audio: send failed after {sent}/{total} chunks: {exc}")
+                finally:
+                    waiting_for_gemini = False
+                return sent == total
 
             def _validate_field(stage: str, transcript: str) -> ValidationResult:
                 """Dispatch to the appropriate field validator."""
@@ -1245,7 +1252,17 @@ async def gemini_handler(request):
                     # Record Gemini-handled fields from local-save args
                     if _eq:
                         _eq.record_gemini_fields(args)
-                    await _local_final_confirmation()
+                    try:
+                        await _local_final_confirmation()
+                    except Exception as _conf_err:
+                        log(f"❌ _local_final_confirmation crashed: {_conf_err}")
+                        traceback.print_exc()
+                        # Still close ws so the call doesn't hang forever
+                        if not ws.closed:
+                            try:
+                                await ws.close()
+                            except Exception:
+                                pass
                 else:
                     err = res.get("message", "unknown error")
                     log(f"❌ LOCAL SAVE FAILED: {err}")
@@ -1305,7 +1322,9 @@ async def gemini_handler(request):
                 if new_stage in _LOCAL_PROMPT_STAGES:
                     prompt = local_tts.PROMPTS.get(new_stage, "")
                     if prompt:
-                        mulaw = await local_tts.synthesize(prompt, SARVAM_API_KEY, sarvam_session)
+                        # Brief acknowledgment so customer knows the call is alive
+                        ack = f"Theek hai. {prompt}"
+                        mulaw = await local_tts.synthesize(ack, SARVAM_API_KEY, sarvam_session)
                         if mulaw is None:
                             return None  # TTS down — let caller fall through
                         await _play_local_audio(mulaw)
@@ -1522,8 +1541,14 @@ async def gemini_handler(request):
                 return True
 
             async for msg in ws:
-                if time.time() - call_start_ts > MAX_CALL_SECS:
+                now_loop = time.time()
+                if now_loop - call_start_ts > MAX_CALL_SECS:
                     log(f"⏱ Call timeout ({MAX_CALL_SECS}s) — closing.")
+                    break
+                # Safety: if save is done but confirmation task failed to close ws,
+                # close it after 30 seconds so the call doesn't hang forever.
+                if save_done_ts > 0 and now_loop - save_done_ts > 30.0:
+                    log("⏱ Post-save safety timeout (30s) — closing ws")
                     break
 
                 if msg.type == aiohttp.WSMsgType.TEXT:
