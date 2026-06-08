@@ -51,7 +51,8 @@ _HOME_TEMPLATE = """\
   
   .provider{{border:2px solid var(--border);border-radius:18px;padding:24px;
              cursor:pointer;transition:all .2s ease;background:var(--bg);text-align:left;position:relative;overflow:hidden}}
-  .provider:hover{{transform: translateY(-2px); border-color: var(--primary); }}
+  .provider:hover{{transform: translateY(-2px); border-color: var(--primary); box-shadow: 0 4px 12px rgba(99,102,241,0.15); }}
+  .provider:active{{transform: translateY(0); }}
   .provider.active{{ border-width: 3px; background: white; box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1); }}
   
   .provider.active.sarvam{{border-color:var(--sarvam);}}
@@ -223,15 +224,24 @@ _HOME_TEMPLATE = """\
 
 <script>
 async function switchProvider(p) {{
-  document.getElementById('status').textContent = 'Switching to ' + p + '…';
-  const r = await fetch('/api/set-provider', {{
-    method: 'POST',
-    headers: {{'Content-Type': 'application/json'}},
-    body: JSON.stringify({{provider: p}})
-  }});
-  const d = await r.json();
-  if (d.ok) {{ location.reload(); }}
-  else {{ document.getElementById('status').textContent = 'Error: ' + (d.error || 'unknown'); }}
+  try {{
+    var st = document.getElementById('status');
+    if (st) st.textContent = 'Switching to ' + p + '…';
+    const r = await fetch('/api/set-provider', {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{provider: p}})
+    }});
+    const d = await r.json();
+    if (d.ok) {{ location.reload(); }}
+    else {{
+      var msg = 'Error: ' + (d.error || 'unknown');
+      if (st) st.textContent = msg;
+      alert(msg);
+    }}
+  }} catch(e) {{
+    alert('Switch failed: ' + e.message);
+  }}
 }}
 
 async function refreshFiles() {{
