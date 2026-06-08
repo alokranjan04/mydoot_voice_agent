@@ -1,22 +1,26 @@
 # Technical Architecture: Mydoot Customer Care Voice Agent
 
 **Agent Name:** Mydoot Customer Care Representative
-**Active Pipeline:** Native Audio — Gemini Live (audio-in, audio-out) with optional Sarvam STT sidecar
-**Orchestration:** LangGraph ServiceGraph
-**Stack:** Gemini 2.5 Flash Native Audio, Sarvam Saaras v3, LangGraph, Vobiz SIP, PostgreSQL, Google Sheets, Gmail SMTP, Google Cloud Run
+**Active Pipeline:** Sarvam Saaras v3 STT + Gemini Live LLM+TTS (text-in, audio-out)
+**Orchestration:** LangGraph ServiceGraph (stage context injection per turn)
+**Stack:** Gemini 2.5 Flash Native Audio, Sarvam Saaras v3, Sarvam Bulbul v2, LangGraph, Vobiz SIP, PostgreSQL, Google Sheets, Gmail SMTP, Google Cloud Run
 
 ---
 
 ## 1. System Overview
 
-Mydoot Customer Care is an AI voice agent that handles inbound phone calls on the Vobiz SIP platform. It uses a native audio pipeline:
-- **Google Gemini Live** (audio-in, audio-out) for real-time speech understanding, LLM reasoning, and TTS voice synthesis
-- **Gemini's native turn detection** handles VAD, barge-in, and language understanding natively
-- **LangGraph ServiceGraph** for tracking conversation state and field extraction quality
+Mydoot Customer Care is an AI voice agent that handles inbound phone calls on the Vobiz SIP platform. It uses a hybrid pipeline:
+- **Sarvam Saaras v3** (REST API) for speech-to-text — transcribes customer audio with local VAD pre-filtering
+- **Google Gemini Live** (text-in, audio-out) for LLM reasoning and TTS voice synthesis
+- **LangGraph ServiceGraph** for structured conversation orchestration — injects compressed stage context into each Gemini turn
+- **Sarvam Bulbul v2** for optional local TTS (currently disabled; voice quality not acceptable)
 
-Customer audio is streamed directly to Gemini as PCM 16kHz via `realtimeInput`. Gemini handles turn detection and responds with audio. This eliminates the previous VAD → STT → text pipeline, reducing response latency from ~3.1s to ~1.5-2.0s.
+Customer audio goes through: Vobiz mu-law 8kHz → local VAD → Sarvam STT → text → Gemini Live → audio response.
 
-**Legacy mode:** Set `NATIVE_AUDIO_INPUT=0` to fall back to the previous Sarvam STT → text → Gemini clientContent pipeline (preserved in code).
+**Feature flags:**
+- `NATIVE_AUDIO_INPUT=0` (default) — Legacy STT path. Proven reliable.
+- `NATIVE_AUDIO_INPUT=1` — Experimental: streams raw audio to Gemini. Lower latency (~1.5s vs ~3s) but causes hallucinations on PSTN audio. Disabled after testing.
+- `LOCAL_PROMPT_STAGES=""` (default) — All stages handled by Gemini. Set to `address,preferred_time,customer_name` to re-enable local TTS for those stages.
 
 ---
 
@@ -47,8 +51,9 @@ Customer audio is streamed directly to Gemini as PCM 16kHz via `realtimeInput`. 
 ┌─────────────────────────────────────────────────────────────────────┐
 │ 4. gemini_handler opens second WebSocket to Gemini Live API         │
 │    wss://generativelanguage.googleapis.com/.../BidiGenerateContent  │
-│    Sends setup: model, systemInstruction, tools                     │
-│    Mode: realtimeInput audio in + audio out (native audio pipeline)  │
+│    Sends setup: model, systemInstruction, tools,                    │
+│    inputAudioTranscription, outputAudioTranscription                │
+│    Mode: text clientContent in, audio out                           │
 │    Instantiates: ServiceGraph() per call                            │
 └─────────────────────────┬───────────────────────────────────────────┘
                           │
@@ -57,22 +62,26 @@ Customer audio is streamed directly to Gemini as PCM 16kHz via `realtimeInput`. 
            ▼                             ▼
 ┌──────────────────────┐    ┌────────────────────────┐
 │ Audio IN loop        │    │ g_receiver task         │
-│ (Vobiz → Gemini)     │    │ (Gemini → Vobiz)        │
+│ (Vobiz → VAD → STT)  │    │ (Gemini → Vobiz)        │
 │                      │    │                         │
 │ mu-law 8kHz          │    │ PCM 24kHz               │
 │ → ulaw2lin → PCM 8k  │    │ → ratecv(24000→8000)    │
-│ → ratecv(8000→16000) │    │ → lin2ulaw              │
-│ → realtimeInput.audio│    │ → mu-law 8kHz           │
-│   (PCM 16kHz, b64)   │    │ → Vobiz playAudio       │
-│                      │    │                         │
-│ Gemini handles:      │    │ Tracks turnComplete:    │
-│ • Turn detection     │    │ flushes transcript buf  │
-│ • Language/intent    │    │ sets gemini_turn_end_ts │
-│ • Barge-in (native)  │    │                         │
-│                      │    │ confirmation_audio_secs │
-│ No VAD, no STT,      │    │ accumulates post-save   │
-│ no stage context     │    │ audio (float, not bool) │
-│ injection needed     │    │                         │
+│                      │    │ → lin2ulaw              │
+│ VAD: RMS ≥ 100       │    │ → mu-law 8kHz           │
+│ accumulate speech    │    │ → Vobiz playAudio        │
+│ end on 0.2s silence  │    │                         │
+│ min 0.3s utterance   │    │ Tracks turnComplete:    │
+│                      │    │ flushes transcript buf  │
+│ Sarvam Saaras v3     │    │ sets gemini_turn_end_ts │
+│ REST → transcript    │    │                         │
+│                      │    │ Truncates duplicate     │
+│ ServiceGraph.        │    │ confirmation text at    │
+│ get_context() inject │    │ first "shukriya"        │
+│ → clientContent text │    │                         │
+│ → Gemini Live        │    │ confirmation_audio_secs │
+│                      │    │ accumulates post-save   │
+│ caller_id sanitized  │    │ audio (float, not bool) │
+│ (path traversal safe)│    │                         │
 └──────────────────────┘    └────────────────────────┘
                           │
                           ▼
@@ -84,9 +93,10 @@ Customer audio is streamed directly to Gemini as PCM 16kHz via `realtimeInput`. 
 │    - Writes to PostgreSQL service_requests table (primary)         │
 │    - Appends row to Google Sheets Sheet1 (secondary, soft-fail)    │
 │    - Returns success to Gemini                                      │
-│    - Gemini speaks confirmation once, then goes silent              │
-│    - Call closes after confirmation audio ≥ 2.5s completes         │
+│    - Gemini speaks confirmation ONCE                                │
+│    - First turnComplete after save → close call in 0.5s            │
 │    - save_executed flag prevents duplicate execution per session    │
+│    - Duplicate text truncated at first "shukriya" before flush     │
 └─────────────────────────┬───────────────────────────────────────────┘
                           │
                           ▼
@@ -110,9 +120,8 @@ Customer audio is streamed directly to Gemini as PCM 16kHz via `realtimeInput`. 
 
 ## 3. Audio Pipeline
 
-### Inbound (Customer Voice → Gemini Native Audio)
+### Inbound (Customer Voice → Sarvam STT → Gemini text)
 
-**Native mode (NATIVE_AUDIO_INPUT=1, default):**
 ```
 Vobiz WebSocket frame
   └── event: "media"
@@ -121,20 +130,20 @@ Vobiz WebSocket frame
         ▼ audioop.ulaw2lin(data, 2)
   Linear PCM, 8kHz, mono, 16-bit
         │
-        ▼ audioop.ratecv(pcm8, 2, 1, 8000, 16000, state)
-  Linear PCM, 16kHz, mono, 16-bit
+        ▼ Local VAD (RMS threshold = 100)
+  Speech frames accumulated; silence > 0.2s triggers flush (VAD_END_SECS)
+  Utterances < 0.3s discarded (noise blips)
         │
-        ▼ Gemini realtimeInput { audio: { data: base64(pcm16k), mimeType: "audio/pcm;rate=16000" } }
-  Gemini handles turn detection, language understanding, barge-in natively.
-  No VAD, no STT, no stage context injection needed.
-  Response latency: ~1.5-2.0s (vs ~3.1s with legacy STT path)
-```
-
-**Legacy mode (NATIVE_AUDIO_INPUT=0):**
-```
-Same as above but routed through:
-  Local VAD (RMS ≥ 100, 0.3s silence) → Sarvam STT → text → Gemini clientContent
-  Response latency: ~3.1s
+        ▼ Sarvam Saaras v3 REST  (POST /speech-to-text)
+  Persistent aiohttp.ClientSession() per call
+  model=saaras:v3 | language_code=hi-IN | file=audio.wav (8kHz WAV)
+  STT hint phrases injected per-stage (brand, address, time)
+        │
+        ▼ Transcript string (Hinglish / English)
+        │
+        ▼ ServiceGraph.get_context() → compressed [STAGE] block
+        │
+        ▼ Gemini clientContent { turns: [{ role: "user", parts: [{ text: ... }] }] }
 ```
 
 ### Outbound (Gemini Voice → Customer)
@@ -159,26 +168,7 @@ Gemini serverContent.modelTurn.parts[].inlineData
 
 ### ServiceGraph (`core/service_graph.py`)
 
-`ServiceGraph` wraps a LangGraph `StateGraph` and holds per-call `ServiceState`. It tracks the current stage and injects context into every Gemini turn.
-
-#### Service Taxonomy
-
-```python
-CATEGORIES = {
-    "Appliance Repair": {
-        "subcategories": ["Refrigerator", "AC / Air Conditioner", "Washing Machine",
-                          "TV / Television", "Geyser", "Microwave Oven", "Laptop / Computer",
-                          "Inverter / UPS", "Water Purifier", "Mixer / Grinder", "Other Appliance"],
-        "needs_brand": True,
-    },
-    "Plumbing":      { "subcategories": [...], "needs_brand": False },
-    "Electrical":    { "subcategories": [...], "needs_brand": False },
-    "Carpentry":     { "subcategories": [...], "needs_brand": False },
-    "Cleaning":      { "subcategories": [...], "needs_brand": False },
-    "Vehicle Service": { "subcategories": [...], "needs_brand": True  },
-    "Other":         { "subcategories": [],     "needs_brand": False },
-}
-```
+`ServiceGraph` wraps a LangGraph `StateGraph` and holds per-call `ServiceState`. It tracks the current stage and injects compressed context into every Gemini turn.
 
 #### Stage Routing
 
@@ -187,145 +177,73 @@ category → subcategory → diagnosis → brand* → address → preferred_time
 *brand stage is skipped for categories where needs_brand=False
 ```
 
-The **diagnosis** stage replaces the old free-text `problem` stage. It injects category-specific questions from `DIAGNOSTIC_FLOWS` to identify the structured `issue_type` and auto-derive `severity`.
+#### Compressed Stage Context (latency-optimized)
 
-#### DIAGNOSTIC_FLOWS
-
-`DIAGNOSTIC_FLOWS` is a dict in `core/service_graph.py` with entries for 20 subcategories:
-
-```python
-DIAGNOSTIC_FLOWS = {
-    "TV / Television": {
-        "issue_types": ["Power Failure", "Display Failure", "No Sound", "Remote Not Working", ...],
-        "questions": ["Is the power indicator light glowing?", "Is there any picture on screen?"],
-        "hints": "If no power light → Power Failure (High). If picture but no sound → No Sound (Low).",
-        "severity_map": {"Power Failure": "High", "Display Failure": "High", "No Sound": "Low", ...}
-    },
-    "Refrigerator": { ... },
-    "Washing Machine": { ... },
-    "AC / Air Conditioner": { ... },
-    "Water Purifier": { ... },
-    # ... 15 more subcategories
-}
-```
-
-Each entry drives the `[STAGE CONTEXT]` block for the diagnosis stage, telling Gemini which questions to ask and how to map answers to a specific `issue_type` and `severity`.
-
-#### [STAGE CONTEXT] Injection
-
-On each customer utterance, `service_graph.get_context()` prepends a block:
+Stage context is injected per turn with minimal tokens (~65% reduction from original verbose format):
 
 ```
-[STAGE CONTEXT — follow these instructions for this turn]
-Stage       : diagnosis
-Collected   : {"category": "Appliance Repair", "subcategory": "Refrigerator"}
-Issue types : Cooling Failure, Water Leakage, Noisy Operation, Power Failure, Ice Build-up
-Diagnosis Q : Is the compressor running (humming sound)? Is there any cooling at all?
-Hints       : No cooling + compressor not running → Cooling Failure (High). Water below → Water Leakage (Medium).
-Instruction : Ask ONE diagnosis question. Once issue is clear, set issue_type and move to brand stage.
-[END STAGE CONTEXT]
+[STAGE stage=address]
+Collected: {"category": "Appliance Repair", "subcategory": "TV / Television", "brand": "Samsung"}
+Do: ASK: Society/building name aur area?
+[/STAGE]
 
-Customer: fridge mein bilkul thanda nahi ho raha
+Customer: Mahagun Mazaria, Sector 78, Noida
 ```
 
-This block tells Gemini exactly which stage it's in, what's collected, and what single question to ask next.
+#### System Prompt Speed Rules
 
-#### Confirmation Loop (Late-Stage Fields)
+The system prompt includes speed constraints to minimize response latency:
+1. MAX 15 WORDS per response
+2. NEVER repeat what the customer just said
+3. Start every response with a brief acknowledgment ("Theek hai.", "Achcha.")
+4. Say confirmation ONCE only — never repeat the closing message
 
-Each of the three late-stage fields — address, preferred_time, customer_name — goes through a two-step confirmation cycle before the stage advances:
+#### Agent Speech–Based Stage Advancement
 
-```
-1. Customer provides value  → set_pending(field, value)   [stage unchanged]
-2. Gemini echoes the value  → "Sector 15, Noida, sahi hai?"
-3. Customer confirms        → confirm_pending()            [stage advances]
-   Customer corrects        → clear_pending() + set_pending(field, newValue) [re-confirm]
-```
-
-`ServiceGraph` stores the pending field/value in `self._pending`. `get_context()` returns `get_confirmation_context()` when pending is set — injecting a confirmation-specific `[STAGE CONTEXT]` block that tells Gemini exactly what to echo and when to advance. Only after customer confirms does `confirm_pending()` call `on_field_collected()` and advance the stage.
-
-```python
-# _stt_and_send() — late-stage with confirmation
-if service_graph.pending is not None:
-    if _is_confirmation(_clean_t):          # "haan", "sahi hai", "yes correct"
-        service_graph.confirm_pending()     # commits field, advances stage
-    else:
-        service_graph.clear_pending()       # discard; re-capture if correction
-        if pf == "address" and len(_words) >= 2:
-            service_graph.set_pending("address", transcript.strip())
-        elif pf == "preferred_time":
-            service_graph.set_pending("preferred_time", transcript.strip())
-elif _cur == "address" and len(_words) >= 2:
-    service_graph.set_pending("address", transcript.strip())
-# ... preferred_time, customer_name same pattern
-```
-
-On the customer_name confirmation turn, `confirm_pending()` calls `on_field_collected("customer_name", ...)` which advances stage to `"done"`. `get_context()` then returns the done instruction → Gemini calls `save_service_request` immediately on that same turn — no extra round-trip.
-
-#### Agent Speech–Based Stage Advancement (Tool Hallucination Fix)
-
-Keyword extraction in `_update_stage_from_customer()` only covers category and Vehicle Service subcategories. For all other categories (Electrical, Plumbing, Carpentry, Cleaning), the ServiceGraph stage stays stuck at `"subcategory"` the entire call — Gemini never receives `[STAGE CONTEXT: stage=done]` and sometimes generates the booking confirmation *without* calling `save_service_request`.
-
-Fix: in `g_receiver()`, on every `turnComplete`, the agent's buffered speech is scanned with `_AGENT_STAGE_TRIGGERS` patterns. When Gemini asks for a specific field, the ServiceGraph stage is advanced to that field — independently of keyword extraction:
+`_AGENT_STAGE_TRIGGERS` patterns scan Gemini's speech at each `turnComplete` to advance the ServiceGraph stage. Guard: won't skip past uncollected local-prompt stages.
 
 ```python
 _AGENT_STAGE_TRIGGERS = [
     ("address",        [r"\baddress\b", r"\bpata\b", r"\bsociety\b", ...]),
     ("preferred_time", [r"\bkab\b.{0,50}\b(aaye|visit|chahte|time)\b", ...]),
-    ("customer_name",  [r"\bapna\s+naam\b", r"\byour\s+name\b", ...]),
+    ("customer_name",  [r"\bapna\s+(?:poora\s+)?naam\b", ...]),
 ]
-# On turnComplete — after flushing agent_buf:
-for _tgt, _pats in _AGENT_STAGE_TRIGGERS:
-    if _tgt_idx > _cur_idx and any(re.search(p, agent_turn_text) for p in _pats):
-        service_graph.state = ServiceState(**{**service_graph.state, "stage": _tgt})
-        break
 ```
-
-Combined flow (e.g. Electrical / Short Circuit — no keyword subcat patterns):
-1. Agent asks "apna address batayein" → `turnComplete` → stage = `address`
-2. Customer gives address → late-stage advancement → stage = `preferred_time`
-3. Agent asks "kab aaye" → `turnComplete` → stage = `preferred_time` (confirmed)
-4. Customer gives time → late-stage advancement → stage = `customer_name`
-5. Agent asks "apna naam batayein" → `turnComplete` → stage = `customer_name` (confirmed)
-6. Customer gives name → late-stage advancement → stage = `done`
-7. Gemini receives `[STAGE CONTEXT: stage=done, ALL FIELDS]` → calls `save_service_request` reliably
-
-#### State Updates
-
-- `on_tool_call(args)`: called when `save_service_request` fires — merges all args into state, sets `stage = "done"`
-- `on_field_collected(field, value)`: called mid-conversation to advance stage when a field is confirmed
 
 ---
 
-## 5. Echo Guard, Barge-in, and Audio Blocking Logic
+## 5. Confirmation & Call Close Logic
 
-Five distinct audio control layers protect conversation integrity:
+### Gemini-Driven Confirmation (LOCAL_PROMPT_STAGES empty)
 
-### Layer 1 — Greeting Guard (startup)
-All customer audio is blocked until the first `turnComplete` event fires (`greeting_done` flag). Prevents background noise from interrupting the greeting. Safety release: force-released at 20 seconds.
+When Gemini calls `save_service_request` and local TTS is disabled:
+1. Save executes → `save_done_ts` set
+2. Gemini speaks its own confirmation message
+3. First `turnComplete` after save → `confirmation_done=True` → send `{"event":"clear"}` to Vobiz → close in 0.5s
+4. Duplicate text truncated at first "shukriya" before flushing to transcript
+5. Text and audio blocked after `confirmation_done` set
 
-### Layer 2 — Echo Guard (per turn)
-After every `turnComplete`, a 0.3-second buffer blocks customer audio. Prevents Gemini's own audio being echoed back as customer speech. Safety timeout releases guard if `turnComplete` is missing for > 8 seconds after last audio.
+### Guard Flags (race condition protection)
 
-### Layer 3 — Barge-in Guard (mid-agent-speech)
-While the agent is actively speaking (`waiting_for_gemini=True` and recent AI audio), the VAD loop monitors for a sustained high-RMS signal:
+When local save is triggered (`stage=done`):
+- `save_done_ts` and `confirmation_done` set **synchronously** at call site (before `asyncio.create_task`)
+- `save_executed` set inside `_trigger_local_save` (prevents Gemini duplicates)
+- g_receiver's finally block checks `confirmation_done` and `save_done_ts` — won't close Vobiz WS if save is in progress
 
-```python
-BARGE_IN_RMS_THRESHOLD = 350   # 3.5× higher than VAD threshold — filters fan/background noise
-BARGE_IN_SUSTAIN_SECS  = 0.3   # sustained human speech, not a door slam or cough
-```
+### 10 WS Close Paths (all verified safe)
 
-When confirmed: `barge_in_active=True` is set → `{"event": "clear"}` is sent to Vobiz (stops audio playback) → `g_receiver` drops all subsequent Gemini audio chunks → accumulated frames are seeded into `speech_buf` (utterance start preserved) → `waiting_for_gemini=False` (utterance allowed through). Clears when next STT turn is sent to Gemini.
-
-### Layer 4 — Post-Save Guard (end of call)
-After `save_service_request` succeeds, ALL customer audio (from Vobiz) is blocked — `save_done_ts` is set and the VAD loop skips all packets.
-
-### Layer 5 — Confirmation Audio Guard (close timing)
-`confirmation_audio_secs` (float) accumulates PCM bytes of Gemini audio played after save. A `turnComplete` can only trigger call close when `confirmation_audio_secs >= 2.5` seconds. Prevents any premature close before the ~6s confirmation message completes.
-
-```
-Fallback close: asyncio.create_task(_close_after(ws, g_ws, 15.0)) is always created on save,
-in case the confirmation turnComplete never fires (Gemini silent after save).
-```
+| # | Trigger | Guard |
+|---|---------|-------|
+| 1 | End-marker "shukriya" | Only when `_LOCAL_PROMPT_STAGES` set |
+| 2 | Byte cap (7s audio) | `not confirmation_done` |
+| 3 | turnComplete after save | First TC closes; extras ignored |
+| 4 | g_receiver finally | `not confirmation_done AND save_done_ts==0` |
+| 5 | _local_final_confirmation end | Intentional close |
+| 6 | _trigger_local_save failure | Graceful error close |
+| 7 | Call timeout (600s) | Always |
+| 8 | Inactivity (25s silence) | `save_done_ts==0` |
+| 9 | Vobiz WS error | Transport error |
+| 10 | Outer finally cleanup | Always |
 
 ---
 
@@ -335,9 +253,8 @@ in case the confirmation turnComplete never fires (Gemini silent after save).
 {
   "setup": {
     "model": "models/gemini-2.5-flash-native-audio-latest",
-    "generationConfig": {
-      "responseModalities": ["AUDIO"]
-    },
+    "generationConfig": { "responseModalities": ["AUDIO"] },
+    "inputAudioTranscription": {},
     "outputAudioTranscription": {},
     "systemInstruction": { "parts": [{ "text": "<system_prompt>" }] },
     "tools": [{ "function_declarations": [{ "name": "save_service_request", ... }] }]
@@ -349,312 +266,75 @@ in case the confirmation turnComplete never fires (Gemini silent after save).
 |---------|-------|--------|
 | Model | gemini-2.5-flash-native-audio-latest | Native TTS voice (Aoede) |
 | Modalities | AUDIO only | Text output not needed |
-| Input mode | clientContent text turns | Audio never sent to Gemini — Sarvam handles STT |
-| inputAudioTranscription | Not set | No audio input to transcribe |
-| outputAudioTranscription | Set | Captures agent speech for transcript email |
-| speechConfig | Not set | Causes deferred 1008 errors on this model |
-| VAD config | Not set | Causes 1008 policy violations on native audio model |
-| ping_interval | 20s | Prevents mid-call WebSocket timeout |
-| ping_timeout | 20s | Drops dead connections quickly |
+| Input mode | clientContent text turns | STT text sent as user turns |
+| inputAudioTranscription | Set | Captures customer speech for logging |
+| outputAudioTranscription | Set | Captures agent speech for transcript |
+| speechConfig | Not set | Causes 1008 errors on this model |
 
 ---
 
-## 7. Tool Call: save_service_request
+## 7. Security & Guardrails
 
-Defined in `app_config.json` under `tools.gemini`, executed in `mydoot_functions.py`.
-
-### Tool Schema
-
-```json
-{
-  "name": "save_service_request",
-  "description": "MANDATORY: Call when [STAGE CONTEXT] shows stage 'done'.",
-  "parameters": {
-    "type": "OBJECT",
-    "properties": {
-      "customer_name":  { "type": "STRING" },
-      "category":       { "type": "STRING" },
-      "subcategory":    { "type": "STRING" },
-      "issue_type":     { "type": "STRING", "description": "Structured fault label from DIAGNOSTIC_FLOWS, e.g. Cooling Failure, MCB Tripping" },
-      "brand":          { "type": "STRING" },
-      "model":          { "type": "STRING" },
-      "severity":       { "type": "STRING", "description": "High / Medium / Low — auto-derived from issue_type" },
-      "error_code":     { "type": "STRING", "description": "Appliance display error code if any, e.g. E3, F1" },
-      "address":        { "type": "STRING" },
-      "preferred_time": { "type": "STRING" }
-    },
-    "required": ["customer_name","category","subcategory","issue_type","address","preferred_time"]
-  }
-}
-```
-
-### Execution Flow
-
-```python
-# pipelines/gemini.py — tool handler
-if fn == "save_service_request":
-    service_graph.on_tool_call(args)          # merge args into ServiceState
-    args.setdefault("caller_id", caller_id)   # injected by pipeline
-
-res = await asyncio.to_thread(FUNCTION_MAP[fn], **args)
-
-if res.get("success"):
-    save_executed = True                       # duplicate-save guard
-    save_done_ts  = time.time()               # activates post-save audio guard
-    asyncio.create_task(_close_after(ws, g_ws, 15.0, log))  # fallback close
-```
-
-After tool success, Gemini speaks the confirmation (Hinglish):
-
-> *"[name] ji, aapki request register ho gayi hai. Hamari team jald se jald aapse sampark karegi. MyDoot ko call karne ke liye shukriya!"*
-
-Response time is left intentionally open ("jald se jald" — as soon as possible) in the voice message; the actual SLA is communicated separately by the dispatcher.
-
-### Google Sheets Write
-
-Columns A–K (11 total):
-
-```python
-service.spreadsheets().values().append(
-    spreadsheetId=SPREADSHEET_ID,
-    range="Sheet1!A2",
-    valueInputOption="RAW",
-    insertDataOption="INSERT_ROWS",
-    body={"values": [[
-        customer_name, category, subcategory, issue_type,
-        brand, model, severity,
-        address, preferred_time,
-        timestamp, caller_id
-    ]]}
-)
-```
-
-#### Sheets Service Caching
-
-`_get_sheets_service()` caches the service object in `_SHEETS_CACHE` with a 3000 s (50-min) TTL. The discovery-doc fetch + TCP/TLS handshake costs ~500 ms; caching ensures only the first save per warm Cloud Run instance pays this cost. On expiry or on a stale-connection error (`reset`, `eof`, `broken pipe`), the cache is invalidated and the service is rebuilt — the append is retried once automatically.
-
-`_SHEETS_CACHE["headers_written"]` flag eliminates the ~300 ms `GET Sheet1!A1:K1` header check on every save after headers are confirmed present.
+- **caller_id sanitized**: `re.sub(r'[^a-zA-Z0-9_+\-]', '', caller_id)` — prevents path traversal in filenames
+- **ReDoS prevention**: Time patterns use `[\w\s,।]{0,20}` instead of `.{0,20}`
+- **Devanagari word boundaries**: `\b` not used with Devanagari (vowel signs are non-`\w`)
+- **Local audio streaming**: `web.FileResponse` (no memory spikes for large WAVs)
+- **Confirmation words**: Include Devanagari variants (जी, अच्छा, ठीक है, सही है, etc.)
+- **Name rejection**: Multi-word affirmatives rejected as names (अच्छा जी, ठीक जी, etc.)
 
 ---
 
 ## 8. VAD — Voice Activity Detection
 
-Local VAD runs before Sarvam STT. It eliminates PSTN line noise from ever reaching the ASR engine.
-
 ```python
 VAD_SPEECH_THRESHOLD   = 100    # RMS amplitude gate for speech detection
-VAD_END_SECS           = 0.3    # silence after speech to end utterance (tunable via env var)
-VAD_MIN_SPEECH_SECS    = 0.3    # minimum utterance duration — catches short responses like "LG", "haan"
+VAD_END_SECS           = 0.2    # silence after speech to end utterance
+VAD_MIN_SPEECH_SECS    = 0.3    # minimum utterance duration
 VAD_MAX_SPEECH_SECS    = 30.0   # hard ceiling — force-flush long utterances
 
-BARGE_IN_RMS_THRESHOLD = 350    # high-RMS threshold: fan/background noise stays below this
-BARGE_IN_SUSTAIN_SECS  = 0.3    # sustained duration to confirm human interruption vs. single loud noise
+BARGE_IN_RMS_THRESHOLD = 350    # high-RMS threshold for interruption detection
+BARGE_IN_SUSTAIN_SECS  = 0.3    # sustained duration to confirm human interruption
 ```
-
-State machine per call:
-```
-in_speech=False + rms >= 100  → in_speech=True, start accumulating
-in_speech=True  + silence > 0.3s → flush to Sarvam STT (if duration >= 0.3s)
-in_speech=True  + duration >= 30s → force-flush to Sarvam STT
-
-barge-in detection (agent speaking):
-  rms >= 350 sustained >= 0.3s → clear Vobiz audio, barge_in_active=True
-```
-
-**Latency reductions (cumulative per turn):**
-
-| Optimization | Savings |
-|---|---|
-| `VAD_END_SECS` 0.7 → 0.3 s | ~400 ms |
-| `VAD_MIN_SPEECH_SECS` 0.5 → 0.3 s | prevents dropped short responses (saves re-ask round-trip) |
-| Persistent `aiohttp.ClientSession()` per call (Sarvam STT) | ~200–300 ms |
-| Cached Sheets service (TTL 3000 s) | ~500 ms per save |
-| `headers_written` flag (skip GET on each save) | ~300 ms per save |
-| Confirmation loop: confirm_pending() → stage=done on name turn | ~5–10 s saved vs extra round-trip |
 
 ---
 
-## 9. Transcript Logging
+## 9. Observability
 
-Transcripts are buffered per turn and flushed as single lines on turn boundaries:
+### Dashboard: `/calls`
+- Per-call quality metrics (category, stage, saved, STT avg, drops, barge-ins)
+- Per-call turn latency view (STT, LLM first token, end-to-end per turn)
+- Transcript with chat bubbles
+- Audio playback (GCS or local)
 
-- Customer speech (from STT): logged immediately in `_stt_and_send()` as `"Customer: <transcript>"`
-- Agent speech: buffered in `agent_buf` via `outputAudioTranscription` events; flushed as one `"Agent: ..."` line on `turnComplete`
-- All log lines are timestamped `HH:MM:SS.mmm` and prefixed with caller ID
-- Full transcript printed at call end; emailed to admin
+### Latency Metrics: `/latency`
+- P50/P95/P99 for STT, LLM first token, end-to-end
+- Stored in PostgreSQL `turn_latency_metrics` table
+- Per-call drill-down via `/calls/latency?caller_id=XXX`
+
+### Current Performance (P50)
+- STT: ~900ms (Sarvam API bottleneck)
+- LLM first token: ~2000ms (Gemini processing)
+- End-to-end: ~8000ms (includes agent speaking time)
 
 ---
 
-## 10. Post-Call Email
+## 10. Sarvam TTS (Local, Optional)
+
+**Status:** Disabled by default (`LOCAL_PROMPT_STAGES=""`)
+
+When enabled, Sarvam Bulbul v2 handles address/time/name stages locally:
+- Model: `bulbul:v2` (v3 doesn't support pitch/loudness; v1 deprecated)
+- Speaker: `anushka`, pace=1.05, pitch=0, loudness=1.5
+- Disabled because voice quality was not acceptable (different from Gemini voice)
+- Pre-cached engagement phrases: "Theek hai." and "Ek second..." (not played when disabled)
+
+---
+
+## 11. Post-Call Email
 
 ```python
-# pipelines/gemini.py — finally block (always runs, even on error)
+# pipelines/gemini.py — finally block (always runs)
 await asyncio.to_thread(send_call_summary_email, caller_id, transcript_log)
 ```
 
-`transcript_log` contains `"Agent: ..."` and `"Customer: ..."` lines accumulated during the call.
-
-Sent via Gmail SMTP SSL (port 465). Sent to `GMAIL_USER` (admin email).
-
----
-
-## 11. Credentials Architecture
-
-```
-GitHub Secret: GCP_SA_KEY (full service account JSON)
-        │
-        └── deploy.yml sets GOOGLE_CREDENTIALS env var on Cloud Run
-                │
-                ▼
-        app.py startup: parses JSON → writes google-credentials.json
-                │
-                ▼
-        mydoot_functions._get_sheets_service()
-        service_account.Credentials.from_service_account_info()
-                │
-                ▼
-        Google Sheets API (sheets v4)
-
-GitHub Secret: POSTGRES_URL
-        │
-        └── deploy.yml sets POSTGRES_URL env var on Cloud Run
-                │
-                ▼
-        app.py startup: init_db() called before routes register
-                │
-                ▼
-        config/database.py — ThreadedConnectionPool (min=1, max=10)
-        DDL: creates instances, service_requests, call_logs tables
-        Upserts instance row: (INSTANCE_ID, display_name)
-```
-
-Service account: `mydoot-voice@testcnx-169610.iam.gserviceaccount.com`
-Required permission: Editor on sheet `1uW39kklQKc4rhf5REATgKqgwbvSNAhlDVKXyAzOMKCk`
-
-PostgreSQL: self-hosted on GCE VM at `34.122.77.178:5432`, database `mydoot`, user `mydoot_user`.
-If `POSTGRES_URL` is unset, `init_db()` returns False and the app runs in Sheets-only mode.
-
-The Sheets service is cached with a 3000 s TTL in `_SHEETS_CACHE` and reused for all calls on the same instance. On stale-connection errors the cache is invalidated and the service is force-rebuilt.
-
----
-
-## 12. Infrastructure
-
-### Docker Image (Multi-stage)
-
-```dockerfile
-FROM python:3.11-slim AS builder
-# pip install --prefix=/install -r requirements.txt
-
-FROM python:3.11-slim
-# Copies only: app.py, mydoot_functions.py, app_config.json,
-#              config/, core/, pipelines/, routes/
-# Excludes: .env, credentials, recordings, venv, test files
-USER priya (non-root, uid 1000)
-EXPOSE 8080
-CMD ["python", "app.py"]
-```
-
-### Cloud Run
-
-| Property | Value |
-|----------|-------|
-| Service | mydoot-voice-agent |
-| Region | us-central1 |
-| Project | testcnx-169610 |
-| Memory | 512Mi |
-| CPU | 1 |
-| Min instances | 1 (always warm) |
-| Max instances | 10 |
-| Timeout | 3600s |
-| Concurrency | 80 |
-
-### PostgreSQL Infrastructure
-
-| Property | Value |
-|----------|-------|
-| Host | GCE VM — 34.122.77.178 |
-| Port | 5432 |
-| Database | mydoot |
-| User | mydoot_user |
-| Tables | instances, service_requests, call_logs |
-| Multi-tenancy | INSTANCE_ID column on all data tables |
-
-### CI/CD
-
-```
-git push main → GitHub Actions (deploy.yml)
-    ├── Auth to GCP (GCP_SA_KEY)
-    ├── Docker build + push to Artifact Registry
-    ├── Write /tmp/env.yaml from GitHub secrets (mydoot_env environment)
-    │   Secrets passed: SARVAM_API_KEY, DEEPGRAM_API_KEY, GEMINI_API_KEY,
-    │   GOOGLE_SPREADSHEET_ID, GMAIL_USER, GMAIL_APP_PASSWORD,
-    │   GOOGLE_CREDENTIALS, POSTGRES_URL, INSTANCE_ID
-    └── gcloud run deploy --env-vars-file=/tmp/env.yaml
-```
-
----
-
-## 13. Observability Dashboard
-
-Every call writes one row to the **Call_Logs** tab of the same Google Sheet via `save_call_log()` in `mydoot_functions.py`. The write is non-blocking (`asyncio.to_thread`) and fires in the `finally` block of `gemini_handler`.
-
-### _call_track dict (per call)
-
-`pipelines/gemini.py` maintains a mutable `_call_track` dict at `gemini_handler` scope:
-
-```python
-_call_track: dict = {
-    "stt_latencies_ms": [],   # ms per successful Sarvam STT call
-    "stt_dropped":      0,    # utterances rejected (concurrent or VAD drop)
-    "barge_ins":        0,    # confirmed customer interruptions
-    "reconnects":       0,    # Gemini WS reconnect events
-    "gcs_uri":          "",   # gs:// URI after recording upload
-}
-```
-
-Instrumentation hooks are placed at:
-- After each successful STT call → `stt_latencies_ms.append(stt_ms)`
-- After each STT concurrent-drop or VAD utterance drop → `stt_dropped += 1`
-- After each confirmed barge-in → `barge_ins += 1`
-- After each Gemini WS reconnect → `reconnects += 1`
-- After GCS upload → `gcs_uri = gcs_uri`
-
-### Dashboard Routes
-
-| Route | Handler | Description |
-|-------|---------|-------------|
-| `GET /calls` | `routes/calls.py:calls_page` | HTML dashboard — stats, call table, expandable detail panels |
-| `GET /calls/data` | `routes/calls.py:calls_data` | JSON — last 200 rows from Call_Logs sheet |
-| `GET /calls/audio` | `routes/calls.py:audio_proxy` | Streams WAV from GCS to browser (query: `?uri=gs://...`) |
-
-The dashboard renders each call's transcript as timestamped chat bubbles (Agent = purple/left, Customer = green/right). The audio player streams directly from GCS via the `/calls/audio` proxy.
-
-### Call_Logs Sheet Schema
-
-18 columns (A–R):
-
-```
-Timestamp (IST) | Caller ID | Duration (s) | Stage Reached | Saved |
-Category | Subcategory | Issue Type | Customer Name | Address | Preferred Time |
-STT Count | STT Avg (ms) | STT Drops | Barge-Ins | Reconnects | Audio GCS | Transcript
-```
-
----
-
-## 14. Key Files Reference
-
-| File | Purpose |
-|------|---------|
-| `app.py` | Entry point — registers routes, reconstructs google-credentials.json at startup |
-| `app_config.json` | System prompt, greeting scripts, tool schema (save_service_request), model config |
-| `mydoot_functions.py` | `save_service_request()`, `save_call_log()`, `get_call_logs()`, `send_call_summary_email()`, `upload_recording_to_gcs()`, Sheets client |
-| `pipelines/gemini.py` | Hybrid pipeline — VAD, Sarvam STT, ServiceGraph context injection, Gemini Live, tool dispatch |
-| `routes/webhook.py` | Vobiz inbound call handler — returns Stream XML with wss:// URL |
-| `routes/calls.py` | `GET /calls` HTML dashboard, `/calls/data` JSON API, `/calls/audio` GCS audio proxy |
-| `core/service_graph.py` | LangGraph ServiceGraph — category taxonomy, stage state, [STAGE CONTEXT] injection |
-| `core/state_engine.py` | Legacy 7-field state tracker (used by save_customer_feedback path) |
-| `config/settings.py` | API keys (Gemini, Sarvam), POSTGRES_URL, INSTANCE_ID from environment |
-| `config/database.py` | PostgreSQL ThreadedConnectionPool — `init_db()`, `get_conn()`, `put_conn()` |
-| `Dockerfile` | Multi-stage build — builder + minimal runtime image |
-| `.github/workflows/deploy.yml` | GitHub Actions → Cloud Run CI/CD pipeline |
+Sent via Gmail SMTP SSL (port 465) to admin email.

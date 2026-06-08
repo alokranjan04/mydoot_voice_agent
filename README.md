@@ -12,10 +12,11 @@ A customer calls **+917971542939**. The AI agent:
 1. Answers immediately with a Hinglish greeting, then auto-detects language (English or Hinglish)
 2. Conducts the entire call in English if the customer responds in English, otherwise Hinglish
 3. Identifies the service category (Appliance Repair, Plumbing, Electrical, Carpentry, Cleaning, Vehicle Service, or Other) and guides through subcategory, structured diagnosis (issue type + severity), address, and preferred visit time
-4. **Confirms each collected field** by echoing it back ("Sector 15, Noida, sahi hai?") — only advances after the customer confirms; corrects if the customer gives a different value
+4. **Confirms each collected field** by echoing it back ("Sector 15, Noida, sahi hai?") — only advances after the customer confirms; corrects if the customer gives a different value. High-confidence values (≥0.85) are auto-confirmed to save time.
 5. Supports **barge-in** — if the customer speaks while the agent is talking, agent audio stops immediately (RMS threshold filters out background noise/fan sounds)
-6. Saves a structured 11-field service request to Google Sheets
+6. Saves a structured 11-field service request to **PostgreSQL** (primary) and **Google Sheets** (secondary)
 7. Emails the full call transcript to the admin after every call
+8. **Observability dashboard** at `/calls` — per-call quality metrics, turn latency drill-down, transcript viewer
 
 No hold music. No missed calls. No incomplete forms.
 
@@ -41,14 +42,14 @@ Customer Phone Call
  pipelines/gemini.py
         │
         ├── Audio In:  mu-law 8kHz → PCM 8kHz
-        │               ↓  Local VAD (RMS threshold)
-        │               ↓  Sarvam Saaras v3 REST (hi-IN)
+        │               ↓  Local VAD (RMS ≥100, 0.2s silence)
+        │               ↓  Sarvam Saaras v3 REST (hi-IN, per-stage hints)
         │               ↓  Text transcript → clientContent turn
         │
         ├── Audio Out: Gemini Live PCM 24kHz → mu-law 8kHz → Vobiz
         │
         ├── core/service_graph.py — LangGraph ServiceGraph
-        │               ↓  Injects [STAGE CONTEXT] with each turn
+        │               ↓  Injects compressed [STAGE] context per turn
         │               ↓  Tracks: category → subcategory → diagnosis
         │                          → brand → address → preferred_time
         │                          → customer_name → done
