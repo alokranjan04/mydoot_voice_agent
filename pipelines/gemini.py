@@ -513,7 +513,7 @@ async def gemini_handler(request):
                         "speechConfig": {
                             "voiceConfig": {
                                 "prebuiltVoiceConfig": {
-                                    "voiceName": "Aoede"
+                                    "voiceName": "Kore"
                                 }
                             }
                         },
