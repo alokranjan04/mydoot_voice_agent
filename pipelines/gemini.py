@@ -513,7 +513,7 @@ async def gemini_handler(request):
                         "speechConfig": {
                             "voiceConfig": {
                                 "prebuiltVoiceConfig": {
-                                    "voiceName": "Kore"
+                                    "voiceName": "Aoede"
                                 }
                             }
                         },
@@ -624,48 +624,28 @@ async def gemini_handler(request):
                                 log(f"🗣  {line}")
                                 customer_buf = ""
                             agent_buf += out_t["text"]
-                            # ── Detect repeated confirmation via end-marker ───────
-                            # Look for "shukriya" / "thank you for calling" in
-                            # the agent buffer. If text continues AFTER the marker,
-                            # Gemini is repeating — block immediately. If the marker
-                            # is at the end, let audio continue (first copy still
-                            # playing). This is safe for both local-TTS and
-                            # Gemini-spoken confirmation modes.
+                            # ── Detect confirmation end via marker ────────────────
+                            # When "shukriya" / "thank you for calling" appears
+                            # in the agent buffer, the confirmation is complete.
+                            # Stop forwarding NEW audio immediately (prevents
+                            # any duplicate from reaching Vobiz). Close after
+                            # 3s drain delay so Vobiz plays buffered audio.
                             if (save_done_ts > 0 and not confirmation_done):
                                 _buf_l = agent_buf.lower()
-                                _end_pos = -1
-                                for _marker, _mlen in [
-                                    ("shukriya", 8),
-                                    ("thank you for calling", 20),
-                                ]:
-                                    _p = _buf_l.find(_marker)
-                                    if _p != -1:
-                                        _end_pos = _p + _mlen
-                                        break
-                                if _end_pos != -1:
-                                    # Check if Gemini added text after the marker
-                                    # (= start of a duplicate). Allow a few chars
-                                    # of punctuation/whitespace after the marker.
-                                    _remaining = agent_buf[_end_pos:].strip(" \t\n!।")
-                                    if _remaining:
+                                for _marker in ("shukriya", "thank you for calling"):
+                                    if _marker in _buf_l:
                                         evt("confirmation_done",
-                                            reason="repeat_after_end_marker",
+                                            reason="end_marker",
                                             tc_seq=_tc_seq,
                                             burst=_post_save_burst,
                                             audio_secs=round(
-                                                confirmation_audio_secs, 2),
-                                            extra_text=_remaining[:40])
+                                                confirmation_audio_secs, 2))
                                         confirmation_done = True
-                                        log(f"🔇 Repeat detected after end-marker "
-                                            f"— clearing Vobiz + closing")
-                                        try:
-                                            if not ws.closed:
-                                                await ws.send_str(json.dumps(
-                                                    {"event": "clear"}))
-                                        except Exception:
-                                            pass
+                                        log(f"🔇 End-marker '{_marker}' found "
+                                            f"— stop forwarding, drain 3s")
                                         asyncio.create_task(
-                                            _close_after(ws, g_ws, 0.5, log))
+                                            _close_after(ws, g_ws, 3.0, log))
+                                        break
 
                         server_content = data.get("serverContent", {})
 

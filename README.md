@@ -308,6 +308,24 @@ The dashboard is available at `<your-url>/calls` — shows summary stats, a per-
 
 ---
 
+## Cost Per Minute
+
+| Component | Rate | Per Minute |
+|-----------|------|------------|
+| **Gemini 3.1 Flash Live API** (STT + LLM + TTS all-in-one) | $0.0023/min | **₹0.19** |
+| **Vobiz Telephony** (incoming PSTN calls) | ₹0.45/min | **₹0.45** |
+| **Total** | | **₹0.64/min** (~$0.0077) |
+
+**Per call (avg 1.5 min):** ₹0.96 (~$0.012)
+
+Notes:
+- Gemini Live API pricing: input $0.00025/1K tokens + output $0.001/1K tokens; audio ≈ 40 tokens/sec → $0.0023/min blended
+- Sarvam STT cost eliminated by switching to Gemini native audio input (was $0.0077/min with Deepgram)
+- Google Sheets API and PostgreSQL writes are negligible (free tier / fixed cost)
+- Cloud Run: ~$0.00002/min (512Mi, 1 vCPU, pay-per-use after min instances)
+
+---
+
 ## Built By
 
 **Alok Ranjan** — [alokranjan04@gmail.com](mailto:alokranjan04@gmail.com)
