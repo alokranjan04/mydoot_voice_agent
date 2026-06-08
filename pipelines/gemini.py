@@ -569,6 +569,7 @@ async def gemini_handler(request):
             greeting_started   = False
             save_done_ts            = 0.0   # timestamp when save_customer_feedback succeeded
             save_executed           = False  # prevent duplicate save calls per session
+            save_tool_pending       = False  # True from tool_call_start until tool_result_sent
             confirmation_done       = False  # True once confirmation audio is blocked
             confirmation_audio_secs = 0.0   # seconds of audio forwarded after save_done_ts set
             waiting_for_gemini = False  # True while Gemini is processing; blocks stacked noise utterances
@@ -583,6 +584,7 @@ async def gemini_handler(request):
                 nonlocal g_ws
                 nonlocal downsample_state, last_ai_audio_ts, gemini_turn_end_ts
                 nonlocal greeting_started, greeting_done, save_done_ts, save_executed
+                nonlocal save_tool_pending
                 nonlocal confirmation_done, confirmation_audio_secs, waiting_for_gemini
                 nonlocal agent_buf, customer_buf
                 _g_reconnects  = 0
@@ -815,9 +817,9 @@ async def gemini_handler(request):
                                     f"(last audio {ai_dur:.2f}s ago)")
                             elif save_done_ts > 0:
                                 if not _LOCAL_PROMPT_STAGES and not confirmation_done:
-                                    if confirmation_audio_secs < 2.0:
-                                        # Gemini was interrupted before speaking
-                                        # the confirmation (0 audio reached customer).
+                                    if confirmation_audio_secs < 4.0:
+                                        # Gemini was interrupted before finishing
+                                        # the confirmation (~5.5s full message).
                                         # Nudge Gemini to speak confirmation now.
                                         log(f"⚠️  Post-save turnComplete with only "
                                             f"{confirmation_audio_secs:.1f}s audio — "
@@ -926,9 +928,17 @@ async def gemini_handler(request):
                                 fn   = fc.get("name", "")
                                 args = fc.get("args", {})
                                 cid  = fc.get("id", "")
+                                is_save_fn = fn in ("save_customer_feedback", "save_service_request")
                                 log(f"🔧 Tool call: {fn} | args={json.dumps(args)}")
                                 evt("tool_call_start", fn=fn, call_id=cid,
                                     save_already=save_executed, tc_seq=_tc_seq)
+                                # Block customer audio immediately when save
+                                # starts — prevents residual audio from
+                                # triggering Gemini interrupts during the
+                                # tool execution + confirmation.
+                                if is_save_fn and not save_executed:
+                                    save_tool_pending = True
+                                    log("🔒 Audio blocked — save tool executing")
 
                                 if fn == "save_customer_feedback":
                                     # Normalize warranty_status — customers often say "1","2","3"
@@ -1727,7 +1737,9 @@ async def gemini_handler(request):
                             pcm8_frames.append(pcm8)
 
                         # ── Post-save guard: block all input after save ────
-                        if save_done_ts > 0:
+                        # Also block during tool execution to prevent
+                        # residual audio from triggering Gemini interrupts.
+                        if save_done_ts > 0 or save_tool_pending:
                             continue
 
                         # ── Greeting guard: wait for Gemini to finish greeting ─
