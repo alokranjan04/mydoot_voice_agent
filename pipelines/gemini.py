@@ -63,9 +63,10 @@ NATIVE_AUDIO_INPUT = os.getenv("NATIVE_AUDIO_INPUT", "1").lower() in ("1", "true
 # Use these WAV files with test_asr_compare.py to benchmark ASR services.
 RECORD_CALLS               = os.getenv("RECORD_CALLS", "0").lower() in ("1", "true", "yes")
 RECORDINGS_DIR             = os.getenv("RECORDINGS_DIR", "recordings")
-# Hard time ceiling on audio forwarding after save. One confirmation is ~5.5s.
-# 6s cap allows the full message and cuts off any Gemini repetition.
-MAX_CONFIRMATION_AUDIO_SECS = 6.0
+# Hard ceiling on audio CONTENT forwarded after save. One confirmation is
+# ~6-7s depending on customer name length. 9s cap allows the full message
+# and cuts off any Gemini repetition (~12s if doubled).
+MAX_CONFIRMATION_AUDIO_SECS = 9.0
 # The byte cap is the primary guard against duplicate audio reaching the
 # customer — it fires based on audio CONTENT bytes forwarded to Vobiz,
 # which tracks closely with playback at ~1:1 generation speed.
@@ -701,8 +702,10 @@ async def gemini_handler(request):
                                 # real-time so a wall-clock check is too slow. We count
                                 # PCM bytes forwarded and stop after MAX_CONFIRMATION_AUDIO_SECS
                                 # (one confirmation message) so the second repetition never
-                                # reaches Vobiz. Also sends {"event":"clear"} to flush any
-                                # already-buffered audio.
+                                # reaches Vobiz. Do NOT send {"event":"clear"} here — the
+                                # audio is already in Vobiz's playback buffer and needs time
+                                # to play out. Just stop forwarding new audio and close after
+                                # a delay to let the buffer drain.
                                 if (save_done_ts > 0 and
                                         confirmation_audio_secs > MAX_CONFIRMATION_AUDIO_SECS):
                                     if not confirmation_done:
@@ -710,13 +713,11 @@ async def gemini_handler(request):
                                             tc_seq=_tc_seq, burst=_post_save_burst,
                                             audio_secs=round(confirmation_audio_secs, 2))
                                         confirmation_done = True
-                                        log(f"🔇 Post-save audio cutoff ({confirmation_audio_secs:.1f}s) — clearing + blocking")
-                                        try:
-                                            if not ws.closed:
-                                                await ws.send_str(json.dumps({"event": "clear"}))
-                                        except Exception:
-                                            pass
-                                        asyncio.create_task(_close_after(ws, g_ws, 0.0, log))
+                                        log(f"🔇 Post-save audio cutoff ({confirmation_audio_secs:.1f}s) — stop forwarding, drain buffer")
+                                        # Wait 5s for Vobiz to play buffered audio
+                                        # before closing. Gemini generates faster than
+                                        # real-time, so buffered audio > wall time elapsed.
+                                        asyncio.create_task(_close_after(ws, g_ws, 5.0, log))
                                     continue
                                 if not greeting_started:
                                     greeting_started = True
