@@ -63,10 +63,9 @@ NATIVE_AUDIO_INPUT = os.getenv("NATIVE_AUDIO_INPUT", "1").lower() in ("1", "true
 # Use these WAV files with test_asr_compare.py to benchmark ASR services.
 RECORD_CALLS               = os.getenv("RECORD_CALLS", "0").lower() in ("1", "true", "yes")
 RECORDINGS_DIR             = os.getenv("RECORDINGS_DIR", "recordings")
-# Hard time ceiling on audio forwarding after save. The confirmation is ~6s.
-# 8s gives enough room for the message to complete and cuts off any Gemini
-# repetition (the model occasionally repeats the closing line twice).
-MAX_CONFIRMATION_AUDIO_SECS = 7.0
+# Hard time ceiling on audio forwarding after save. One confirmation is ~5.5s.
+# 6s cap allows the full message and cuts off any Gemini repetition.
+MAX_CONFIRMATION_AUDIO_SECS = 6.0
 # The byte cap is the primary guard against duplicate audio reaching the
 # customer — it fires based on audio CONTENT bytes forwarded to Vobiz,
 # which tracks closely with playback at ~1:1 generation speed.
@@ -456,7 +455,7 @@ async def gemini_handler(request):
     model = APP_CONFIG.get("parameters", {}).get("google", {}).get(
         "model", "models/gemini-3.1-flash-live-preview"
     )
-    log(f"🚀 Gemini Live connecting | model={model}")
+    log(f"🚀 Gemini Live connecting | model={model} | native_audio={'ON' if NATIVE_AUDIO_INPUT else 'OFF'}")
     log(f"   API key: {'SET len=' + str(len(GEMINI_API_KEY)) if GEMINI_API_KEY else '*** MISSING ***'}")
 
     g_ws = None    # defined at function level so g_receiver can reassign via nonlocal on reconnect
@@ -623,20 +622,13 @@ async def gemini_handler(request):
                                 customer_buf = ""
                             agent_buf += out_t["text"]
                             # ── Detect repeated confirmation via end-marker ───────
-                            # Look for the confirmation end-marker ("shukriya" /
-                            # "thank you for calling") in the agent buffer. Once
-                            # found, any text that follows means Gemini has started
-                            # repeating — set confirmation_done to block the audio
-                            # for that repetition before it reaches Vobiz.
-                            # (Customer-name counting was unreliable: the name can
-                            # appear earlier in the same turn, firing too early.)
-                            if (save_done_ts > 0 and not confirmation_done
-                                    and _LOCAL_PROMPT_STAGES):
-                                # End-marker detection: only active when local TTS
-                                # handles confirmation.  When Gemini speaks its own
-                                # confirmation (_LOCAL_PROMPT_STAGES is empty), text
-                                # arrives BEFORE audio — blocking here would kill the
-                                # audio before it plays.
+                            # Look for "shukriya" / "thank you for calling" in
+                            # the agent buffer. If text continues AFTER the marker,
+                            # Gemini is repeating — block immediately. If the marker
+                            # is at the end, let audio continue (first copy still
+                            # playing). This is safe for both local-TTS and
+                            # Gemini-spoken confirmation modes.
+                            if (save_done_ts > 0 and not confirmation_done):
                                 _buf_l = agent_buf.lower()
                                 _end_pos = -1
                                 for _marker, _mlen in [
@@ -648,19 +640,29 @@ async def gemini_handler(request):
                                         _end_pos = _p + _mlen
                                         break
                                 if _end_pos != -1:
-                                    evt("confirmation_done", reason="end_marker",
-                                        tc_seq=_tc_seq, burst=_post_save_burst,
-                                        audio_secs=round(confirmation_audio_secs, 2))
-                                    confirmation_done = True
-                                    log("🔇 End-marker reached — "
-                                        "clearing Vobiz buffer + closing in 0.5s")
-                                    try:
-                                        if not ws.closed:
-                                            await ws.send_str(json.dumps({"event": "clear"}))
-                                    except Exception:
-                                        pass
-                                    asyncio.create_task(
-                                        _close_after(ws, g_ws, 0.5, log))
+                                    # Check if Gemini added text after the marker
+                                    # (= start of a duplicate). Allow a few chars
+                                    # of punctuation/whitespace after the marker.
+                                    _remaining = agent_buf[_end_pos:].strip(" \t\n!।")
+                                    if _remaining:
+                                        evt("confirmation_done",
+                                            reason="repeat_after_end_marker",
+                                            tc_seq=_tc_seq,
+                                            burst=_post_save_burst,
+                                            audio_secs=round(
+                                                confirmation_audio_secs, 2),
+                                            extra_text=_remaining[:40])
+                                        confirmation_done = True
+                                        log(f"🔇 Repeat detected after end-marker "
+                                            f"— clearing Vobiz + closing")
+                                        try:
+                                            if not ws.closed:
+                                                await ws.send_str(json.dumps(
+                                                    {"event": "clear"}))
+                                        except Exception:
+                                            pass
+                                        asyncio.create_task(
+                                            _close_after(ws, g_ws, 0.5, log))
 
                         server_content = data.get("serverContent", {})
 
