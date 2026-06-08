@@ -51,11 +51,11 @@ BARGE_IN_SUSTAIN_SECS  = float(os.getenv("BARGE_IN_SUSTAIN_SECS", "0.3"))
 # Gemini handles turn detection, language understanding, and barge-in natively.
 # Sarvam STT still runs in background for transcript logging if enabled.
 # Set NATIVE_AUDIO_INPUT=0 to fall back to the legacy VAD → STT → text path.
-# Disabled by default: native audio causes hallucinations (fabricated
-# addresses, brands, names) and Gemini loses track of conversation state
-# (skips tool calls). Legacy STT path is more accurate.
-# Set NATIVE_AUDIO_INPUT=1 to re-enable for latency testing.
-NATIVE_AUDIO_INPUT = os.getenv("NATIVE_AUDIO_INPUT", "0").lower() in ("1", "true", "yes")
+# TESTING: Enabled by default with gemini-3.1-flash-live-preview which has
+# improved Hindi speech understanding vs 2.5. Previous hallucination issues
+# (fabricated addresses, brands) were on gemini-2.5-flash-native-audio.
+# Set NATIVE_AUDIO_INPUT=0 to revert to legacy STT path if issues persist.
+NATIVE_AUDIO_INPUT = os.getenv("NATIVE_AUDIO_INPUT", "1").lower() in ("1", "true", "yes")
 
 # ── Call recording ────────────────────────────────────────────────────────────
 # Set RECORD_CALLS=1 to save each call's inbound PSTN audio as a WAV file.
@@ -454,7 +454,7 @@ async def gemini_handler(request):
         )
 
     model = APP_CONFIG.get("parameters", {}).get("google", {}).get(
-        "model", "models/gemini-2.5-flash-native-audio-latest"
+        "model", "models/gemini-3.1-flash-live-preview"
     )
     log(f"🚀 Gemini Live connecting | model={model}")
     log(f"   API key: {'SET len=' + str(len(GEMINI_API_KEY)) if GEMINI_API_KEY else '*** MISSING ***'}")
@@ -510,6 +510,13 @@ async def gemini_handler(request):
                     "model": model,
                     "generationConfig": {
                         "responseModalities": ["AUDIO"],
+                        "speechConfig": {
+                            "voiceConfig": {
+                                "prebuiltVoiceConfig": {
+                                    "voiceName": "Aoede"
+                                }
+                            }
+                        },
                     },
                     "inputAudioTranscription": {},
                     "outputAudioTranscription": {},
@@ -534,15 +541,24 @@ async def gemini_handler(request):
             log(f"✅ Gemini Live Ready: {json.dumps(resp)[:120]}")
 
             # ── 3. Kick off greeting ─────────────────────────────────────────
-            await g_ws.send(json.dumps({
-                "clientContent": {
-                    "turns": [{
-                        "role": "user",
-                        "parts": [{"text": "[CALL_STARTED]"}],
-                    }],
-                    "turnComplete": True,
-                }
-            }))
+            if NATIVE_AUDIO_INPUT:
+                # Native audio mode: use realtimeInput.text to stay in the
+                # same input mode as the audio stream (avoid clientContent/
+                # realtimeInput protocol mismatch that causes disconnects).
+                await g_ws.send(json.dumps({
+                    "realtimeInput": {"text": "[CALL_STARTED]"}
+                }))
+            else:
+                # Legacy STT path: use clientContent for text turns.
+                await g_ws.send(json.dumps({
+                    "clientContent": {
+                        "turns": [{
+                            "role": "user",
+                            "parts": [{"text": "[CALL_STARTED]"}],
+                        }],
+                        "turnComplete": True,
+                    }
+                }))
             log("📨 [CALL_STARTED] trigger sent — awaiting greeting audio")
 
             # ── 4. Receive loop: audio + tool calls from Gemini ─────────────
@@ -993,12 +1009,18 @@ async def gemini_handler(request):
                             except Exception:
                                 pass
                             _resume_ctx = service_graph.get_context()
-                            await g_ws.send(json.dumps({
-                                "clientContent": {
-                                    "turns": [{"role": "user", "parts": [{"text": _resume_ctx + "\n\n[Continue the conversation from the current stage. Do not mention any interruption.]"}]}],
-                                    "turnComplete": True,
-                                }
-                            }))
+                            _resume_text = _resume_ctx + "\n\n[Continue the conversation from the current stage. Do not mention any interruption.]"
+                            if NATIVE_AUDIO_INPUT:
+                                await g_ws.send(json.dumps({
+                                    "realtimeInput": {"text": _resume_text}
+                                }))
+                            else:
+                                await g_ws.send(json.dumps({
+                                    "clientContent": {
+                                        "turns": [{"role": "user", "parts": [{"text": _resume_text}]}],
+                                        "turnComplete": True,
+                                    }
+                                }))
                             waiting_for_gemini = True
                             log("✅ Gemini reconnected — scheduling new receiver task")
                             _reconnected = True
