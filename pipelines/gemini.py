@@ -815,27 +815,68 @@ async def gemini_handler(request):
                                     f"(last audio {ai_dur:.2f}s ago)")
                             elif save_done_ts > 0:
                                 if not _LOCAL_PROMPT_STAGES and not confirmation_done:
-                                    # Gemini speaks confirmation (local TTS disabled).
-                                    # First turnComplete after save = confirmation done.
-                                    # Close after 1s to let Vobiz buffer drain.
-                                    evt("confirmation_done", reason="gemini_turn_complete",
-                                        tc_seq=_tc_seq,
-                                        audio_secs=round(confirmation_audio_secs, 2))
-                                    confirmation_done = True
-                                    log(f"✅ Gemini confirmation done (audio={confirmation_audio_secs:.1f}s) — clearing + closing")
-                                    # Clear Vobiz buffer to flush any duplicate audio
-                                    # that Gemini generated before turnComplete arrived.
-                                    try:
-                                        if not ws.closed:
-                                            await ws.send_str(json.dumps({"event": "clear"}))
-                                    except Exception:
-                                        pass
-                                    # Truncate agent_buf to remove any duplicate text
-                                    # (Gemini may concatenate two turns before turnComplete)
-                                    _shukriya_pos = agent_buf.lower().find("shukriya")
-                                    if _shukriya_pos != -1:
-                                        agent_buf = agent_buf[:_shukriya_pos + len("shukriya!")]
-                                    asyncio.create_task(_close_after(ws, g_ws, 0.5, log))
+                                    if confirmation_audio_secs < 2.0:
+                                        # Gemini was interrupted before speaking
+                                        # the confirmation (0 audio reached customer).
+                                        # Nudge Gemini to speak confirmation now.
+                                        log(f"⚠️  Post-save turnComplete with only "
+                                            f"{confirmation_audio_secs:.1f}s audio — "
+                                            f"nudging Gemini to speak confirmation")
+                                        evt("confirmation_nudge",
+                                            tc_seq=_tc_seq,
+                                            audio_secs=round(
+                                                confirmation_audio_secs, 2))
+                                        _nudge = (
+                                            "[SAVE ALREADY DONE — do NOT call "
+                                            "save_service_request again]\n"
+                                            "Speak the confirmation to the customer "
+                                            "now. Start with their name."
+                                        )
+                                        try:
+                                            if NATIVE_AUDIO_INPUT:
+                                                await g_ws.send(json.dumps({
+                                                    "realtimeInput": {
+                                                        "text": _nudge}
+                                                }))
+                                            else:
+                                                await g_ws.send(json.dumps({
+                                                    "clientContent": {
+                                                        "turns": [{
+                                                            "role": "user",
+                                                            "parts": [{
+                                                                "text": _nudge
+                                                            }],
+                                                        }],
+                                                        "turnComplete": True,
+                                                    }
+                                                }))
+                                        except Exception as _nudge_err:
+                                            log(f"❌ Nudge failed: {_nudge_err}")
+                                    else:
+                                        # Gemini spoke confirmation (enough audio).
+                                        # Close after letting Vobiz buffer drain.
+                                        evt("confirmation_done",
+                                            reason="gemini_turn_complete",
+                                            tc_seq=_tc_seq,
+                                            audio_secs=round(
+                                                confirmation_audio_secs, 2))
+                                        confirmation_done = True
+                                        log(f"✅ Gemini confirmation done "
+                                            f"(audio={confirmation_audio_secs:.1f}s)"
+                                            f" — clearing + closing")
+                                        try:
+                                            if not ws.closed:
+                                                await ws.send_str(json.dumps(
+                                                    {"event": "clear"}))
+                                        except Exception:
+                                            pass
+                                        _shukriya_pos = agent_buf.lower().find(
+                                            "shukriya")
+                                        if _shukriya_pos != -1:
+                                            agent_buf = agent_buf[
+                                                :_shukriya_pos + len("shukriya!")]
+                                        asyncio.create_task(
+                                            _close_after(ws, g_ws, 0.5, log))
                                 elif confirmation_audio_secs >= CONFIRMATION_MIN_AUDIO_SECS and not confirmation_done:
                                     # Local TTS mode: enough audio played — close now.
                                     evt("confirmation_done", reason="turn_complete",
@@ -859,14 +900,24 @@ async def gemini_handler(request):
 
                         # ── Interrupted: agent cut off mid-speech ────────────
                         if server_content.get("interrupted"):
-                            log("⚡ serverContent.interrupted — agent speech was interrupted by customer")
-                            # Clear Vobiz audio buffer so buffered agent audio
-                            # stops playing on the phone immediately.
-                            try:
-                                if not ws.closed:
-                                    await ws.send_str(json.dumps({"event": "clear"}))
-                            except Exception:
-                                pass
+                            if save_done_ts > 0:
+                                # Ignore interrupts after save — they're caused
+                                # by residual customer audio that was in-flight
+                                # when the tool call completed. Clearing Vobiz
+                                # here would kill the confirmation audio.
+                                log("⚡ serverContent.interrupted — IGNORED "
+                                    "(post-save, likely residual audio)")
+                            else:
+                                log("⚡ serverContent.interrupted — agent speech "
+                                    "was interrupted by customer")
+                                # Clear Vobiz audio buffer so buffered agent audio
+                                # stops playing on the phone immediately.
+                                try:
+                                    if not ws.closed:
+                                        await ws.send_str(json.dumps(
+                                            {"event": "clear"}))
+                                except Exception:
+                                    pass
 
                         # ── Tool calls ───────────────────────────────────────
                         tool_call = data.get("toolCall")
