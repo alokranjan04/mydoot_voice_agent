@@ -1080,14 +1080,62 @@ async def gemini_handler(request):
                 except Exception as ex:
                     log(f"❌ g_receiver error: {type(ex).__name__}: {ex}")
                     traceback.print_exc()
-                else:
-                    # Loop ended without exception = Gemini closed connection normally
+                except websockets.exceptions.ConnectionClosedOK as ex:
+                    # Gemini sent a clean close (code=1000). If the call
+                    # isn't done yet (save not executed), reconnect — Gemini
+                    # sometimes closes early when it thinks the conversation
+                    # is finished (e.g. after "main samajh gayi").
                     try:
                         close_code = g_ws.protocol.close_code
                         close_reason = g_ws.protocol.close_reason
                         log(f"⚠️  Gemini closed connection — code={close_code} reason={close_reason!r}")
                     except Exception:
                         log("⚠️  Gemini closed connection (no close code available)")
+                    if _g_reconnects < 1 and not save_executed and not ws.closed:
+                        _g_reconnects += 1
+                        _call_track["reconnects"] += 1
+                        log("🔄 Gemini clean-closed mid-call — reconnecting (1/1)")
+                        waiting_for_gemini = True
+                        try:
+                            _old_g_ws = g_ws
+                            g_ws = await websockets.connect(
+                                GEMINI_WS_URL,
+                                open_timeout=15,
+                                ping_interval=20,
+                                ping_timeout=20,
+                            )
+                            await g_ws.send(json.dumps(setup))
+                            _r2 = await asyncio.wait_for(g_ws.recv(), timeout=10.0)
+                            if json.loads(_r2).get("error"):
+                                raise Exception(f"Reconnect setup error: {json.loads(_r2)['error']}")
+                            try:
+                                await _old_g_ws.close()
+                            except Exception:
+                                pass
+                            _resume_ctx = service_graph.get_context()
+                            _resume_text = _resume_ctx + "\n\n[Continue the conversation from the current stage. Do not mention any interruption.]"
+                            if NATIVE_AUDIO_INPUT:
+                                await g_ws.send(json.dumps({
+                                    "realtimeInput": {"text": _resume_text}
+                                }))
+                            else:
+                                await g_ws.send(json.dumps({
+                                    "clientContent": {
+                                        "turns": [{"role": "user", "parts": [{"text": _resume_text}]}],
+                                        "turnComplete": True,
+                                    }
+                                }))
+                            waiting_for_gemini = True
+                            log("✅ Gemini reconnected after clean close — new receiver task")
+                            _reconnected = True
+                            asyncio.create_task(g_receiver())
+                            return
+                        except Exception as _re_err:
+                            log(f"❌ Gemini reconnect failed: {_re_err}")
+                            traceback.print_exc()
+                else:
+                    # Loop ended without exception and no ConnectionClosedOK
+                    log("⚠️  Gemini connection ended (unknown reason)")
                 finally:
                     # Flush any partial buffers that didn't get a turnComplete
                     if agent_buf.strip():
