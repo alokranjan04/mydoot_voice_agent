@@ -6,6 +6,185 @@
 
 ---
 
+## 0. End-to-End Flow & Architecture
+
+### Explain the complete end-to-end flow of a customer call
+
+#### Architecture Diagram
+
+```
+┌──────────┐     mu-law 8kHz      ┌──────────────┐    PCM 16kHz     ┌──────────┐
+│ Customer │◄───────────────────►│  Cloud Run    │◄──────────────►│  Gemini  │
+│  Phone   │     WebSocket #1    │  (Python)     │   WebSocket #2  │  3.1     │
+└──────────┘                     │               │                 │  Flash   │
+                                 │  audioop      │                 │  Live    │
+    Vobiz SIP                    │  resample     │                 │          │
+    +917971542939                │               │                 │ Voice:   │
+                                 │  ┌─────────┐  │                 │ Aoede    │
+                                 │  │ asyncio │  │                 └────┬─────┘
+                                 │  │ 2 tasks │  │                      │
+                                 │  └─────────┘  │               toolCall
+                                 │               │                      │
+                                 │  ┌─────────┐  │    ┌──────────────┐  │
+                                 │  │  save    │◄─────│ PostgreSQL   │◄─┘
+                                 │  │  tool    │──────│ Google Sheets│
+                                 │  └─────────┘  │    └──────────────┘
+                                 └──────────────┘
+
+Cost: ₹0.64/min  |  Latency: ~2s/turn  |  Concurrency: 80 calls/instance
+```
+
+#### Phase 1: Call Initiation
+
+```
+Customer dials +917971542939
+       │
+       ▼
+Vobiz Telephony Platform (SIP provider)
+       │
+       ▼
+POST /answer → our Cloud Run server
+       │
+       ▼
+Server returns XML with WebSocket URL:
+  wss://mydoot-voice-agent.../gemini-stream?caller_id=9582211961
+       │
+       ▼
+Vobiz opens bidirectional WebSocket
+  (carries G.711 mu-law audio at 8kHz)
+```
+
+**Interview answer:** *"When a customer calls our Vobiz number, Vobiz sends a POST webhook to our Cloud Run server. We respond with XML containing a WebSocket URL. Vobiz then opens a bidirectional WebSocket that carries real-time audio in G.711 mu-law format at 8kHz — this is the standard phone codec."*
+
+#### Phase 2: Gemini Connection
+
+```
+Server simultaneously opens WebSocket to:
+  wss://generativelanguage.googleapis.com/.../BidiGenerateContent
+
+Sends setup message:
+  {
+    model: "gemini-3.1-flash-live-preview",
+    responseModalities: ["AUDIO"],
+    speechConfig: { voiceName: "Aoede" },
+    systemInstruction: "You are Mydoot Customer Care...",
+    tools: [save_service_request],
+    inputAudioTranscription: {},
+    outputAudioTranscription: {}
+  }
+
+Sends greeting trigger:
+  { realtimeInput: { text: "[CALL_STARTED]" } }
+
+Gemini generates greeting audio
+```
+
+**Interview answer:** *"We maintain two WebSocket connections simultaneously — one to Vobiz (customer audio) and one to Gemini Live API. The setup message configures the AI model, voice, system prompt, and available tools. We trigger the greeting by sending a text message through realtimeInput."*
+
+#### Phase 3: Audio Pipeline (the core)
+
+```
+INBOUND (Customer → AI):
+  Vobiz sends mu-law 8kHz audio frames
+    → base64 decode
+    → audioop.ulaw2lin()     (mu-law → PCM 16-bit)
+    → audioop.ratecv()       (8kHz → 16kHz)
+    → base64 encode
+    → Send to Gemini as realtimeInput.audio
+
+OUTBOUND (AI → Customer):
+  Gemini sends PCM 24kHz audio
+    → base64 decode
+    → audioop.ratecv()       (24kHz → 8kHz)
+    → audioop.lin2ulaw()     (PCM → mu-law)
+    → base64 encode
+    → Send to Vobiz as playAudio event
+```
+
+**Interview answer:** *"This is the most critical part. We're bridging two different audio worlds. Phone networks use G.711 mu-law at 8kHz. Gemini expects PCM at 16kHz for input and produces PCM at 24kHz for output. I use Python's audioop library for real-time resampling. The entire pipeline runs in asyncio — two concurrent coroutines, one reading from Vobiz and forwarding to Gemini, the other reading from Gemini and forwarding to Vobiz. All in-memory, no disk I/O."*
+
+#### Phase 4: Conversation Flow
+
+```
+Gemini handles EVERYTHING natively:
+  - Turn detection (VAD)
+  - Speech recognition
+  - Language understanding
+  - Response generation
+  - Speech synthesis
+
+Conversation stages (guided by system prompt):
+  1. Greeting → full service list
+  2. Category → "Achcha, electrical problem hai"
+  3. Subcategory → "Light chali gayi hai"
+  4. Diagnosis → "Kya specific fault hai?"
+  5. Brand → (only for appliances/vehicles)
+  6. Address → echo back: "15 Janpath, sahi hai?"
+  7. Preferred time → "Kal subah 10 baje"
+  8. Customer name → proceed to save
+
+KEY RULE: Echo back every input
+  Customer: "Crompton"
+  Agent: "Achcha, Crompton. Aapka address kya hai?"
+  (catches mishearing immediately)
+```
+
+**Interview answer:** *"With native audio mode, Gemini handles turn detection, speech recognition, and response generation in one hop — no separate STT service. The system prompt guides it through 8 stages. The critical design decision is echo-back: the agent repeats every key input so the customer can catch errors. For example, if Gemini mishears 'Sethi Max' as 'Princesley state', the customer immediately corrects it."*
+
+#### Phase 5: Tool Call & Save
+
+```
+All fields collected
+       │
+       ▼
+Gemini calls save_service_request tool:
+  {
+    customer_name: "Sonu Kumar",
+    category: "Electrical",
+    subcategory: "Wiring",
+    issue_type: "Power Failure",
+    address: "15 Janpath, New Delhi",
+    preferred_time: "aaj shaam 5 baje"
+  }
+       │
+       ├──► PostgreSQL (primary) — INSERT into service_requests
+       ├──► Google Sheets (secondary, soft-fail) — append row
+       │
+       ▼
+Tool returns { success: true } to Gemini
+       │
+       ▼
+Gemini speaks confirmation:
+  "Sonu ji, aapki request register ho gayi hai..."
+       │
+       ▼
+End-marker "shukriya" detected → stop forwarding audio
+       │
+       ▼
+3-second drain delay → close both WebSockets
+       │
+       ▼
+Transcript emailed to admin via Gmail SMTP
+```
+
+**Interview answer:** *"When Gemini has all fields, it calls our save_service_request tool. We save to PostgreSQL as the primary store and Google Sheets as secondary with soft-fail. The tool returns success, Gemini speaks the confirmation. I detect the word 'shukriya' in the output transcription to know the confirmation is complete, then close the call after a 3-second drain delay so the customer hears the full message."*
+
+#### Phase 6: Edge Cases I Solved
+
+**Q: What if Gemini disconnects mid-call?**
+*"Gemini sometimes closes the WebSocket with code=1000 when it thinks the conversation is done — like after saying 'main samajh gayi'. I catch both ConnectionClosedError and ConnectionClosedOK, reconnect to Gemini, send the current stage context, and the conversation resumes. The customer doesn't notice."*
+
+**Q: What about duplicate confirmations?**
+*"Gemini sometimes repeats the closing message twice. I detect 'shukriya' in the output transcription and immediately stop forwarding new audio. A 9-second byte cap catches anything the text detection misses."*
+
+**Q: What about the save tool call getting interrupted?**
+*"When the save tool call starts, I set a save_tool_pending flag that blocks customer audio to Gemini. Without this, residual audio triggers an interrupt and Gemini never speaks the confirmation."*
+
+**Q: What about barge-in?**
+*"In native audio mode, Gemini handles barge-in natively — when the customer speaks while the agent is talking, Gemini stops generating and processes the interruption. I send a clear event to Vobiz to flush any buffered audio."*
+
+---
+
 ## 1. Architecture & Core Infrastructure
 
 ### Why did you use Cloud Run?
