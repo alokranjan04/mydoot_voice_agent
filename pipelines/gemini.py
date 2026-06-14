@@ -10,6 +10,7 @@ import websockets
 from aiohttp import web
 
 from config.settings import APP_CONFIG, GEMINI_API_KEY, GEMINI_WS_URL, SARVAM_API_KEY
+from core.recorder import _TimelineRecorder
 from core.state_engine import ConversationStateEngine
 from core.service_graph import ServiceGraph, ServiceState
 from core.field_validators import (
@@ -436,7 +437,7 @@ async def gemini_handler(request):
     lt             = LatencyTracker(caller_id)
     transcript_log = []     # ["Agent: ...", "Customer: ..."]
     call_ts        = datetime.now().strftime("%Y%m%d_%H%M%S")
-    pcm8_frames    = []     # raw 8kHz PCM16 frames for WAV recording (RECORD_CALLS=1)
+    recorder       = _TimelineRecorder() if RECORD_CALLS else None  # stereo recorder
 
     def log(msg):
         print(f"[{_ts()}] caller={caller_id} | {msg}", flush=True)
@@ -705,6 +706,8 @@ async def gemini_handler(request):
                                 pcm8, downsample_state = audioop.ratecv(
                                     pcm24, 2, 1, 24000, 8000, downsample_state
                                 )
+                                if recorder:
+                                    recorder.write_priya(pcm8)
                                 mulaw = audioop.lin2ulaw(pcm8, 2)
                                 last_ai_audio_ts = time.time()
                                 if not ws.closed:
@@ -1762,8 +1765,8 @@ async def gemini_handler(request):
 
                         raw_mulaw = base64.b64decode(data["media"]["payload"])
                         pcm8      = audioop.ulaw2lin(raw_mulaw, 2)
-                        if RECORD_CALLS:
-                            pcm8_frames.append(pcm8)
+                        if recorder:
+                            recorder.write_caller(pcm8)
 
                         # ── Post-save guard: block all input after save ────
                         # Also block during tool execution to prevent
@@ -1911,17 +1914,13 @@ async def gemini_handler(request):
             pass
         elapsed = time.time() - (call_start_ts if 'call_start_ts' in dir() else time.time())
         log(f"📞 Call ended | duration={elapsed:.1f}s | transcript={len(transcript_log)} lines")
-        if RECORD_CALLS and pcm8_frames:
+        if recorder and recorder:
             try:
                 os.makedirs(RECORDINGS_DIR, exist_ok=True)
                 wav_path = os.path.join(RECORDINGS_DIR, f"{caller_id}_{call_ts}.wav")
-                with wave.open(wav_path, "wb") as wf:
-                    wf.setnchannels(1)
-                    wf.setsampwidth(2)   # 16-bit PCM
-                    wf.setframerate(8000)
-                    wf.writeframes(b"".join(pcm8_frames))
+                recorder.save(wav_path)
                 _call_track["local_wav"] = f"{caller_id}_{call_ts}.wav"
-                log(f"🎙️  Recording saved → {wav_path} ({len(pcm8_frames)} frames, {elapsed:.0f}s)")
+                log(f"🎙️  Stereo recording saved → {wav_path} (L=customer R=agent, {elapsed:.0f}s)")
                 gcs_uri = await asyncio.to_thread(upload_recording_to_gcs, wav_path, caller_id)
                 if gcs_uri:
                     _call_track["gcs_uri"] = gcs_uri
