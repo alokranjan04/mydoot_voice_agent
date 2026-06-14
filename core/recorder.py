@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-_TimelineRecorder — stereo PCM-16 LE @ 8 kHz call recorder.
+_TimelineRecorder — mono PCM-16 LE @ 8 kHz call recorder.
 
-Left  channel = caller audio
-Right channel = Priya TTS audio
+Both caller audio and agent audio are mixed into a single mono channel
+with wall-clock timing so the conversation flows naturally.
 
 Audio is placed at max(wall_clock_offset, channel_head) so natural silence
 gaps are preserved and no chunk overwrites already-written audio.
@@ -12,39 +12,51 @@ import time, wave
 
 
 class _TimelineRecorder:
-    __slots__ = ("_caller", "_priya", "_start", "_caller_head", "_priya_head")
+    __slots__ = ("_buf", "_start", "_caller_head", "_agent_head")
 
     def __init__(self):
-        self._caller      = bytearray()
-        self._priya       = bytearray()
+        self._buf         = bytearray()
         self._start       = time.perf_counter()
         self._caller_head = 0
-        self._priya_head  = 0
+        self._agent_head  = 0
 
     # ── Internal placement ────────────────────────────────────────────────────
 
-    def _place(self, buf: bytearray, pcm: bytes, head: int) -> int:
-        """Write pcm at max(wall_clock_byte_offset, head). Returns new head."""
+    def _place(self, pcm: bytes, head: int) -> int:
+        """Mix pcm into the mono buffer at max(wall_clock_offset, head).
+        Audio is ADDED (mixed) to existing data, not overwritten.
+        Returns new head position."""
+        import array as _array
+
         wc  = int((time.perf_counter() - self._start) * 8000) * 2
         pos = max(wc, head)
         end = pos + len(pcm)
-        if len(buf) < end:
-            buf.extend(b"\x00" * (end - len(buf)))
-        buf[pos:end] = pcm
+
+        # Extend buffer if needed
+        if len(self._buf) < end:
+            self._buf.extend(b"\x00" * (end - len(self._buf)))
+
+        # Mix (add) new audio into existing buffer instead of overwriting.
+        # This lets caller + agent audio overlap naturally.
+        existing = _array.array("h", self._buf[pos:end])
+        incoming = _array.array("h", pcm)
+        for i in range(len(incoming)):
+            # Clip to int16 range to prevent overflow
+            mixed = existing[i] + incoming[i]
+            existing[i] = max(-32768, min(32767, mixed))
+        self._buf[pos:end] = existing.tobytes()
+
         return end
 
     # ── Public write API ──────────────────────────────────────────────────────
 
     def write_caller(self, pcm: bytes) -> None:
-        """Record caller audio (left channel)."""
-        self._caller_head = self._place(self._caller, pcm, self._caller_head)
+        """Record caller audio."""
+        self._caller_head = self._place(pcm, self._caller_head)
 
     def write_priya(self, pcm: bytes) -> None:
-        """Record Priya TTS audio (right channel).
-        Must be called BEFORE the WebSocket send so the last chunk is always
-        captured even if the WS closes mid-stream.
-        """
-        self._priya_head = self._place(self._priya, pcm, self._priya_head)
+        """Record agent (AI) audio."""
+        self._agent_head = self._place(pcm, self._agent_head)
 
     def write(self, pcm: bytes) -> None:
         """Backward-compatibility alias → caller channel."""
@@ -53,23 +65,12 @@ class _TimelineRecorder:
     # ── Save ──────────────────────────────────────────────────────────────────
 
     def save(self, path: str) -> None:
-        """Interleave channels and write a stereo WAV file."""
-        import array as _array
-        n = max(len(self._caller), len(self._priya))
-        n = (n + 1) & ~1                          # round up to whole 2-byte sample
-        caller_b = bytes(self._caller) + b"\x00" * (n - len(self._caller))
-        priya_b  = bytes(self._priya)  + b"\x00" * (n - len(self._priya))
-        caller_s = _array.array("h", caller_b)
-        priya_s  = _array.array("h", priya_b)
-        stereo   = _array.array("h")
-        for c, p in zip(caller_s, priya_s):
-            stereo.append(c)   # left  = caller
-            stereo.append(p)   # right = Priya
+        """Write a mono WAV file with both caller and agent audio mixed."""
         with wave.open(path, "wb") as wf:
-            wf.setnchannels(2)
+            wf.setnchannels(1)
             wf.setsampwidth(2)
             wf.setframerate(8000)
-            wf.writeframes(stereo.tobytes())
+            wf.writeframes(bytes(self._buf))
 
     def __bool__(self) -> bool:
-        return bool(self._caller) or bool(self._priya)
+        return bool(self._buf)
