@@ -102,6 +102,11 @@ jobs:
               if val:                        # skip empty / unset secrets
                   lines.append(f"{k}: {json.dumps(val)}")
 
+          # Non-secret config values (not from GitHub Secrets)
+          lines.append('RECORD_CALLS: "1"')
+          lines.append('GCS_RECORDINGS_BUCKET: "mydootrecordings"')
+          lines.append('GCS_DELETE_LOCAL: "1"')
+
           with open("/tmp/env.yaml", "w") as f:
               f.write("\n".join(lines) + "\n")
 
