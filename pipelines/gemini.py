@@ -1915,15 +1915,14 @@ async def gemini_handler(request):
         elapsed = time.time() - (call_start_ts if 'call_start_ts' in dir() else time.time())
         log(f"📞 Call ended | duration={elapsed:.1f}s | transcript={len(transcript_log)} lines")
         log(f"🎙️  REC_DEBUG: RECORD_CALLS={RECORD_CALLS} recorder={recorder is not None} "
-            f"bool={bool(recorder) if recorder else 'N/A'} "
-            f"buf_len={len(recorder._buf) if recorder else 0}")
+            f"frames={recorder.frame_count() if recorder else 0}")
         if recorder:
             try:
                 os.makedirs(RECORDINGS_DIR, exist_ok=True)
                 wav_path = os.path.join(RECORDINGS_DIR, f"{caller_id}_{call_ts}.wav")
                 recorder.save(wav_path)
                 _call_track["local_wav"] = f"{caller_id}_{call_ts}.wav"
-                log(f"🎙️  Recording saved → {wav_path} ({len(recorder._buf)} bytes, {elapsed:.0f}s)")
+                log(f"🎙️  Recording saved → {wav_path} ({recorder.frame_count()} frames, {elapsed:.0f}s)")
                 gcs_uri = await asyncio.to_thread(upload_recording_to_gcs, wav_path, caller_id)
                 if gcs_uri:
                     _call_track["gcs_uri"] = gcs_uri
