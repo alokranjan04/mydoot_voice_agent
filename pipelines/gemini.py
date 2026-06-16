@@ -10,6 +10,7 @@ import websockets
 from aiohttp import web
 
 from config.settings import APP_CONFIG, GEMINI_API_KEY, GEMINI_WS_URL, SARVAM_API_KEY
+from config.cloud_logging import cloud_log, cloud_metric, cloud_trace_event
 from core.state_engine import ConversationStateEngine
 from core.service_graph import ServiceGraph, ServiceState
 from core.field_validators import (
@@ -458,6 +459,8 @@ async def gemini_handler(request):
     )
     log(f"🚀 Gemini Live connecting | model={model} | native_audio={'ON' if NATIVE_AUDIO_INPUT else 'OFF'}")
     log(f"   API key: {'SET len=' + str(len(GEMINI_API_KEY)) if GEMINI_API_KEY else '*** MISSING ***'}")
+    cloud_log("Call started", severity="INFO", caller_id=caller_id,
+              event="call_start", model=model, native_audio=NATIVE_AUDIO_INPUT)
 
     g_ws = None    # defined at function level so g_receiver can reassign via nonlocal on reconnect
     setup: dict = {}  # populated after connect; accessible to g_receiver for reconnect
@@ -963,9 +966,16 @@ async def gemini_handler(request):
                                 elif fn in FUNCTION_MAP:
                                     _t_tc_start = time.time()
                                     res = await asyncio.to_thread(FUNCTION_MAP[fn], **args)
+                                    _took_ms = round((time.time() - _t_tc_start) * 1000)
                                     evt("tool_call_complete", fn=fn, success=res.get("success"),
-                                        took_ms=round((time.time() - _t_tc_start) * 1000))
+                                        took_ms=_took_ms)
                                     log(f"🔧 Tool result: {res}")
+                                    cloud_log(f"Tool call: {fn}", severity="INFO",
+                                              caller_id=caller_id, event="tool_call",
+                                              function=fn, success=res.get("success"),
+                                              took_ms=_took_ms)
+                                    cloud_metric("tool_call_ms", _took_ms,
+                                                 caller_id=caller_id, function=fn)
                                     _trigger_local_conf = False
                                     if is_save_fn and res.get("success"):
                                         save_executed = True
@@ -1091,8 +1101,13 @@ async def gemini_handler(request):
                         close_code = g_ws.protocol.close_code
                         close_reason = g_ws.protocol.close_reason
                         log(f"⚠️  Gemini closed connection — code={close_code} reason={close_reason!r}")
+                        cloud_log("Gemini disconnected", severity="WARNING",
+                                  caller_id=caller_id, event="gemini_disconnect",
+                                  close_code=close_code, save_done=save_executed)
                     except Exception:
                         log("⚠️  Gemini closed connection (no close code available)")
+                        cloud_log("Gemini disconnected", severity="WARNING",
+                                  caller_id=caller_id, event="gemini_disconnect")
                     if _g_reconnects < 1 and not save_executed and not ws.closed:
                         _g_reconnects += 1
                         _call_track["reconnects"] += 1
@@ -1913,6 +1928,11 @@ async def gemini_handler(request):
             pass
         elapsed = time.time() - (call_start_ts if 'call_start_ts' in dir() else time.time())
         log(f"📞 Call ended | duration={elapsed:.1f}s | transcript={len(transcript_log)} lines")
+        cloud_log("Call ended", severity="INFO", caller_id=caller_id,
+                  event="call_end", duration_s=round(elapsed, 1),
+                  turns=len(transcript_log), saved=save_executed)
+        cloud_metric("call_duration_s", round(elapsed, 1), caller_id=caller_id)
+        cloud_metric("call_saved", 1.0 if save_executed else 0.0, caller_id=caller_id)
         log(f"🎙️  REC_DEBUG: RECORD_CALLS={RECORD_CALLS} "
             f"rec_frames={'list len=' + str(len(rec_frames)) if rec_frames is not None else 'None'}")
         if rec_frames:
