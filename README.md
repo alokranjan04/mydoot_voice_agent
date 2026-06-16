@@ -9,14 +9,16 @@
 
 A customer calls **+917971542939**. The AI agent:
 
-1. Answers immediately with a Hinglish greeting, then auto-detects language (English or Hinglish)
-2. Conducts the entire call in English if the customer responds in English, otherwise Hinglish
+1. Answers immediately with a Hinglish greeting, then asks the customer to choose Hindi or English
+2. Conducts the entire call in the language the customer selected
 3. Identifies the service category (Appliance Repair, Plumbing, Electrical, Carpentry, Cleaning, Vehicle Service, or Other) and guides through subcategory, structured diagnosis (issue type + severity), address, and preferred visit time
 4. **Confirms each collected field** by echoing it back ("Sector 15, Noida, sahi hai?") — only advances after the customer confirms; corrects if the customer gives a different value. High-confidence values (≥0.85) are auto-confirmed to save time.
 5. Supports **barge-in** — if the customer speaks while the agent is talking, agent audio stops immediately (RMS threshold filters out background noise/fan sounds)
-6. Saves a structured 11-field service request to **PostgreSQL** (primary) and **Google Sheets** (secondary)
-7. Emails the full call transcript to the admin after every call
-8. **Observability dashboard** at `/calls` — per-call quality metrics, turn latency drill-down, transcript viewer
+6. **Records every call** as stereo WAV and uploads to GCS bucket `mydootrecordings` (RECORD_CALLS=1)
+7. Saves a structured 11-field service request to **PostgreSQL** (primary) and **Google Sheets** (secondary)
+8. Emails the full call transcript to the admin after every call
+9. **Structured Cloud Logging** via `config/cloud_logging.py` — JSON logs, log-based metrics, Cloud Monitoring integration
+10. **Observability dashboard** at `/calls` — per-call quality metrics, turn latency drill-down, transcript viewer
 
 No hold music. No missed calls. No incomplete forms.
 
@@ -41,25 +43,30 @@ Customer Phone Call
         ▼
  pipelines/gemini.py
         │
-        ├── Audio In:  mu-law 8kHz → PCM 8kHz
-        │               ↓  Local VAD (RMS ≥100, 0.2s silence)
-        │               ↓  Sarvam Saaras v3 REST (hi-IN, per-stage hints)
-        │               ↓  Text transcript → clientContent turn
+        ├── Audio In:  mu-law 8kHz → PCM 16kHz → realtimeInput.audio
+        │               (Gemini native audio — no separate STT)
         │
         ├── Audio Out: Gemini Live PCM 24kHz → mu-law 8kHz → Vobiz
         │
         ├── core/service_graph.py — LangGraph ServiceGraph
-        │               ↓  Injects compressed [STAGE] context per turn
+        │               ↓  Compressed system prompt (~620 tokens)
         │               ↓  Tracks: category → subcategory → diagnosis
         │                          → brand → address → preferred_time
         │                          → customer_name → done
         │               ↓  DIAGNOSTIC_FLOWS: 20-subcategory fault tree
         │                  (issue_type, severity, error_code)
+        │
+        ├── config/cloud_logging.py — Structured JSON logging
+        │               ↓  Cloud Logging + Cloud Monitoring (log-based metrics)
+        │
+        ├── Call Recording — stereo WAV → GCS bucket mydootrecordings
+        │
+        ├── Reconnect on code=1000 — handles Gemini clean-close mid-call
         ▼
- Gemini Live (gemini-2.5-flash-native-audio-latest)
- • LLM + TTS in one model (text-in / audio-out)
- • Voice: Aoede (warm, clear female)
- • Language: English or Hinglish (auto-detected)
+ Gemini Live (gemini-3.1-flash-live-preview)
+ • STT + LLM + TTS all-in-one (native audio mode, NATIVE_AUDIO_INPUT=1)
+ • Voice: Aoede (slow, sweet voice style)
+ • Language: Hindi or English (customer chooses at start of call)
         │
         │  When all fields collected:
         ▼
@@ -77,9 +84,11 @@ Customer Phone Call
 ```
 [CALL_STARTED] → Agent speaks Hinglish greeting (1 of 3, random)
       ↓
-Customer responds → Sarvam Saaras v3 STT transcribes
+Agent asks: "Hindi mein baat karein ya English mein?"
       ↓
-[STAGE CONTEXT] injected → Gemini guided through stages:
+Customer chooses language → Gemini continues in that language
+      ↓
+Gemini guided through stages (native audio — no separate STT):
   1. category      — detect service type from customer description
   2. subcategory   — specific type (e.g. Refrigerator, Pipe Leak, Wiring)
   3. diagnosis     — structured fault diagnosis: DIAGNOSTIC_FLOWS injects
@@ -100,9 +109,11 @@ Customer confirms name → save_service_request() tool call IMMEDIATELY
       ↓
 Agent: "[name] ji, aapki request register ho gayi hai. Hamari team jald se jald aapse sampark karegi."
       ↓
-Agent goes silent
+Agent goes silent (end-marker detection + 9s byte cap + 5s drain delay)
       ↓
 Call auto-closes after confirmation audio completes
+      ↓
+Stereo WAV recording uploaded to GCS (mydootrecordings bucket)
       ↓
 Transcript emailed to admin (always, even on dropped calls)
 ```
@@ -165,15 +176,16 @@ mydoot-voice-agent/
 │
 ├── config/
 │   ├── settings.py         # API keys, URLs, POSTGRES_URL, INSTANCE_ID loaded from env
-│   └── database.py         # PostgreSQL ThreadedConnectionPool — init_db(), get_conn(), put_conn()
+│   ├── database.py         # PostgreSQL ThreadedConnectionPool — init_db(), get_conn(), put_conn()
+│   └── cloud_logging.py    # Structured JSON logging — Cloud Logging, Cloud Monitoring (log-based metrics)
 │
 ├── core/
 │   ├── state_engine.py     # Legacy 7-field state tracker
 │   └── service_graph.py    # LangGraph ServiceGraph — category taxonomy + stage context injection
 │
 ├── pipelines/
-│   ├── gemini.py           # Hybrid pipeline: Sarvam STT + Gemini Live LLM+TTS
-│   └── sarvam.py           # Sarvam pipeline (backup)
+│   ├── gemini.py           # Native audio pipeline: Gemini 3.1 STT+LLM+TTS (NATIVE_AUDIO_INPUT=1)
+│   └── sarvam.py           # Sarvam pipeline (legacy fallback)
 │
 ├── routes/
 │   ├── webhook.py          # POST /answer — Vobiz inbound call handler
@@ -197,7 +209,7 @@ mydoot-voice-agent/
 - Vobiz SIP account
 - Google service account with Sheets Editor access
 - Gmail account with App Password enabled
-- Sarvam AI API key (for STT)
+- Sarvam AI API key (optional — only needed if NATIVE_AUDIO_INPUT=0 fallback)
 
 ### Local Development
 
@@ -218,7 +230,7 @@ Server starts on `http://localhost:5050`
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `GEMINI_API_KEY` | Yes | Google AI Studio API key |
-| `SARVAM_API_KEY` | Yes | Sarvam AI API key (for Saaras v3 STT) |
+| `SARVAM_API_KEY` | No | Sarvam AI API key (only for legacy STT fallback, NATIVE_AUDIO_INPUT=0) |
 | `GOOGLE_CREDENTIALS` | Yes | GCP service account JSON (full key) |
 | `GOOGLE_SPREADSHEET_ID` | Yes | Target Google Sheet ID |
 | `GMAIL_USER` | Yes | Gmail address for transcript emails |
@@ -227,8 +239,9 @@ Server starts on `http://localhost:5050`
 | `POSTGRES_URL` | No | PostgreSQL DSN — enables dual-write to PG + Sheets (`postgresql://user:pass@host/db`) |
 | `INSTANCE_ID` | No | Tenant identifier — tags all PG rows (default: `"default"`) |
 | `PORT` | No | Server port (default: 5050) |
-| `RECORD_CALLS` | No | Set to `1` to save inbound audio as WAV files |
-| `GCS_RECORDINGS_BUCKET` | No | GCS bucket for WAV upload |
+| `NATIVE_AUDIO_INPUT` | No | Set to `1` (default) for Gemini native audio; `0` for legacy Sarvam STT path |
+| `RECORD_CALLS` | No | Set to `1` to save stereo WAV recordings and upload to GCS |
+| `GCS_RECORDINGS_BUCKET` | No | GCS bucket for WAV upload (default: `mydootrecordings`) |
 | `GCS_DELETE_LOCAL` | No | Set to 1 to delete local WAV after GCS upload |
 
 ---
@@ -243,7 +256,7 @@ Every push to `main` auto-deploys to Google Cloud Run via GitHub Actions.
 |--------|-------|
 | `GCP_SA_KEY` | Full GCP service account JSON |
 | `GEMINI_API_KEY` | Gemini API key (paid tier required for Live API) |
-| `SARVAM_API_KEY` | Sarvam AI API key |
+| `SARVAM_API_KEY` | Sarvam AI API key (optional — legacy STT fallback only) |
 | `GOOGLE_SPREADSHEET_ID` | Sheet ID |
 | `GMAIL_USER` | Gmail address |
 | `GMAIL_APP_PASSWORD` | Gmail App Password |
@@ -299,7 +312,7 @@ Every call is logged to **both PostgreSQL** (`call_logs` table) and the **Call_L
 | Saved | Whether save_service_request succeeded |
 | Category / Subcategory / Issue Type | Structured service request data |
 | Customer Name / Address / Preferred Time | Collected fields |
-| STT Count / STT Avg (ms) | Sarvam STT call count and average latency |
+| STT Count / STT Avg (ms) | STT call count and average latency (legacy path only) |
 | STT Drops / Barge-Ins / Reconnects | Audio quality signals |
 | Audio GCS | `gs://` URI of the call recording (if RECORD_CALLS=1) |
 | Transcript | Full timestamped Agent + Customer conversation |
@@ -330,4 +343,4 @@ Notes:
 
 **Alok Ranjan** — [alokranjan04@gmail.com](mailto:alokranjan04@gmail.com)
 
-Powered by Google Gemini Live · Sarvam Saaras v3 STT · LangGraph · Vobiz SIP · PostgreSQL · Google Cloud Run · GitHub Actions
+Powered by Google Gemini 3.1 Flash Live (native audio) · LangGraph · Vobiz SIP · PostgreSQL · Cloud Logging · Google Cloud Run · GitHub Actions

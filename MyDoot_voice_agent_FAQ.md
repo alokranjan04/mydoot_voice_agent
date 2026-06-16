@@ -643,6 +643,42 @@ The architecture is designed so each layer fails independently and gracefully. S
 
 ---
 
+### How did you implement Cloud Logging, Cloud Trace, and Cloud Monitoring?
+
+I built a structured JSON logging module (`config/cloud_logging.py`) that integrates with Google Cloud's operations suite.
+
+**Cloud Logging (structured JSON):**
+Every log line is a JSON object with fields like `severity`, `caller_id`, `stage`, `event`, and `latency_ms`. On Cloud Run, these JSON payloads are automatically ingested by Cloud Logging with full field indexing — so I can filter by `jsonPayload.caller_id="9582211961"` or `jsonPayload.event="tool_call_complete"` to debug a specific call.
+
+**Cloud Monitoring (log-based metrics):**
+I defined log-based metrics that extract numeric values from structured logs — for example, a metric on `jsonPayload.latency_ms` filtered to `jsonPayload.event="turn_complete"` gives me per-turn latency as a Cloud Monitoring time series. I can set alerts when P95 latency exceeds 6 seconds or when error rate spikes above 5%.
+
+**How it works in the code:**
+`config/cloud_logging.py` configures Python's `logging` module to emit JSON to stdout. On Cloud Run, stdout is captured by the Cloud Logging agent automatically. Locally, it falls back to human-readable console output. Every pipeline event (call start, turn complete, tool call, reconnect, call end) emits a structured log with consistent field names, making it easy to build dashboards and alerts without any external logging SDK.
+
+**Why not a third-party logging service?**
+Cloud Logging is free for the first 50 GB/month, integrates natively with Cloud Run (zero config), and feeds directly into Cloud Monitoring for alerts. External services like Datadog or Splunk would add cost and another dependency for no real benefit at this scale.
+
+---
+
+### How does the language selection feature work?
+
+Instead of auto-detecting the customer's language (which was unreliable on short utterances), I switched to explicit language selection at the start of every call.
+
+**Flow:**
+1. Agent greets in Hinglish: "Namaste! Mydoot Customer Care mein aapka swagat hai..."
+2. Agent immediately asks: "Hindi mein baat karein ya English mein?"
+3. Customer responds with their preference
+4. Gemini continues the entire conversation in the chosen language
+
+**Why explicit selection over auto-detection?**
+Auto-detection required 2-3 sentences of speech to reliably identify the language. During that ramp-up period, the agent sometimes switched languages mid-sentence or defaulted to the wrong language. With explicit selection, the customer is in control from the first turn, and Gemini's system prompt locks the language for the rest of the call.
+
+**Implementation:**
+This is entirely prompt-driven — the system prompt instructs Gemini to ask for language preference after the greeting and then stick to the chosen language. No code changes were needed. The compressed system prompt (~620 tokens, 75% reduction from the original ~2500 tokens) includes the language selection instruction.
+
+---
+
 ## Key Numbers to Remember
 
 | Metric | Value |
